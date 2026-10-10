@@ -36,3 +36,10 @@ work/
 state/
 *.log
 .journal/
+bench_results.jsonl
+
+# ── 构建中间产物 ─────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+recorder/bin/
+mcp/dist/

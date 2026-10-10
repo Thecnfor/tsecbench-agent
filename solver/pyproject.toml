@@ -1,0 +1,11 @@
+[project]
+name = "tsec-solver"
+version = "0.0.1"
+description = "TSecBench thin-shell solver (L1) — BoxPwnr external-solver bridge"
+requires-python = ">=3.14"
+dependencies = ["openai>=1.75", "pyyaml>=6.0"]
+
+# 脚本形态（main.py / run_bench.py 直接执行），不作为安装包打进 wheel；
+# 但依赖解析仍纳入 workspace 的同一把 uv.lock。
+[tool.uv]
+package = false

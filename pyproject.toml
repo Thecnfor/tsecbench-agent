@@ -1,0 +1,33 @@
+# TSecBench Agent —— uv workspace 根
+# 三个 Python 包共享一把锁与一个 .venv（Python 3.14，由 uv 自动安装）：
+#   orchestrator/  L0 确定性编排器（architecture.md §0/§3）
+#   solver/        L1 解题薄壳（脚本形态，非安装包）
+#   mock/          平台 mock server（runbook.md §4.1）
+[project]
+name = "tsecbench-workspace"
+version = "0.0.1"
+description = "TSecBench autonomous pentest agent (L0 orchestrator + L1 solver + mock platform)"
+requires-python = ">=3.14"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["orchestrator", "solver", "mock"]
+
+[dependency-groups]
+dev = ["pytest>=8.4", "ruff>=0.14"]
+
+[tool.pytest.ini_options]
+testpaths = ["orchestrator/tests", "mock/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# solver/ 是 v0 原型（BoxPwnr 桥接），按契约重写前不追排版
+"solver/**" = ["E501"]

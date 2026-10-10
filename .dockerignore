@@ -1,0 +1,27 @@
+# 构建上下文排除（runbook.md §1：git 排除 ≠ 构建上下文排除，两个机制必须各自配）
+# 第一条必须是 refs/ —— 漏一行的后果是参考实现被打包上传到全程审计的托管平台。
+refs/
+ing/
+docs/
+tmp
+.git/
+*.ovpn
+.env
+
+# 运行时与开发产物：镜像内一律重建，不从宿主机带入。
+# 注意 dockerignore 的普通路径只匹配根级 —— 必须 **/ 前缀才能拦住
+# mcp/node_modules、solver/.venv 这类子目录（漏拦会让宿主机产物覆盖镜像内 npm ci 结果）。
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/node_modules/
+**/*.log
+mcp/dist/
+recorder/bin/
+build/
+dist/
+work/
+state/
+.pytest_cache/
+.ruff_cache/
+bench_results.jsonl

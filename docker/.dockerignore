@@ -1,0 +1,25 @@
+# 构建上下文瘦身 + 泄漏防线第一道（image-spec.md §6 的完整扫描在构建流程末尾）
+.git/
+.venv/
+solver/.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# 敏感与许可红线：绝不进镜像
+ing/
+refs/
+*.ovpn
+.env
+*.key
+
+# 文档与运行时产物
+docs/
+*.md
+refs.lock
+work/
+state/
+*.log
+bench_results.jsonl
+docker/
