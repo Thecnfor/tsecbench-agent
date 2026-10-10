@@ -59,16 +59,18 @@
 | hint 扣分默认值 | **按 10% 设初值**（上届两处口径一致；本届 `hint_cost_radio` 读不到） | [platform-api.md](platform-api.md) §4.7 |
 | **合规红线** | `refs/` 与两届获奖队素材**绝不进镜像**，也不把上届题解喂进 prompt —— 平台按作弊处置且全程审计 | [architecture.md](architecture.md) §10.4、[image-spec.md](image-spec.md) §6 |
 | 大模型 | **DeepSeek**（`api.deepseek.com`，OpenAI 兼容 `/v1`） | [platform-api.md](platform-api.md) §4 |
+| **Jev（10-10 决策：完全排除）** | **不落地任何 Jev 代码**：核查结论是「产品真实（勘误 §11.2）但托管不可达 + 本地收益未验证」，用户决策**完全排除** —— 判定层不建、零新增依赖、零新增环境变量；相关落地项（原 A20、原 B14、runbook/image-spec 的 Jev 条目）已全部撤回 | [architecture.md](architecture.md) §12 |
+| **旗舰评测集口径（10-10）** | **63 题 / 23000 分 / 360min / 六能力域（Web·二进制·利用·多阶段·云·对抗规避）/ normal**；`TOTAL_TIME_LIMIT` 默认 21600s、Phase 1 ≈7~8min/题；六域覆盖自检与两处缺口（横向/云）见 §13.2 | [architecture.md](architecture.md) §13 |
 
 ## 文档索引
 
 | 文件 | 内容 |
 |---|---|
 | [platform-api.md](platform-api.md) | 答题 API 梳理、调用流程、错误码、以及文档里容易踩的陷阱（**§4.11–4.13 是与上届的规则差异**：关卡门、限频、接口整体换代）。摄取契约与下发形状不确定性见 [architecture.md](architecture.md) §6.5 与 §7.1 |
-| [architecture.md](architecture.md) | 完整架构设计：语言分工、Solver Adapter 契约（含双图 `prior`）、借鉴清单与自研边界、组件、状态机、预算策略、错误处理、双模运行、测试策略、决赛预留。**§1 是五栈按执行位置的分层设计（L0~L4）+ 性能模型；§9/§11 是两轮外部技术栈建议的逐条核查（含一处已撤回的错误判断）；§10 是开源生态调研轮：refs/ 清单、两个供应链事件、上届官方文档挖到的平台事实、合规红线** |
+| [architecture.md](architecture.md) | 完整架构设计：语言分工、Solver Adapter 契约（含双图 `prior`）、借鉴清单与自研边界、组件、状态机、预算策略、错误处理、双模运行、测试策略、决赛预留。**§1 是五栈按执行位置的分层设计（L0~L4）+ 性能模型；§9/§11 是两轮外部技术栈建议的逐条核查（含一处已撤回的错误判断）；§10 是开源生态调研轮：refs/ 清单、两个供应链事件、上届官方文档挖到的平台事实、合规红线；**§12 Jev 排除决策（含 §11.2 勘误）；§13 旗舰评测集口径（63/23000/360min/六域）** |
 | [image-spec.md](image-spec.md) | 基座选择理由、工具来源策略、工具清单（含 MCP 工具层）、运行时版本钉死、Ghidra+REA 决策依据、体积预算与降级阶梯、构建规范、密钥与参考资料泄漏防线 |
 | [runbook.md](runbook.md) | 本地评测怎么跑、托管镜像怎么交付、测试矩阵 |
-| [open-questions.md](open-questions.md) | 需要向主办方确认的问题清单（A1–A19），按是否阻塞排序；内部悬置决策（B1–B10）；决策截止线 |
+| [open-questions.md](open-questions.md) | 需要向主办方确认的问题清单（A1–A20），按是否阻塞排序；内部悬置决策（B1–B14）；决策截止线 |
 
 ## 参考实现（`../refs/`，只读，**严禁进镜像**）
 

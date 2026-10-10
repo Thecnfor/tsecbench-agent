@@ -110,6 +110,10 @@ MCP 层的取舍原则：**能用 CLI 直接 spawn 的就不套 MCP**。MCP 的�
 ### 通用
 `git`、`curl`、`wget`、`jq`、`unzip`、`tmux`、`python3-venv`、**Node 26.8.1**、**`ripgrep`**
 
+### 云 / 多阶段域的工具面缺口（2026-10-10 记账）
+
+旗舰评测集口径含「云攻击」「多阶段渗透」两域（[architecture.md](architecture.md) §13.2）。现状：**横向移动与云攻击没有专用工具**。两处缺口的最小候选与触发条件记在 [open-questions.md](open-questions.md) B14；**在 A9/A20 答复与 A14 体积口径落定前不改本清单**（B10 纪律不变），此期间由 solver 现场脚本 + `curl` / `requests` 覆盖 IMDS / 元数据 / STS 类目标。
+
 ## 3.1 运行时版本钉死
 
 | 运行时 | 版本 | 理由 |
