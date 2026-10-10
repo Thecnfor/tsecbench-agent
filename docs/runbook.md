@@ -46,7 +46,21 @@ BENCHMARK_BASE_URL:https://tsecbench.zc.tencent.com
 
 （token 值不写入文档，以 `ing/env` 原件为准。）
 
-导出方式（临时调试用；正式实现由编排器的 Config Resolver 统一处理两种分隔符）：
+⚠️ **切分隔符时只能在第一个冒号处切。** 这是本文件原本的一个错误示例：用 `awk -F: '{print $2}'` 取 `BENCHMARK_BASE_URL` 会得到 **`https`** —— 因为值本身含 `https://`。实测该文件第二行按 `:` 切出 **3 段**，第一行只有 2 段。照错误示例写进测试，得到的是一个「平台地址是 https」的诡异故障，比直接报错更难查。
+
+```bash
+# ✗ 错：值里含冒号时被切碎（实测得到 BENCHMARK_BASE_URL=https）
+awk -F: '{print $1"="$2}' ing/env
+
+# ✓ 对：归一化分隔符后交给 shell。已在当前这套 ing/env 上实测通过，
+#   base_url 完整保留 https:// 不被切断
+eval "$(sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)[=:][[:space:]]*/\1=/' ing/env | tr -d '\r' | sed 's/^/export /')"
+echo "$BENCHMARK_BASE_URL"   # → https://tsecbench.zc.tencent.com
+```
+
+⚠️ **上面这条 `eval` 只用于本地临时调试，不是正式实现。** 对不是自己写的文件做 `eval` 等于开一条代码执行路径（值里若含 `$(...)` 或反引号会被执行）。正式实现由 Ingest Resolver 在进程内解析，**绝不 eval、绝不经 shell**，见 [architecture.md](architecture.md) §6.5。
+
+**`ing/` 里有什么是不能假设的** —— 文件名带任务 ID（`task_gDhBwRoIg0Lj_vpn_config.ovpn`），每次评测下发一套；分隔符、键名、文件数量、甚至「有没有 VPN 文件」都可能变。托管模式下**根本没有 `ing/`**（凭据由平台注入环境变量）。因此解析层必须「按内容识别 + 缺什么都能跑」，设计见 [architecture.md](architecture.md) §6.5。
 
 ```bash
 export BENCHMARK_TOKEN=$(awk -F: '/^BENCHMARK_TOKEN/{print $2}' ing/env)
@@ -214,7 +228,7 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 | 极短 `TOTAL` | Phase 1/2 切换、收尾保护、强制 close 与提交 |
 | hint 触发与禁止 | 零 flag 才取；`is_completed` 题绝不取 |
 | 网关改写 | 19 项白名单逐条断言 + 边界 + 幂等 |
-| 配置解析 | 冒号分隔 / 等号分隔 / 缺字段 / 空值 |
+| 配置解析 | **完整跑 [architecture.md](architecture.md) §7.1 的 22 条摄取用例矩阵**（含「值内含冒号不能被切成 https」「无 ing/ 目录视为正常托管模式」「solver 环境不得含 BENCHMARK_TOKEN」）|
 | VPN 双模 | 可达时不拨；不可达且有 tun+NET_ADMIN 时拨；拨失败时降级继续 |
 | **离线解题基准** | **用 `refs/BoxPwnr` 的题目集（HackTheBox / picoCTF 等）在无 token 条件下测自研薄壳的单题收敛率** —— 这是 B1 自研路线唯一能在 10/12 前拿到的量化证据 |
 | **工具面自检** | **镜像内 ghidra headless / REA（本地路径，非 `npx`）/ feroxbuster / nuclei 离线模板各跑一次 smoke，确认无运行期联网行为；`ss -ltnp` 确认 REA bridge 未监听 `0.0.0.0`** |

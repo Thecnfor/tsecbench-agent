@@ -203,13 +203,16 @@ MCP 层的取舍原则：**能用 CLI 直接 spawn 的就不套 MCP**。MCP 的�
 
 **A. 凭据与私钥**
 
-- UUID 形态的 token 字面量（当前手上的 token 已知，可作精确指纹）；
+> ⚠️ **指纹必须是构建期从当前 `ing/` 现场导出的，不能写死值。** 每次评测下发的 token 与 VPN 都不同（见 [architecture.md](architecture.md) §6.5），所以「拿手上这套 token 的字符串当精确指纹」的做法在下一套下发时就失效了 —— 它会**假装通过**，而这比误报更危险。正确做法：扫描脚本先跑一遍 Ingest Resolver，把**本次实际解析出的每个机密值**（token、base_url、ovpn 内 `<key>`/`<cert>`/`<tls-auth>` 块的规范化文本）作为待查集合，再去各层比对。形态类正则（UUID、`BEGIN PRIVATE KEY`、`sk-`）作为兜底，不作为主力。
+
+- 本次下发的 token / base_url **实际值**（构建期动态取得）；
+- UUID 形态的 token 字面量（兜底）；
 - `-----BEGIN PRIVATE KEY-----` / `-----BEGIN RSA PRIVATE KEY-----` / `-----BEGIN OPENVPN PRIVATE KEY-----`；
 - `sk-` 前缀的密钥串；
-- `BENCHMARK_TOKEN` 的实际取值；
 - `*.ovpn` 文件残留、`ing/` 目录残留、`.env` 文件残留；
-- OpenVPN tls-auth 静态密钥块的指纹；
-- **recorder 的构建期 CA 私钥**（新增检查项，见 §5）—— 镜像里允许出现 CA **证书/公钥**，绝不允许出现对应**私钥**。扫描 `-----BEGIN CERTIFICATE-----` 邻近是否存在 `BEGIN PRIVATE KEY`，并对构建期 CA 的私钥做精确指纹比对。
+- OpenVPN tls-auth 静态密钥块的指纹（同样按本次下发内容动态导出）；
+- **`.gitignore` 是按目录名写的（`ing/`、`*.ovpn`），但 `.dockerignore` 必须独立存在且同样覆盖它们** —— git 排除不等于构建上下文排除，这是两个完全不同的机制，只配一个就会漏。
+- **recorder 的构建期 CA 私钥**（见 §5）—— 镜像里允许出现 CA **证书/公钥**，绝不允许出现对应**私钥**。扫描 `-----BEGIN CERTIFICATE-----` 邻近是否存在 `BEGIN PRIVATE KEY`，并对构建期 CA 私钥做指纹比对（同样构建期动态导出）。
 
 **B. 参考资料与作弊红线（2026-10-10 新增）**
 
