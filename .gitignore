@@ -1,0 +1,38 @@
+# ── 严禁入库：凭据与私钥 ──────────────────────────────────
+# ing/ 内含 BENCHMARK_TOKEN 实际值与 OpenVPN 客户端私钥（<key> 块）。
+# 平台要求敏感配置一律走环境变量，且本仓库是公开的。
+ing/
+*.ovpn
+.env
+*.key
+*.p12
+*.pfx
+
+# ── 严禁入库：第三方参考实现 ──────────────────────────────
+# refs/ 是 14 个 clone 下来读源码的仓库，约 467MB，且其中：
+#   · aide-for-pentest / Tsec-Hackathon / xbow-competition —— **无 LICENSE 文件 = 默认保留所有权利**，
+#     无权再分发，放进公开仓库即构成侵权；
+#   · ARTEX-EN / BoxPwnr / Cairn —— AGPL-3.0，传染性；
+#   · ARTEX-EN 本身是被下架原仓库 Autumn-27/ARTEX 的第三方镜像（该工具曾被
+#     CrowdStrike 报告点名用于真实银行攻击），公开转发它在本项目语境下是纯风险。
+# 复现方式见 refs.lock（记录 URL + commit + 许可证 + 借鉴点）。
+refs/
+
+# ── 构建产物 ──────────────────────────────────────────────
+agent.tar.gz
+*.tar
+*.tgz
+build/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+target/
+*.so
+
+# ── 运行时产物（本地评测落盘，含题目响应，不入库）────────
+work/
+state/
+*.log
+.journal/

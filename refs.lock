@@ -1,0 +1,51 @@
+# 参考实现清单（refs/ 不入库）
+
+`refs/` 已被 `.gitignore` 排除，原因见 `.gitignore` 注释与下方「许可证」列 —— 其中三个仓库**没有 LICENSE 文件**，即默认保留所有权利，无权再分发进公开仓库。
+
+本文件的作用是**让调研可复现**：任何人按 URL + commit 重新 clone 即可得到与本文档结论所依据的完全相同的源码快照。
+
+生成时间：2026-10-10 · 全部为 `--depth 1` 浅克隆 · 总计 14 个仓库约 467MB
+
+| 目录 | 上游 commit | 许可证 | 为什么 clone | 实际借用什么 |
+|---|---|---|---|---|
+| `ARTEMIS` | `f309242d2a` | Apache-2.0 | 内层执行体首要参考；CTF flag 提交抽象；9 个领域角色 prompt | supervisor 统辖+动态子 agent+triage；configs/tests/ctf_easy.yaml 的 flag_pattern 形状；codex-rs/core/*.md 的角色分解 |
+| `ARTEX-EN` | `f45efab88b` | AGPL-3.0（原仓库 Autumn-27/ARTEX 已从 GitHub 下架） | 仅读架构，禁止进镜像/引用代码 | 双图架构 asset graph + exploration graph；traffic 录制代理；进程级信息交换；共享 todolist |
+| `BoxPwnr` | `6e2778ce67` | AGPL-3.0 | 离线解题基准（无 token 也能测薄壳收敛率） | 多平台评测框架结构 |
+| `BreachWeave` | `bc2d9502a2` | Apache-2.0 | 第二届第一名；docs/ 内含上届官方 API+MCP 文档原件 | 30s 轮询、runtime.maxSolvers、久攻不下主动释放窗口、planner/solver prompt 解耦 |
+| `CHYing-agent` | `0d2ee81fa7` | MIT | 上届题集规模与关卡 gating 的真实数据点（54 flag / 卡第三关） | benchmark 脚手架形态 |
+| `Cairn` | `8e7e0ea675` | AGPL-3.0 | 第二届第三名 | 把渗透建模为状态空间搜索；dispatch_mock.yaml 的 mock 配置形态 |
+| `Tsec-Hackathon` | `3d380f32ca` | 无 LICENSE（保留所有权利） | 主办方官方资源仓；本项目一半参考仓库的 URL 是从它的索引里定位的 | 前二十团队开源仓库导航索引 |
+| `aide-for-pentest` | `958f7cfd02` | 无 LICENSE（保留所有权利） | 最小最干净的落地模板 | Dockerfile.worker 的 worker 镜像切分 |
+| `ctf-agent` | `3366d56955` | MIT | BSidesSF 2026 CTF 冠军 52/52 | Coordinator + Solver swarm + 消息总线三层拆分 |
+| `hexstrike-ai` | `d689933ff5` | MIT | 渗透工具 MCP server | server/MCP 两层解耦（工具实现与 MCP 暴露分离） |
+| `mcp-for-security` | `51dd537f58` | MIT | 评估 | SQLMap/FFUF/NMAP/Masscan 的 MCP 封装形态 |
+| `mcp-security-hub` | `b6800740da` | MIT | 评估 | Nmap/Ghidra/Nuclei/SQLMap/Hashcat 的 MCP 封装 |
+| `rea` | `f63f12d8ff` | MIT | 要装进镜像（133 个逆向 MCP 工具） | engines.node 决定 Node 版本下限；Ghidra 12.1.x + JDK 21 组合 |
+| `xbow-competition` | `2c4d490d8e` | 无 LICENSE（保留所有权利） | 第一届初赛 7/238；「薄桥接层+现成 CLI」路线可行性证明 | 平台桥接层与解题体彻底分离；本地模拟测试+真实平台双轨 |
+
+## 复现命令
+
+```bash
+mkdir -p refs && cd refs
+git clone --depth 1 https://github.com/Stanford-Trinity/ARTEMIS.git ARTEMIS
+git clone --depth 1 https://github.com/KbaHaxor/ARTEX-EN.git ARTEX-EN
+git clone --depth 1 https://github.com/0ca/BoxPwnr.git BoxPwnr
+git clone --depth 1 https://github.com/m-sec-org/BreachWeave.git BreachWeave
+git clone --depth 1 https://github.com/yhy0/CHYing-agent.git CHYing-agent
+git clone --depth 1 https://github.com/oritera/Cairn.git Cairn
+git clone --depth 1 https://github.com/Yeti-791/Tsec-Hackathon.git Tsec-Hackathon
+git clone --depth 1 https://github.com/chainreactors/aide-for-pentest.git aide-for-pentest
+git clone --depth 1 https://github.com/verialabs/ctf-agent.git ctf-agent
+git clone --depth 1 https://github.com/0x4m4/hexstrike-ai.git hexstrike-ai
+git clone --depth 1 https://github.com/cyproxio/mcp-for-security.git mcp-for-security
+git clone --depth 1 https://github.com/FuzzingLabs/mcp-security-hub.git mcp-security-hub
+git clone --depth 1 https://github.com/morluto/rea.git rea
+git clone --depth 1 https://github.com/m-sec-org/xbow-competition.git xbow-competition
+```
+
+## 红线
+
+1. **`refs/` 绝不 COPY 进镜像**，也不作为 git submodule / subtree 引入本仓库。
+2. **AGPL-3.0 三个（ARTEX-EN / BoxPwnr / Cairn）**：只读设计，不复制代码片段 —— 否则触发传染性许可义务。
+3. **无 LICENSE 三个（aide-for-pentest / Tsec-Hackathon / xbow-competition）**：只读，不复制、不转发源码副本。
+4. **不把上届题解、答辩 PPT 内容、flag 字面量喂进 prompt 或镜像**（平台作弊条款 + 全程审计）。见 `docs/architecture.md` §10.4。
