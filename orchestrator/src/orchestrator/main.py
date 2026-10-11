@@ -338,11 +338,14 @@ async def run_agent(
 
 def main() -> int:
     config = resolve_config()
+    # solver 在题目工作区目录下被启动（cwd ≠ 仓库根），`-m solver.main` 不可导入 ——
+    # 用仓库内绝对路径直接执行脚本（solver/main.py 自带 .env 定位，不依赖 cwd）。
+    solver_main = Path(__file__).resolve().parents[3] / "solver" / "main.py"
     summary = asyncio.run(
         run_agent(
             base_url=config.base_url,
             token=config.token,
-            solver_cmd=config.solver_cmd or [sys.executable, "-m", "solver.main"],
+            solver_cmd=config.solver_cmd or [sys.executable, str(solver_main)],
             config=config,
         )
     )

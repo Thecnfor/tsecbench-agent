@@ -43,3 +43,6 @@ bench_results.jsonl
 .ruff_cache/
 recorder/bin/
 mcp/dist/
+
+# 评测运行数据（含 flag 与平台内部状态，绝不入库）
+workspaces/

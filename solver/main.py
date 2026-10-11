@@ -227,10 +227,24 @@ def load_task() -> dict:
 # ------------------------------------------------------------------- prompt ---
 def build_system_prompt() -> str:
     base = TASK_PROMPT.strip()
-    contract = """
+    if CONTAINER:
+        execution = (
+            "- You act exclusively through the `run_command` tool. "
+            "Every command runs inside your Kali Linux container."
+        )
+    else:
+        execution = (
+            "- You act exclusively through the `run_command` tool. Commands run on a LEAN host "
+            "(not a Kali container): nmap, gobuster, curl, python3 are installed. Dirb wordlists "
+            "are at /usr/share/dirb/wordlists/common.txt (fallback: /usr/share/wordlists/dirb/). "
+            "Enumerate web targets with `gobuster dir -u http://<target>/ -w <common.txt>`; "
+            "no wordlist? build a focused one from the site's own links in one bash loop. "
+            "NEVER run broad filesystem searches (`find /`, `locate`) — they only burn your budget."
+        )
+    contract = f"""
 
 # EXECUTION CONTRACT (added by the solver shell)
-- You act exclusively through the `run_command` tool. Every command runs inside your Kali Linux container.
+{execution}
 - Commands must be non-interactive and automated. Use explicit timeouts for long tasks, e.g. `timeout 90 nmap -sV -p- <target>`.
 - You may create files (e.g. `cat > /root/exploit.py <<'EOF' ... EOF`) and run them.
 - If a command runs too long the shell kills it; adjust and retry with a narrower scope.

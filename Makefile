@@ -27,8 +27,11 @@ check:
 	$(UV) run python scripts/check_access.py
 
 ## run: 本地评测起编排器（先 make check；LLM key 取自 solver/.env，GATEWAY_MODE=off）
+## 时间片可调：SLICE_MIN_S/SLICE_MAX_S 覆盖默认 120/1200（v1.1 起默认拉长到 300/1800）
+SLICE_MIN_S ?= 300
+SLICE_MAX_S ?= 1800
 run:
-	set -a; . ./solver/.env; set +a; $(UV) run python -m orchestrator
+	set -a; . ./solver/.env; set +a; SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) $(UV) run python -m orchestrator
 
 ## mock: 启动平台 mock server（runbook.md §4.1，只绑 loopback）
 mock:
