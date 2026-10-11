@@ -46,3 +46,6 @@ mcp/dist/
 
 # 评测运行数据（含 flag 与平台内部状态，绝不入库）
 workspaces/
+
+# 跨轮次评测数据（含 flag，绝不入库）
+data/
