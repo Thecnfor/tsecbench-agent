@@ -2,7 +2,7 @@
 # 或直接执行各目标下的命令（uv 在 Windows 宿主机也可用）。
 UV ?= uv
 
-.PHONY: bootstrap test lint fmt check run mock image build-recorder build-mcp clean
+.PHONY: bootstrap test lint fmt check run mock image build-recorder build-mcp build-ts-workflow ui clean
 
 ## bootstrap: 安装 Python 3.14 并解析全部 workspace 依赖
 bootstrap:
@@ -48,6 +48,14 @@ build-recorder:
 ## build-mcp: 只构建 Node 阶段（验证 TS→JS 编译链）
 build-mcp:
 	docker build -f docker/Dockerfile --target node-builder -t tsec-mcp:build .
+
+## build-ts-workflow: 构建 L1.5 TS 手动工作流 solver（Mastra）
+build-ts-workflow:
+	cd solver/ts-workflow && npm install && npm run build
+
+## ui: 启动调试观测台（http://127.0.0.1:7878，只读契约产物）
+ui:
+	UI_PORT=$${UI_PORT:-7878} node debug-ui/server.ts
 
 clean:
 	$(UV) run ruff clean 2>/dev/null; rm -rf .pytest_cache recorder/bin mcp/dist

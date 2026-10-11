@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>TSecBench · Agent 观测台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--edge:#30363d;--fg:#c9d1d9;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--edge);position:sticky;top:0;background:var(--bg);z-index:5}
+header h1{font-size:16px;margin:0}header .live{color:var(--ok);font-size:12px}header .dead{color:var(--dim);font-size:12px}
+#runs{display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px;border-bottom:1px solid var(--edge)}
+.run-chip{border:1px solid var(--edge);border-radius:14px;padding:3px 12px;cursor:pointer;font-size:12px}
+.run-chip.on{border-color:var(--acc);color:var(--acc)}
+.run-chip .st{font-size:10px;padding:0 4px;border-radius:8px;margin-left:6px}
+.st.solved{background:#12351c;color:var(--ok)}.st.failed{background:#3d1418;color:var(--bad)}.st.running{background:#2d2a12;color:var(--warn)}
+main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:0;min-height:calc(100vh - 90px)}
+.left{border-right:1px solid var(--edge);padding:12px 16px;min-width:0}
+.right{padding:12px 16px;overflow-y:auto;max-height:calc(100vh - 90px)}
+h2{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:16px 0 8px}
+#budget{height:8px;background:var(--panel);border:1px solid var(--edge);border-radius:4px;overflow:hidden;margin:6px 0}
+#budgetfill{height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--ok))}
+#cot{font-family:var(--mono);font-size:12.5px;background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:10px;max-height:46vh;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+.ev{padding:2px 0;border-left:2px solid transparent}
+.ev.kind-meta{color:var(--dim)}.ev.kind-profile{color:#bc8cff}.ev.kind-plan{color:var(--acc)}.ev.kind-kb{color:var(--warn)}
+.ev.kind-candidate{color:var(--ok);font-weight:600}.ev.kind-done{color:var(--ok)}
+.ev.kind-pi_stdout{color:var(--fg);border-left-color:var(--edge)}.ev.kind-recon{color:#79c0ff}
+.ev .t{color:var(--dim);margin-right:6px}.ev .k{background:#21262d;border-radius:4px;padding:0 5px;margin-right:6px;font-size:11px}
+.card{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:10px;margin-bottom:10px}
+.card h3{margin:0 0 6px;font-size:12px;color:var(--acc)}
+.mem ul{margin:4px 0;padding-left:16px}.mem li{font-family:var(--mono);font-size:12px}
+#gauge{height:10px;background:var(--panel);border:1px solid var(--edge);border-radius:5px;overflow:hidden;margin:4px 0 2px}
+#gaugefill{height:100%;width:0;background:var(--acc)}
+.tabs{display:flex;gap:4px;margin:10px 0}.tab{border:1px solid var(--edge);border-radius:6px 6px 0 0;padding:4px 10px;cursor:pointer;font-size:12px;color:var(--dim)}
+.tab.on{color:var(--acc);border-bottom-color:var(--acc)}
+pre.md{white-space:pre-wrap;font-family:var(--mono);font-size:12px;max-height:34vh;overflow:auto;background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:10px}
+.doclist li{cursor:pointer;padding:2px 0}.doclist li:hover{color:var(--acc)}
+input[type=text]{width:100%;background:#0d1117;border:1px solid var(--edge);color:var(--fg);border-radius:6px;padding:6px 8px;font-size:13px}
+.flag{font-family:var(--mono);color:var(--ok);background:#12351c;display:inline-block;border-radius:6px;padding:2px 8px;margin:2px}
+.pane{display:none}.pane.on{display:block}
+.chart{display:flex;align-items:flex-end;gap:2px;height:60px;background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:6px}
+.chart i{flex:1;background:var(--acc);border-radius:1px;min-height:1px}
+</style>
+</head>
+<body>
+<header>
+  <h1>TSecBench 观测台</h1>
+  <span id="live" class="dead">● 未连接</span>
+  <span style="color:var(--dim);font-size:12px">L0 编排 → L1.5 Mastra 工作流 → pi 执行内核 · 事件流 = 契约产物只读</span>
+</header>
+<div id="runs"></div>
+<main>
+  <div class="left">
+    <h2>任务预算（SOLVER_DEADLINE_EPOCH）</h2>
+    <div id="budget"><div id="budgetfill"></div></div>
+    <span id="budgettext" style="color:var(--dim);font-size:12px">—</span>
+
+    <h2>思维链（chain-of-thought 事件流，SSE 实时）</h2>
+    <div id="cot"></div>
+
+    <h2>长上下文压力（累计 pi 输出，估算 token）</h2>
+    <div class="chart" id="ctxchart"></div>
+    <span id="ctxtext" style="color:var(--dim);font-size:12px">—</span>
+  </div>
+  <div class="right">
+    <div class="tabs" id="tabs">
+      <div class="tab on" data-p="mem">动态记忆</div>
+      <div class="tab" data-p="rag">RAG · LLM wiki</div>
+      <div class="tab" data-p="skills">Skills</div>
+      <div class="tab" data-p="inj">提示词注入</div>
+    </div>
+
+    <div class="pane on" id="p-mem">
+      <div class="card"><h3>候选 flag（harvest 落盘）</h3><div id="flags">—</div></div>
+      <div class="card mem"><h3>prior.json · assets（客观资产，recorder 回流）</h3><ul id="m-assets">—</ul></div>
+      <div class="card mem"><h3>explored（已探索，防重复）</h3><ul id="m-explored"></ul></div>
+      <div class="card mem"><h3>open_leads（未验证线索）</h3><ul id="m-leads"></ul></div>
+      <div class="card"><h3>result.json</h3><pre class="md" id="result" style="max-height:20vh">—</pre></div>
+    </div>
+
+    <div class="pane" id="p-rag">
+      <div class="card"><h3>离线检索（走 kb/index.py 真实倒排链路）</h3>
+        <input type="text" id="q" placeholder="如：werkzeug console / rsa small e / docker.sock">
+        <pre class="md" id="qout" style="margin-top:8px">输入关键词检索知识库…</pre></div>
+      <div class="card"><h3>wiki 文档（点开浏览）</h3><ul class="doclist" id="docs"></ul></div>
+      <pre class="md" id="docview" style="display:none"></pre>
+    </div>
+
+    <div class="pane" id="p-skills">
+      <div class="card"><h3>已部署 skills（kb → agentDir/skills 渐进披露）</h3><ul class="doclist" id="skills"></ul></div>
+      <div class="card"><h3>扩展工具（pi_ext）</h3><span class="flag">recon</span> <span style="color:var(--dim)">nmap top-ports + HTTP 指纹 + 目录枚举 → 预聚合 JSON</span></div>
+    </div>
+
+    <div class="pane" id="p-inj">
+      <div class="card"><h3>APPEND_SYSTEM.md 快照（profile + planner + KB 动态拼装）</h3>
+        <pre class="md" id="injview">运行任一 solver 后自动捕获</pre></div>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s)
+let runId = null, es = null
+
+const KIND_LABEL = {meta:"启动",profile:"分类",plan:"规划",kb:"知识",recon:"侦察",
+  pi_stdout:"思维/工具",candidate:"候选",done:"结束",corrupt:"损坏"}
+
+function renderRuns(runs){
+  const el = $("#runs"); el.innerHTML = ""
+  for (const r of runs){
+    const chip = document.createElement("div")
+    chip.className = "run-chip" + (r.id===runId?" on":"")
+    chip.innerHTML = r.id + ` <span class="st ${r.status}">${r.status}·${r.flags}⚑·${r.events}ev</span>`
+    chip.onclick = () => selectRun(r.id)
+    el.appendChild(chip)
+  }
+}
+
+function evLine(e){
+  const div = document.createElement("div")
+  div.className = "ev kind-" + e.kind
+  const t = e.ts ? new Date(e.ts*1000).toLocaleTimeString() : ""
+  let body = ""
+  if (e.kind === "pi_stdout") body = e.text ?? ""
+  else if (e.kind === "candidate") body = e.flag ?? ""
+  else body = JSON.stringify(Object.fromEntries(Object.entries(e).filter(([k])=>!["ts","kind"].includes(k))))
+  div.innerHTML = `<span class="t">${t}</span><span class="k">${KIND_LABEL[e.kind]??e.kind}</span>${escapeHtml(String(body))}`
+  return div
+}
+function escapeHtml(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+
+async function selectRun(id){
+  runId = id
+  renderRuns(await (await fetch("/api/runs")).json())
+  const evs = await (await fetch(`/api/run/${id}/events`)).json()
+  const cot = $("#cot"); cot.innerHTML = ""
+  for (const e of evs) cot.appendChild(evLine(e))
+  cot.scrollTop = cot.scrollHeight
+  drawContext(evs); drawBudget(evs)
+  if (es) es.close()
+  es = new EventSource(`/api/run/${id}/stream`)
+  $("#live").textContent = "● 实时"; $("#live").className = "live"
+  es.onmessage = (m) => { try { const e = JSON.parse(m.data); cot.appendChild(evLine(e)); cot.scrollTop = cot.scrollHeight; pushContext(e); refreshState() } catch {} }
+  es.onerror = () => { $("#live").textContent = "● 断开"; $("#live").className = "dead" }
+  refreshState()
+}
+
+async function refreshState(){
+  if (!runId) return
+  const s = await (await fetch(`/api/run/${runId}/state`)).json()
+  $("#flags").innerHTML = (s.flags??[]).map(f=>`<span class="flag">${escapeHtml(f)}</span>`).join("") || "（暂无）"
+  const prior = s.prior ?? {}
+  fillList("#m-assets", prior.assets); fillList("#m-explored", prior.explored); fillList("#m-leads", prior.open_leads)
+  $("#result").textContent = s.result ? JSON.stringify(s.result,null,1) : "—"
+  if (s.injection) $("#injview").textContent = s.injection
+}
+function fillList(sel, items){
+  const el = $(sel); el.innerHTML = ""
+  for (const it of (items??[]).slice(0,12)) { const li=document.createElement("li"); li.textContent = it; el.appendChild(li) }
+  if (!items?.length) el.innerHTML = "<li style='color:var(--dim)'>—</li>"
+}
+
+let ctxTokens = []
+function drawContext(evs){
+  ctxTokens = []; let acc = 0
+  for (const e of evs) if (e.kind==="pi_stdout"){ acc += String(e.text??"").length/4; ctxTokens.push(acc) }
+  paintChart()
+}
+function pushContext(e){ if (e.kind==="pi_stdout"){ const last = ctxTokens.at(-1)??0; ctxTokens.push(last + String(e.text??"").length/4); paintChart() } }
+function paintChart(){
+  const el = $("#ctxchart"); el.innerHTML = ""
+  const data = ctxTokens.slice(-120), max = Math.max(1,...data)
+  for (const v of data){ const i=document.createElement("i"); i.style.height = (v/max*100)+"%"; el.appendChild(i) }
+  const est = Math.round(ctxTokens.at(-1) ?? 0)
+  $("#ctxtext").textContent = `累计 ≈ ${est.toLocaleString()} tokens（>45k 触发 v0 裁剪；Mastra 版由 pi compaction 接管）`
+}
+
+function drawBudget(evs){
+  const first = evs[0]?.ts, last = evs.at(-1)?.ts
+  if (!first || !last) return $("#budgettext").textContent = "—"
+  const span = Math.max(1,last-first)
+  // 无 deadline 元数据时以事件跨度示意；接入后用 SOLVER_DEADLINE_EPOCH 精确
+  $("#budgetfill").style.width = Math.min(100, span/1200*100) + "%"
+  $("#budgettext").textContent = `事件跨度 ${Math.round(span)}s（时间片上限 1200s/题）`
+}
+
+async function loadKB(){
+  const docs = await (await fetch("/api/kb")).json()
+  const el = $("#docs"); el.innerHTML = ""
+  const sk = $("#skills"); sk.innerHTML = ""
+  for (const d of docs){
+    for (const [sel,label] of [["#docs",d.doc],["#skills",`${d.doc}（${d.sections.length} 节 · SKILL.md 已生成）`]]){
+      const li = document.createElement("li"); li.textContent = label
+      li.onclick = () => { const v = $("#docview"); v.style.display="block"; v.textContent = d.body; v.scrollIntoView({behavior:"smooth"}) }
+      $(sel).appendChild(li)
+    }
+  }
+}
+$("#q").addEventListener("keydown", async (e) => {
+  if (e.key !== "Enter") return
+  $("#qout").textContent = "检索中…"
+  const hits = await (await fetch("/api/kb/search?q="+encodeURIComponent($("#q").value))).json()
+  $("#qout").textContent = JSON.stringify(hits,null,1).slice(0,4000)
+})
+$("#tabs").addEventListener("click",(e)=>{
+  if (!e.target.classList.contains("tab")) return
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("on"))
+  document.querySelectorAll(".pane").forEach(p=>p.classList.remove("on"))
+  e.target.classList.add("on"); $("#p-"+e.target.dataset.p).classList.add("on")
+})
+
+async function boot(){
+  loadKB()
+  const runs = await (await fetch("/api/runs")).json()
+  renderRuns(runs)
+  if (runs.length) selectRun(runs.at(-1).id)
+  else $("#runs").innerHTML = '<span style="color:var(--dim);font-size:12px">暂无 run —— 跑 `make run`（真实评测）或 `SOLVER_CMD=python solver/dual_main.py` 后，契约产物落盘即自动出现</span>'
+  setInterval(async ()=>renderRuns(await (await fetch("/api/runs")).json()), 5000)
+}
+boot()
+</script>
+</body>
+</html>

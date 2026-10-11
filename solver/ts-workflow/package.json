@@ -1,0 +1,22 @@
+{
+  "name": "@tsecbench/ts-workflow",
+  "version": "0.0.1",
+  "private": true,
+  "description": "L1.5 TS manual-workflow solver (Mastra): deterministic recon->triage->plan->exploit->harvest graph; the model only works INSIDE nodes (user requirement: manual workflows are mandatory under model frameworks). Version pins live in toolchain.env (MASTRA_VERSION / ZOD_VERSION / PI_VERSION).",
+  "type": "module",
+  "engines": {
+    "node": "26.8.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@mastra/core": "1.75.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^26.0.0"
+  }
+}

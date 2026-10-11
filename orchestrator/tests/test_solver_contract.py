@@ -27,9 +27,11 @@ def solver_module(tmp_path, monkeypatch):
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     sys.modules.pop("main", None)
+    sys.modules.pop("common", None)  # 契约状态真值源，须随 main 一同重载
     mod = importlib.import_module("main")
     yield mod, task
     sys.modules.pop("main", None)
+    sys.modules.pop("common", None)
 
 
 def test_orch_mode_detected(solver_module):
@@ -61,7 +63,8 @@ def test_write_result_summary(solver_module):
 
 def test_load_task_tolerates_missing(solver_module, monkeypatch):
     mod, _ = solver_module
-    monkeypatch.setattr(mod, "SOLVER_TASK_PATH", "Z:/nonexistent/nope.json")
+    # 契约状态单一真值源在 common（main 经 __getattr__ 转发），patch 必须落在本体
+    monkeypatch.setattr(mod.common, "SOLVER_TASK_PATH", "Z:/nonexistent/nope.json")
     assert mod.load_task() == {}
 
 
