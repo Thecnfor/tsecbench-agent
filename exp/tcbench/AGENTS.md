@@ -56,6 +56,11 @@
      **禁止任何 _clip/截断逻辑进对话记录**；
    - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt}` /
      `task_close{closed_at,duration_sec,outcome,flags}`；
+   - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求
+     （`prompt.py: CLOSING_SUMMARY_PROMPT`：解题思路 / 工具使用困难 / 工具集优化建议），
+     由 deepseek 输出；复盘作为**普通 user/assistant 消息**原样写入同一 conversation.jsonl
+     （带 `kind_note: "closing_summary"` 标记，`task_close.summary` 同步存全文），
+     未通关的题不复盘；复盘完丢弃 messages（销毁该题 agent 上下文）；
    - **任务不跨 bench 共享**：不同 bench 题目/代号不同，记录互不共享（防跨 bench 作弊）；
      token 明文不落盘（meta 只存 hint，目录名本身即 token 属挂载语义）。
 

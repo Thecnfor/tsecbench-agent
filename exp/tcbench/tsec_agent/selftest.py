@@ -49,11 +49,20 @@ def make_fake_client():
         msgs = kwargs["messages"]
         sys_prompt = next((m["content"] for m in msgs if m["role"] == "system"), "")
         assert kwargs["model"], "model missing"
-        assert "shell" in str(kwargs.get("tools")), "tools missing"
         assert sys_prompt, "system prompt missing"
+
+        # 复盘总结轮：无 tools（use_tools=False），返回总结文本
+        if kwargs.get("tools") is None:
+            last_user = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
+            assert "最终复盘" in last_user or "工具" in last_user, "closing prompt missing"
+            return FakeResponse(FakeChoice(FakeMessage(
+                content="复盘：1. 思路：默认凭据进后台拿 flag。2. 工具困难：dirb 字典路径难记。"
+                        "3. 优化建议：预装 seclists 常用子集。")))
+
+        assert "shell" in str(kwargs.get("tools")), "tools missing"
         # 校验消息序列：tool 消息必须紧跟带 tool_calls 的 assistant
         last = None
-        for m in messages if (messages := kwargs["messages"]) else []:
+        for m in msgs:
             if m["role"] == "tool":
                 assert last and last.get("tool_calls"), "orphan tool message"
             last = m
@@ -203,6 +212,15 @@ def main() -> int:
             saw_full["result"] = True
     assert "system" in kinds and "user" in kinds and "assistant" in kinds and "tool" in kinds, kinds
     assert all(saw_full.values()), f"conversation missing fields: {saw_full}"
+    # 通关复盘：同一 jsonl 里有 closing_summary 标记的 assistant 条目（t-01 通关，t-02 未通关无）
+    closing = [r for r in (json.loads(l) for l in open(conv_t01))
+               if r["kind"] == "assistant" and r.get("kind_note") == "closing_summary"]
+    assert closing, "closing summary missing in conversation.jsonl"
+    assert "优化建议" in (closing[0].get("output") or ""), "closing summary content not recorded"
+    conv_t02 = os.path.join(recdir, "tasks", "t-02", "conversation.jsonl")
+    closing02 = [r for r in (json.loads(l) for l in open(conv_t02))
+                 if r.get("kind_note") == "closing_summary"]
+    assert not closing02, "t-02 not completed but got closing summary!"
     # t-02 conversation 也存在（对话按题隔离）
     assert os.path.isfile(os.path.join(recdir, "tasks", "t-02", "conversation.jsonl"))
     # events.jsonl 存在且有 run_start/run_finish/final_summary

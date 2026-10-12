@@ -21,7 +21,7 @@ import time
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 
 from config import CFG
-from prompt import SYSTEM_PROMPT, TASK_TEMPLATE
+from prompt import SYSTEM_PROMPT, TASK_TEMPLATE, CLOSING_SUMMARY_PROMPT
 from shell_tool import SHELL_TOOL_SCHEMA, dispatch_shell, set_task_cwd, get_task_cwd
 from records import init_records, rec
 import bench
@@ -54,26 +54,29 @@ def make_client() -> OpenAI:
     )
 
 
-def call_llm(client: OpenAI, messages: list) -> object:
+def call_llm(client: OpenAI, messages: list, use_tools: bool = True) -> object:
     """chat completion 调用，按 AGENT_LLM_RETRY_MODE 重试。
 
     - forever（默认）：连接/超时/限流/5xx 无限指数退避（封顶 llm_retry_max_delay），
       直到成功或任务时限；每 10 次记一条日志避免刷屏。
     - finite：最多 api_max_retries 次后抛出。
     - 4xx（认证/参数错误，非 429）：立即抛出，不重试。
+    - use_tools=False：复盘总结轮用——不下发工具，模型只能输出文本。
     """
     delay = 2.0
     attempt = 0
     while True:
         attempt += 1
         try:
-            return client.chat.completions.create(
+            kwargs = dict(
                 model=CFG.model,
                 messages=messages,
-                tools=[SHELL_TOOL_SCHEMA],
-                tool_choice="auto",
                 temperature=0.2,
             )
+            if use_tools:
+                kwargs["tools"] = [SHELL_TOOL_SCHEMA]
+                kwargs["tool_choice"] = "auto"
+            return client.chat.completions.create(**kwargs)
         except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
             # 4xx 认证/参数错误（除 429 限流）重试无意义 → 立即失败
             status = getattr(e, "status_code", None)
@@ -206,13 +209,14 @@ def smoke_test(client: OpenAI) -> int:
     return 0 if ok else 1
 
 
-def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[bool, str, int]:
+def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
+               conv) -> tuple[bool, str, int, list]:
     """单题独立上下文：解题直到模型输出最终总结（无工具调用）或轮次预算耗尽。
 
-    返回 (got_summary, last_content, turns_used)。上下文用完即弃，题目间互不影响。
+    返回 (got_summary, last_content, turns_used, messages)——messages 交还调用方用于
+    通关后的复盘总结（同上下文），复盘完成即销毁。
     对话全量、忠实落盘（conversation.jsonl）：发送什么、输出什么，原样记录不裁剪。
     """
-    conv = rec().conversation(code)
     messages: list = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task_card},
@@ -224,13 +228,13 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
     turns_used = 0
     for turn in range(1, budget + 1):
         if (rem := remaining_sec()) is not None and rem <= 0:
-            return False, last_content, turns_used
+            return False, last_content, turns_used, messages
         try:
             resp = call_llm(client, messages)
         except Exception as e:
             log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
             conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}")
-            return False, last_content, turns_used
+            return False, last_content, turns_used, messages
         turns_used += 1
 
         msg = resp.choices[0].message
@@ -262,7 +266,7 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
 
         if not tool_calls_raw:
             # 本题上下文的最终总结 → 交还控制器
-            return True, msg.content or "", turns_used
+            return True, msg.content or "", turns_used, messages
 
         for tc in tool_calls_raw:
             args = {}
@@ -282,7 +286,31 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     log(f"[{code}] per-task turn budget ({budget}) exhausted")
-    return False, last_content, turns_used
+    return False, last_content, turns_used, messages
+
+
+def closing_summary(client: OpenAI, code: str, messages: list, conv) -> str:
+    """通关后复盘：在同一题上下文里追加一条总结请求（无工具），回复作为普通消息
+    与其它对话一样忠实写入 conversation.jsonl。返回总结文本。"""
+    user_msg = {"role": "user", "content": CLOSING_SUMMARY_PROMPT}
+    messages.append(user_msg)
+    conv.write("user", turn=f"{code}:closing", content=CLOSING_SUMMARY_PROMPT)
+    try:
+        resp = call_llm(client, messages, use_tools=False)
+    except Exception as e:
+        log(f"[{code}] closing summary LLM error: {type(e).__name__}: {e}")
+        conv.write("error", turn=f"{code}:closing", error=f"{type(e).__name__}: {e}")
+        return ""
+    msg = resp.choices[0].message
+    assistant_msg = {"role": "assistant", "content": msg.content}
+    messages.append(assistant_msg)
+    conv.write("assistant", turn=f"{code}:closing",
+               thinking=getattr(msg, "reasoning_content", None),
+               output=msg.content,
+               kind_note="closing_summary",   # 标记本条为通关复盘
+               usage=getattr(resp, "usage", None))
+    log(f"[{code}] closing summary recorded ({len(msg.content or '')} chars)")
+    return msg.content or ""
 
 
 def _task_target(state: dict) -> str:
@@ -372,6 +400,9 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
         set_task_cwd(_task_workdir(code))
         last = ""
         state = None
+        closing_text = ""
+        conv = rec().conversation(code)
+        messages: list | None = None
         try:
             card = TASK_TEMPLATE.format(
                 code=code, difficulty=task["difficulty"], level=task["level"],
@@ -382,7 +413,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             budget = task_budget
             if rem := remaining_sec():
                 budget = max(10, min(task_budget, int(rem // 6)))
-            _, last, _ = solve_task(client, code, card, budget)
+            _, last, _, messages = solve_task(client, code, card, budget, conv)
 
             # 校验平台状态（快照失败重试，避免误判）
             for _try in range(3):
@@ -392,10 +423,15 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                     if state is not None:
                         break
                 time.sleep(4)
+
+            # 通关后：同一上下文直接追加复盘请求，总结像普通消息一样落 conversation.jsonl
+            if state and state["is_completed"] and messages is not None:
+                closing_text = closing_summary(client, code, messages, conv)
         except Exception as e:
             log(f"[{code}] worker error: {type(e).__name__}: {e}")
             rec().event("task_error", {"code": code, "error": f"{type(e).__name__}: {e}"})
         finally:
+            messages = None  # 该题上下文销毁（引用丢弃，随 GC 回收）
             set_task_cwd("")  # 线程结束清 thread-local
             closed_at = time.strftime("%Y-%m-%d %H:%M:%S")
             completed = bool(state and state["is_completed"])
@@ -420,7 +456,8 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                              duration_sec=round(time.time() - TASK_START_TS.get(code, time.time()), 1),
                              outcome=outcome,
                              flags=(f"{state['correct_flag_count']}/{state['flag_count']}" if state else "?"),
-                             summary=(last or "")[:800])
+                             summary=(closing_text or last or ""),
+                             workdir_summary=(last or ""))
             log(f"=== task {code}: {outcome} "
                 f"{'(' + str(state['correct_flag_count']) + '/' + str(state['flag_count']) + ')' if state else ''} ===")
             with lock:
