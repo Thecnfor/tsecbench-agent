@@ -112,7 +112,13 @@ POST {BASE}/openapi/v1/challenges/close?unique_code=X  释放名额（通关/放
 - [ ] `agent.py --smoke` 通过（本地模式不强求 VPN；hosted 模式必须全绿）
 - [ ] 凭证只出现在 `.env`（已 gitignore），**没有硬编码进代码/文档/镜像层**
 - [ ] 改了 Dockerfile/entrypoint → 重新 build + `--smoke` 验证
-- [ ] **镜像体积 ≤3GB**：`docker images tsec-agent` 检查（当前 1.21GB；大体积包如 seclists 全量字典、metasploit 不要装）
+- [ ] **镜像体积 ≤3GB**：`docker images tsec-agent` 检查（当前 1.27GB；大体积包如 seclists 全量字典、metasploit 不要装）
+- [ ] **限网运行**：容器只允许 AI API + 靶场 VPN 出站，公网全 ban。
+  新依赖必须**预装进镜像**（apt/pip/字典），不要依赖运行时联网安装；
+  新的外联需求先加到 Dockerfile 再改提示词
+- [ ] **只放通用资源，不放题目特化资源**：题目每次都变，源码仓库/PoC/特定 CVE 材料
+  一律不进镜像（上轮用过的仓库不代表下轮有用）；只保留通用库（exploitdb/searchsploit、
+  seclists、rockyou、dirb）和跨题常用工具
 - [ ] 改了平台相关逻辑 → 对照 README 平台流程与错误码
 - [ ] 没有破坏上述架构不变量（单工具、容器 VPN、预检门槛、不硬编码平台差异）
 - [ ] README/AGENTS.md 同步更新

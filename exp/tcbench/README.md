@@ -32,6 +32,19 @@
 - **检测逻辑**（默认 `AGENT_MODE=auto`）：探测 local 网关 `/models` 可达 → local；
   否则探测 hosted 网关 → hosted；都不通回退 local 并由冒烟测试报错。
 - **覆盖**：环境变量 `AGENT_MODE=local|hosted`，或命令行 `agent.py --mode hosted`。
+- **托管模式转写网关（官方机制）**：托管环境中大模型 API 一律走转写网关，
+  地址转换规则 `https://HOST[/path]` → `http://HOST.tsecbench.gw[/path]`（`config.py: to_gateway_url` 自动转换）。
+  官方白名单供应商（19 家，均可按此规则转换）：
+  `api.hunyuan.cloud.tencent.com`、`api.lkeap.cloud.tencent.com`、`tokenhub.tencentmaas.com`、
+  `api.deepseek.com`、`dashscope.aliyuncs.com/compatible-mode`、`*.maas.aliyuncs.com`、
+  `qianfan.baidubce.com`、`ark.cn-beijing.volces.com`、`open.bigmodel.cn`、`api.moonshot.cn`、
+  `api.siliconflow.cn`、`spark-api-open.xf-yun.com`、`api.minimaxi.com`、`api.stepfun.com`、
+  `api.lingyiwanwu.com`、`api.baichuan-ai.com`、`api.xiaomimimo.com`、`api.kimi.com`、`agent-awd.baidu.com`。
+  **换供应商**：只改 `.env` 的 `DEEPSEEK_BASE_URL`（官方地址）+ `AGENT_MODEL`，hosted 地址自动转换。
+- **出站防火墙（docker 层面限网）**：`NET_RESTRICT`（entrypoint，默认 auto：
+  探测公网 AI API 可达=local 不限网，不可达=hosted 启用）。启用后容器 netns 内 iptables
+  出站白名单：`lo` 全通、`tun0`（VPN 隧道，覆盖全部转写网关与靶场）全通、VPN 服务器端口
+  （保重连）、平台 API 域名 IP；**其余出站 DROP**（IPv6 一并禁）。只作用于容器网络命名空间。
 - **凭证**：全部写在项目根 `.env`（`.gitignore` 排除、不入库）。
   优先级：真实环境变量 > `.env` > 内置默认。
 - **变量注入分工**：
@@ -102,6 +115,10 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 - Kali 基础镜像内的 `mirrors.neusoft.edu.cn` 源已切换为 `http.kali.org`（见 Dockerfile）
 
 ## 环境变量与 `.env`
+
+> **限网原则**：托管/正式环境只允许 AI API + 靶场 VPN 出站，公网全 ban。
+> 工具与字典全部**按领域预装进镜像**（Web/内网/爆破/逆向/取证/隧道/数据库 + exploitdb/seclists/rockyou），
+> 不放任何题目特化资源（题目每次都变）；详见 `docker/Dockerfile` 的领域分组注释。
 
 凭证统一放项目根 `.env`（`.gitignore` 已排除，**不入库**）。优先级：真实环境变量 > `.env` > 内置默认。
 

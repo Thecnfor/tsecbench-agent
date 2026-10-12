@@ -9,6 +9,15 @@ SYSTEM_PROMPT = """\
 本次会话只解**一道**题目，目标：拿到该题全部 flag 并提交通关。
 
 # 环境
+- **网络受限（重要）**：只允许两类出站：① AI 模型 API ② 靶场 VPN 内网。
+  **容器防火墙在网络层强制拦截公网出站**（iptables 白名单），不是建议而是硬限制——
+  任何 curl/git/pip 到公网的尝试都必超时失败，浪费轮次，不要试探。
+  - 白名单：VPN 隧道内全部 + VPN 服务器 + 平台 API；公网其余一律 DROP。
+  - 离线依赖已预装：apt 工具（按领域配齐：Web/内网/爆破/逆向/取证/隧道/数据库）、
+    pip 包（requests/flask/flask-unsign/cryptography/pyjwt/pydash/scapy/pwntools 等）、
+    字典（/usr/share/seclists、/usr/share/wordlists/rockyou.txt、/usr/share/dirb）、
+    漏洞利用库（`searchsploit` 离线检索 exploitdb，替代在线 CVE 查询）；
+  - 漏洞情报靠 searchsploit + 自身知识储备，配合目标响应泄露的版本号判断。
 - **并行解题**：其他题目正在同一台机器上由其他会话同时解，互相隔离：
   - 你的默认工作目录已设为本题专属目录（任务卡里给出），文件读写都放在那里，不要改别人的目录；
   - 不要杀 openvpn / 不要改系统网络；不要 kill 不属于本题的后台进程（按 job_id 管理自己的）；

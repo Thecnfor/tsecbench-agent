@@ -58,7 +58,56 @@ if ! getent hosts "$GATEWAY_HOST" >/dev/null 2>&1; then
     fi
 fi
 
-# --- 4. 执行传入命令（默认：先冒烟自测，通过后正式跑分） ---
+# --- 4. 出站网络限制（限网模式）---
+# NET_RESTRICT=1：出站白名单——lo 全通、tun0(VPN隧道) 全通、VPN服务器:端口(保重连)、
+# 平台API域名IP；其余出站全部 DROP。只作用于容器 netns（docker 授予 NET_ADMIN），不碰宿主机。
+# NET_RESTRICT=auto（默认）：探测公网 AI API——可达=local 开发模式(不禁网)，
+# 不可达=hosted 托管模式(禁网)。NET_RESTRICT=0 显式禁用。
+restrict_network() {
+    local vpn_srv vpn_port bench_host
+    vpn_srv=$(awk '/^remote /{print $2; exit}' "$VPN_CONF" 2>/dev/null)
+    vpn_port=$(awk '/^remote /{print $3; exit}' "$VPN_CONF" 2>/dev/null)
+    vpn_port="${vpn_port:-1194}"
+    bench_host=$(printf '%s' "${BENCHMARK_BASE_URL:-}" | sed -E 's|^[a-z]+://([^/:]+).*|\1|')
+
+    iptables -N TSEC_OUT 2>/dev/null || iptables -F TSEC_OUT
+    iptables -A TSEC_OUT -o lo -j ACCEPT
+    iptables -A TSEC_OUT -o tun0 -j ACCEPT                      # 靶场内网 + 内网转写网关
+    if [ -n "${vpn_srv:-}" ]; then
+        iptables -A TSEC_OUT -o eth0 -d "$vpn_srv" -p udp --dport "$vpn_port" -j ACCEPT
+        iptables -A TSEC_OUT -o eth0 -d "$vpn_srv" -p tcp --dport "$vpn_port" -j ACCEPT
+    fi
+    if [ -n "${bench_host:-}" ] && [ "$bench_host" != "${BENCHMARK_BASE_URL:-}" ]; then
+        local ip
+        for ip in $(getent ahosts "$bench_host" 2>/dev/null | awk '{print $1}' | sort -u); do
+            iptables -A TSEC_OUT -o eth0 -d "$ip" -j ACCEPT
+            log "allow bench api egress: $bench_host -> $ip"
+        done
+    fi
+    iptables -A TSEC_OUT -o eth0 -j DROP
+    iptables -C OUTPUT -j TSEC_OUT 2>/dev/null || iptables -I OUTPUT 1 -j TSEC_OUT
+    # IPv6 一律不出站（避免 v6 绕过）
+    command -v ip6tables >/dev/null && { ip6tables -I OUTPUT 1 -o eth0 -j DROP 2>/dev/null || true; }
+    log "egress restricted: whitelisted (lo, tun0, vpn-server, bench-api); others DROP"
+}
+
+NET_RESTRICT="${NET_RESTRICT:-auto}"
+if [ "$NET_RESTRICT" = "auto" ]; then
+    if timeout 5 curl -s -o /dev/null https://api.deepseek.com/v1/models 2>/dev/null; then
+        NET_RESTRICT=0
+        log "NET_RESTRICT=auto -> 0 (local mode: public AI API reachable, no egress lockdown)"
+    else
+        NET_RESTRICT=1
+        log "NET_RESTRICT=auto -> 1 (hosted mode: AI API via VPN, public egress will be blocked)"
+    fi
+fi
+if [ "$NET_RESTRICT" = "1" ]; then
+    restrict_network
+else
+    log "NET_RESTRICT=0: egress NOT restricted (dev/local mode)"
+fi
+
+# --- 5. 执行传入命令（默认：先冒烟自测，通过后正式跑分） ---
 if [ $# -eq 0 ]; then
     if /opt/agent-venv/bin/python3 /agent/agent.py --smoke; then
         log "smoke test passed, starting full run"

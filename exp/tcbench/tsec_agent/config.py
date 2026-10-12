@@ -9,6 +9,7 @@
 """
 
 import os
+import re
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -31,12 +32,38 @@ def _env(name: str, default: str) -> str:
     return val if val not in (None, "") else default
 
 
+# --- 托管模式转写网关通用转换 ---
+# 托管环境所有大模型 API 走转写网关：https://HOST[/path] → http://HOST.tsecbench.gw[/path]。
+# 白名单供应商（托管环境官方清单，共19家，均可按此规则转换）：
+#   api.hunyuan.cloud.tencent.com / api.lkeap.cloud.tencent.com / tokenhub.tencentmaas.com /
+#   api.deepseek.com / dashscope.aliyuncs.com(compatible-mode) / *.maas.aliyuncs.com /
+#   qianfan.baidubce.com / ark.cn-beijing.volces.com / open.bigmodel.cn / api.moonshot.cn /
+#   api.siliconflow.cn / spark-api-open.xf-yun.com / api.minimaxi.com / api.stepfun.com /
+#   api.lingyiwanwu.com / api.baichuan-ai.com / api.xiaomimimo.com / api.kimi.com /
+#   agent-awd.baidu.com
+# 换模型供应商时：只需改 .env 的 DEEPSEEK_BASE_URL（官方地址）+ AGENT_MODEL，
+# hosted 网关地址自动转换，无需其他改动。
+GATEWAY_SUFFIX = ".tsecbench.gw"
+
+
+def to_gateway_url(base_url: str) -> str:
+    """https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1（幂等）"""
+    m = re.match(r"^[a-z]+://([^:/]+)(:\d+)?(/.*)?$", base_url.strip())
+    if not m:
+        return base_url
+    host, port, path = m.group(1), m.group(2) or "", m.group(3) or ""
+    if host.endswith(GATEWAY_SUFFIX):  # 已是转写网关地址，原样返回
+        return base_url
+    return f"http://{host}{GATEWAY_SUFFIX}{port}{path}"
+
+
 # --- 两套模型后端 ---
 LOCAL_BASE_URL = _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 LOCAL_API_KEY = _env("DEEPSEEK_API_KEY", "")
 LOCAL_MODEL = _env("AGENT_MODEL_LOCAL", "deepseek-flash")
 
-HOSTED_BASE_URL = _env("DEEPSEEK_BASE_URL_HOSTED", "http://api.deepseek.com.tsecbench.gw/v1")
+# hosted：显式配置优先，否则由本地官方地址自动转换
+HOSTED_BASE_URL = _env("DEEPSEEK_BASE_URL_HOSTED", to_gateway_url(LOCAL_BASE_URL))
 HOSTED_API_KEY = _env("DEEPSEEK_API_KEY_HOSTED", "tsec-bench")
 HOSTED_MODEL = _env("AGENT_MODEL_HOSTED", "deepseek-v4.1-flash-expires-on-0910")
 
