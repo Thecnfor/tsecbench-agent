@@ -137,9 +137,19 @@ def install_fake_bench():
 def main() -> int:
     import agent
     import os
+    import json
+    import shutil
+    import tempfile
     from config import CFG
     os.environ.setdefault("AGENT_MODE", "local")
     CFG.resolve()  # 填充 model/base_url（离线自测不真实连接）
+
+    # 记录目录隔离到临时目录（模拟 /work）
+    recdir = tempfile.mkdtemp(prefix="tsec_rec_")
+    os.environ["RECORDS_DIR"] = recdir
+    os.environ["AGENT_PLATFORM_WATCH"] = "0"  # 离线：不开平台轮询线程
+    import records
+    records.RECORDS_DIR = recdir
 
     calls = install_fake_bench()
     client = make_fake_client()
@@ -151,7 +161,56 @@ def main() -> int:
     assert rc == 0, f"run() returned {rc}"
     assert "t-01" in started and "t-02" in started, f"started={started}"
     assert "t-01" in closed and "t-02" in closed, f"closed={closed}"
-    print("PASS: controller + per-task isolated context end-to-end OK")
+
+    # ---- 持久化记录断言 ----
+    # meta.json：run 起止齐全
+    meta = json.load(open(os.path.join(recdir, "meta.json")))
+    assert meta["mode"] == "local" and meta["model"], "meta mode/model missing"
+    assert meta["runs"] and meta["runs"][0].get("started_at"), "runs[].started_at missing"
+    assert meta["runs"][0].get("finished_at"), "runs[].finished_at missing"
+    # tasks.jsonl：生命周期含 task_start(started_at) 与 task_close(closed_at/duration)
+    phases = {}
+    for line in open(os.path.join(recdir, "tasks.jsonl")):
+        r = json.loads(line)
+        phases.setdefault(r["code"], set()).add(r["phase"])
+        if r["phase"] == "task_start":
+            assert r.get("started_at") and r.get("target"), f"task_start fields: {r}"
+        if r["phase"] == "task_close":
+            assert r.get("closed_at") and r.get("duration_sec") is not None, f"task_close fields: {r}"
+            assert r.get("outcome") in ("pass", "fail"), f"outcome: {r}"
+    assert phases.get("t-01") >= {"task_start", "task_close"}, f"t-01 lifecycle: {phases.get('t-01')}"
+    # conversation.jsonl：全量不裁剪——assistant 含 thinking/output/tool_calls，tool 含 result
+    conv_t01 = os.path.join(recdir, "tasks", "t-01", "conversation.jsonl")
+    kinds = []
+    saw_full = {"thinking": False, "output": False, "tool_calls": False, "result": False}
+    for line in open(conv_t01):
+        r = json.loads(line)
+        kinds.append(r["kind"])
+        if r["kind"] == "system" and len(r["content"]) < 500:
+            raise AssertionError("system prompt truncated!")
+        if r["kind"] == "assistant":
+            if r.get("thinking"):
+                saw_full["thinking"] = True
+                # 忠实：不裁剪，thinking 原文应与模型输出一致（含"先侦察"）
+                assert "先侦察" in r["thinking"] or len(r["thinking"]) > 10, r["thinking"]
+            if r.get("output"):
+                saw_full["output"] = True
+            if r.get("tool_calls"):
+                saw_full["tool_calls"] = True
+                assert '"echo flag{fake}"' in r["tool_calls"][0]["arguments"] or \
+                       "flag{fake}" in r["tool_calls"][0]["arguments"], "tool args not faithful"
+        if r["kind"] == "tool" and r.get("result"):
+            saw_full["result"] = True
+    assert "system" in kinds and "user" in kinds and "assistant" in kinds and "tool" in kinds, kinds
+    assert all(saw_full.values()), f"conversation missing fields: {saw_full}"
+    # t-02 conversation 也存在（对话按题隔离）
+    assert os.path.isfile(os.path.join(recdir, "tasks", "t-02", "conversation.jsonl"))
+    # events.jsonl 存在且有 run_start/run_finish/final_summary
+    evs = [json.loads(l)["type"] for l in open(os.path.join(recdir, "events.jsonl"))]
+    assert "run_start" in evs and "run_finish" in evs and "final_summary" in evs, evs
+
+    shutil.rmtree(recdir, ignore_errors=True)
+    print("PASS: controller + per-task context + persistent records end-to-end OK")
     return 0
 
 

@@ -143,6 +143,30 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 > 切换「内部本地跑分」时只需改 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`，代码零改动。
 > 手动指定模式：`agent.py --mode local|hosted` 或 `AGENT_MODE=hosted`。
 
+## bench 记录持久化（records.py，替代旧 trace 双文件）
+
+```
+docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 token 重启则 append）
+├── meta.json                         # mode/model、runs[]（每次运行 started_at/finished_at/结果）
+├── events.jsonl                      # run 级事件：llm_retry、platform_poll_error、final_summary…
+├── tasks.jsonl                       # 题目生命周期：task_start{started_at,target,attempt}
+│                                      / task_close{closed_at,duration_sec,outcome,flags}
+├── openvpn.log
+└── tasks/<code>/
+     ├── conversation.jsonl           # 完整 LLM 对话，**全量不裁剪**：
+     │    system/user 任务卡、assistant{thinking,output,tool_calls}、tool{result}
+     │    每条含 ts/seq/turn/tool_call_id
+     └── <AI 解题产物>
+```
+
+- **隔离**：`run.sh` 只挂 `runs/<TOKEN>:/work` → 容器内只有当前 bench；
+  其他 bench 不在挂载内（bench 内可读、bench 外不可读），不做 shell 拦截。
+- **归档**：`docker/archive_runs.sh [TOKEN...]` 把记录打包到 docker 目录外
+  （默认 `~/tsec_bench_runs/<TOKEN>_<ts>.tar.gz`）并删除源目录；归档包数量/存留自行管理。
+  运行中的 bench 会拒绝归档。
+- **反作弊**：任务不跨 bench 共享（题目/代号每轮不同）；`.gitignore` 排除 `docker/runs/`。
+- 查看对话：`jq . docker/runs/<TOKEN>/tasks/e1-01/conversation.jsonl`
+
 ## 平台流程（agent 提示词内置）
 
 1. `GET /openapi/v1/challenges` — 拉题列表与进度（优先 `is_completed=false`，由易到难）

@@ -46,6 +46,18 @@
 7. **上下文按题隔离（方案 A）**：平台编排（选题/start/close/名额）由 `agent.py` 控制器 +
    `bench.py` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solve_task`），
    题目做完上下文即弃。**不要改回单一大上下文**。失败题重试上限 2 次（attempts 字典）。
+8. **bench 记录与隔离（records.py）**：
+   - 记录目录唯一键 = **token**（`docker/runs/<TOKEN>/`，无时间戳；同 token 重启 append）；
+   - **隔离靠挂载边界**：`run.sh` 只挂当前 token 目录为 `/work`——容器内只见当前 bench，
+     其他 bench 不在挂载内；**不做 shell 拦截**；旧 bench 由 `docker/archive_runs.sh`
+     归档到 docker 目录外（`~/tsec_bench_runs/`，存留用户自行管理），归档后彻底不可读；
+   - **对话忠诚不裁剪**：发送给模型的 system/user、模型的 thinking/output/tool_calls、
+     工具 result 全部原样落 `conversation.jsonl`（含 ts/seq/turn/tool_call_id），
+     **禁止任何 _clip/截断逻辑进对话记录**；
+   - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt}` /
+     `task_close{closed_at,duration_sec,outcome,flags}`；
+   - **任务不跨 bench 共享**：不同 bench 题目/代号不同，记录互不共享（防跨 bench 作弊）；
+     token 明文不落盘（meta 只存 hint，目录名本身即 token 属挂载语义）。
 
 ## 文件地图
 
@@ -55,7 +67,7 @@
 | `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
 | `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill | 调工具行为 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
-| `tsec_agent/trace.py` | 追踪日志：思考/输出/工具/生命周期 → trace.jsonl + trace.log | 日志字段调整 |
+| `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl | 记录字段调整 |
 | `tsec_agent/config.py` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
 | `tsec_agent/selftest.py` | 离线端到端自测（fake 模型驱动工具循环） | 改动主循环后必须跑 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + agent venv | 加工具/依赖（**镜像 ≤3GB 硬约束**） |

@@ -23,13 +23,16 @@ from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLi
 from config import CFG
 from prompt import SYSTEM_PROMPT, TASK_TEMPLATE
 from shell_tool import SHELL_TOOL_SCHEMA, dispatch_shell, set_task_cwd, get_task_cwd
-from trace import TRACE
+from records import init_records, rec
 import bench
 from bench import PlatformError
 
 import threading
 
 LOG_PATH = "agent.log"
+
+# 题目启动时间戳（code -> unix ts），用于 task_close 计算 duration
+TASK_START_TS: dict[str, float] = {}
 
 
 def log(msg: str) -> None:
@@ -88,7 +91,7 @@ def call_llm(client: OpenAI, messages: list) -> object:
             if attempt == 1 or attempt % 10 == 0:
                 log(f"LLM call failed (attempt {attempt}, {CFG.llm_retry_mode} mode): "
                     f"{type(e).__name__}: {e}; retry in {wait:.0f}s")
-                TRACE.run_lifecycle("llm_retry", {"attempt": attempt,
+                rec().event("llm_retry", {"attempt": attempt,
                                                   "error": f"{type(e).__name__}: {e}",
                                                   "next_delay_sec": wait})
             time.sleep(wait)
@@ -107,7 +110,7 @@ def start_platform_watcher(interval: float = 20.0) -> None:
     import urllib.request
 
     if os.environ.get("AGENT_PLATFORM_WATCH", "1") in ("0", "off", "false"):
-        TRACE.run_lifecycle("platform_watcher_disabled", {})
+        rec().event("platform_watcher_disabled", {})
         return
 
     def _fetch() -> list | None:
@@ -125,12 +128,12 @@ def start_platform_watcher(interval: float = 20.0) -> None:
             try:
                 items = _fetch()
             except Exception as e:
-                TRACE.run_lifecycle("platform_poll_error", {"error": f"{type(e).__name__}: {e}"})
+                rec().event("platform_poll_error", {"error": f"{type(e).__name__}: {e}"})
                 time.sleep(interval)
                 continue
             cur = {c["unique_code"]: c for c in items}
             if first:
-                TRACE.run_lifecycle("platform_snapshot", {
+                rec().event("platform_snapshot", {
                     "total": len(cur),
                     "completed": [k for k, v in cur.items() if v["is_completed"]],
                 })
@@ -140,22 +143,24 @@ def start_platform_watcher(interval: float = 20.0) -> None:
                 if p is None:
                     continue
                 if p["container_status"] != c["container_status"]:
-                    TRACE.challenge_change(code, "container_status",
-                                           p["container_status"], c["container_status"])
+                    rec().event("challenge_change", {"code": code, "field": "container_status",
+                                             "old": p["container_status"],
+                                             "new": c["container_status"]})
                 if p["correct_flag_count"] != c["correct_flag_count"]:
-                    TRACE.challenge_change(
-                        code, "flags",
-                        f"{p['correct_flag_count']}/{p['flag_count']}",
-                        f"{c['correct_flag_count']}/{c['flag_count']}",
-                        f"completed={c['is_completed']}")
+                    rec().event("challenge_change", {
+                        "code": code, "field": "flags",
+                        "old": f"{p['correct_flag_count']}/{p['flag_count']}",
+                        "new": f"{c['correct_flag_count']}/{c['flag_count']}",
+                        "completed": c["is_completed"]})
                 if p["is_completed"] != c["is_completed"]:
-                    TRACE.challenge_change(code, "is_completed",
-                                           p["is_completed"], c["is_completed"])
+                    rec().event("challenge_change", {"code": code, "field": "is_completed",
+                                                     "old": p["is_completed"],
+                                                     "new": c["is_completed"]})
             prev = cur
             time.sleep(interval)
 
     threading.Thread(target=_watch, daemon=True).start()
-    TRACE.run_lifecycle("platform_watcher_started", {"interval_sec": interval})
+    rec().event("platform_watcher_started", {"interval_sec": interval})
 
 
 def smoke_test(client: OpenAI) -> int:
@@ -205,11 +210,16 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
     """单题独立上下文：解题直到模型输出最终总结（无工具调用）或轮次预算耗尽。
 
     返回 (got_summary, last_content, turns_used)。上下文用完即弃，题目间互不影响。
+    对话全量、忠实落盘（conversation.jsonl）：发送什么、输出什么，原样记录不裁剪。
     """
+    conv = rec().conversation(code)
     messages: list = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task_card},
     ]
+    # 忠实记录本题输入（system + 任务卡）
+    conv.write("system", turn=f"{code}:0", content=SYSTEM_PROMPT)
+    conv.write("user", turn=f"{code}:0", content=task_card)
     last_content = ""
     turns_used = 0
     for turn in range(1, budget + 1):
@@ -219,18 +229,22 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
             resp = call_llm(client, messages)
         except Exception as e:
             log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
+            conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}")
             return False, last_content, turns_used
         turns_used += 1
 
         msg = resp.choices[0].message
         tlabel = f"{code}:{turn}"
         tool_calls_raw = getattr(msg, "tool_calls", None) or []
-        TRACE.assistant_turn(
+        # AI 输出全量落盘：thinking / output / tool_calls 原文
+        conv.write(
+            "assistant",
             turn=tlabel,
-            reasoning=getattr(msg, "reasoning_content", None),
-            content=msg.content,
+            thinking=getattr(msg, "reasoning_content", None),
+            output=msg.content,
             tool_calls=[{"id": tc.id, "name": tc.function.name,
                          "arguments": tc.function.arguments} for tc in tool_calls_raw],
+            usage=getattr(resp, "usage", None),
         )
         if msg.content:
             last_content = msg.content
@@ -261,7 +275,9 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int) -> tuple[
                     result = dispatch_shell(args)
                 else:
                     result = f"error: unknown tool {tc.function.name!r}"
-            TRACE.tool_result(tlabel, tc.function.name, args, result)
+            # 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联）
+            conv.write("tool", turn=tlabel, tool_call_id=tc.id, tool=tc.function.name,
+                       arguments=args, result=result)
             log(f"tool#{tc.id[-6:]} {tc.function.name} -> {result.splitlines()[0][:160] if result else ''}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
@@ -280,9 +296,13 @@ def run(client: OpenAI) -> int:
     """控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close → 下一题。
 
     平台编排由 Python 硬编码（可靠），模型只在单题上下文里解题（上下文隔离）。
+    所有记录持久化到当前 bench 目录（records.py）。
     """
-    TRACE.run_lifecycle("run_start", {"mode": CFG.mode, "model": CFG.model,
-                                      "max_turns": CFG.max_turns, "deadline_sec": CFG.deadline_sec})
+    R = init_records(mode=CFG.mode, model=CFG.model)
+    R.event("run_start", {"mode": CFG.mode, "model": CFG.model,
+                          "max_turns": CFG.max_turns, "deadline_sec": CFG.deadline_sec})
+    R.run_start(mode=CFG.mode, model=CFG.model, max_turns=CFG.max_turns)
+    log(f"records dir: {R.dir}")
     start_platform_watcher()
     task_budget = int(os.environ.get("AGENT_TASK_MAX_TURNS", "60"))
     task_filter = os.environ.get("AGENT_TASK_FILTER", "").strip()
@@ -297,11 +317,11 @@ def run(client: OpenAI) -> int:
             if e.code == "task_not_found":
                 raise
             log(f"platform fetch error: {e}")
-            TRACE.run_lifecycle("platform_poll_error", {"error": str(e)})
+            rec().event("platform_poll_error", {"error": str(e)})
             return None
         except Exception as e:
             log(f"platform fetch error: {type(e).__name__}: {e}")
-            TRACE.run_lifecycle("platform_poll_error", {"error": f"{type(e).__name__}: {e}"})
+            rec().event("platform_poll_error", {"error": f"{type(e).__name__}: {e}"})
             return None
 
     # 并行调度：每题独立线程 + 独立上下文 + 独立工作目录
@@ -309,8 +329,10 @@ def run(client: OpenAI) -> int:
         _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     except Exception as e:
         # 调度层任何未预期异常都不允许"静默死亡"：落日志并收尾
-        TRACE.run_lifecycle("run_finish", {"reason": "controller_error",
-                                           "error": f"{type(e).__name__}: {e}"})
+        rec().event("run_finish", {"reason": "controller_error",
+                                   "error": f"{type(e).__name__}: {e}"})
+        rec().run_finish(reason="controller_error", error=f"{type(e).__name__}: {e}",
+                         results=results)
         log(f"controller error: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
@@ -318,7 +340,8 @@ def run(client: OpenAI) -> int:
 
     final = snapshot()
     _print_summary(results, final)
-    TRACE.run_lifecycle("run_finish", {"reason": "controller_done", "results": results})
+    rec().event("run_finish", {"reason": "controller_done", "results": results})
+    rec().run_finish(reason="controller_done", results=results)
     return 0
 
 
@@ -371,29 +394,33 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 time.sleep(4)
         except Exception as e:
             log(f"[{code}] worker error: {type(e).__name__}: {e}")
-            TRACE.run_lifecycle("task_error", {"code": code, "error": f"{type(e).__name__}: {e}"})
+            rec().event("task_error", {"code": code, "error": f"{type(e).__name__}: {e}"})
         finally:
             set_task_cwd("")  # 线程结束清 thread-local
+            closed_at = time.strftime("%Y-%m-%d %H:%M:%S")
             completed = bool(state and state["is_completed"])
             try:
                 bench.close_challenge(code)
-                TRACE.challenge_change(code, "controller_close", "available", "closed",
-                                       "completed" if completed else "not completed")
+                rec().event("challenge_change", {"code": code, "field": "controller_close",
+                                                 "old": "available", "new": "closed",
+                                                 "completed": completed})
             except PlatformError as e:
                 if e.code != "invalid_state":
                     log(f"[{code}] close error: {e}")
             except Exception as e:
                 log(f"[{code}] close network error: {type(e).__name__}: {e}")
-                TRACE.run_lifecycle("platform_poll_error",
-                                    {"where": "close", "code": code, "error": str(e)})
+                rec().event("platform_poll_error",
+                            {"where": "close", "code": code, "error": str(e)})
             outcome = "pass" if completed else "fail"
             with lock:
                 results[code] = outcome
-            TRACE.run_lifecycle("task_finish", {
-                "code": code, "outcome": outcome,
-                "flags": (f"{state['correct_flag_count']}/{state['flag_count']}" if state else "?"),
-                "summary": (last or "")[:800],
-            })
+            # 题目生命周期：关闭时间 + 耗时 + 结果（task_close 对应 task_start）
+            rec().task_event(code, "task_close",
+                             closed_at=closed_at,
+                             duration_sec=round(time.time() - TASK_START_TS.get(code, time.time()), 1),
+                             outcome=outcome,
+                             flags=(f"{state['correct_flag_count']}/{state['flag_count']}" if state else "?"),
+                             summary=(last or "")[:800])
             log(f"=== task {code}: {outcome} "
                 f"{'(' + str(state['correct_flag_count']) + '/' + str(state['flag_count']) + ')' if state else ''} ===")
             with lock:
@@ -414,8 +441,9 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             time.sleep(8)
             continue
         for code in bench.release_completed(items):
-            TRACE.challenge_change(code, "controller_close", "available", "closed",
-                                   "released after completion")
+            rec().event("challenge_change", {"code": code, "field": "controller_close",
+                                             "old": "available", "new": "closed",
+                                             "note": "released after completion"})
             with lock:
                 results.setdefault(code, "pass")
         items = snapshot() or items
@@ -467,7 +495,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                             with lock:
                                 cap = max(len(running), active)
                             log(f"platform max-active reached; cap -> {cap}")
-                            TRACE.run_lifecycle("parallel_cap", {"cap": cap, "reason": "max_active"})
+                            rec().event("parallel_cap", {"cap": cap, "reason": "max_active"})
                             slot_full = True
                             break
                         elif e.code == "invalid_state":
@@ -482,7 +510,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                             break
                     except Exception as e:
                         log(f"[{code}] start network error (try {_try + 1}): {type(e).__name__}: {e}")
-                        TRACE.run_lifecycle("platform_poll_error",
+                        rec().event("platform_poll_error",
                                             {"where": "start", "code": code, "error": str(e)})
                         time.sleep(5)
                 if task_ended:
@@ -505,9 +533,13 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             with lock:
                 attempts[code] = attempts.get(code, 0) + 1
                 attempt_no = attempts[code]
-            TRACE.run_lifecycle("task_start", {"code": code, "target": addr,
-                                               "attempt": attempt_no, "parallel": len(running) + 1,
-                                               "flags": f"0/{task['flag_count']}"})
+            # 题目生命周期：启动时间（task_start，对应 task_close 的 closed_at/duration）
+            rec().task_event(code, "task_start",
+                             started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                             target=addr, attempt=attempt_no,
+                             parallel=len(running) + 1,
+                             flags=f"0/{task['flag_count']}")
+            TASK_START_TS[code] = time.time()
             log(f"=== task {code} attempt {attempt_no} target={addr} "
                 f"[parallel {len(running) + 1}/{cap}] ===")
             t = threading.Thread(target=worker, args=(task, addr, attempt_no),
@@ -543,7 +575,7 @@ def _print_summary(results: dict, items: list | None) -> None:
         "=" * 46,
     ]
     print("\n".join(lines), flush=True)
-    TRACE.run_lifecycle("final_summary", {"completed": len(done), "total": total,
+    rec().event("final_summary", {"completed": len(done), "total": total,
                                           "score": score})
 
 
