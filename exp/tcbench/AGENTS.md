@@ -61,6 +61,11 @@
      由 deepseek 输出；复盘作为**普通 user/assistant 消息**原样写入同一 conversation.jsonl
      （带 `kind_note: "closing_summary"` 标记，`task_close.summary` 同步存全文），
      未通关的题不复盘；复盘完丢弃 messages（销毁该题 agent 上下文）；
+   - **平台终态立即停止**：`bench.py` 把 `invalid_state + "finished"` 分类为
+     `TaskFinishedError`（评测截止终态）→ `agent.py: platform_ended()` 置全局 `STOP` 事件：
+     调度器/worker（solve_task 每轮检测）/watcher/call_llm 重试全部收敛退出，
+     join 所有 worker 后尽力 close 其靶场容器，写 `run_finish{reason:"platform_ended"}`
+     正常退出（exit 0，容器随之停止）。**禁止把终态当普通网络错误无限重试**；
    - **任务不跨 bench 共享**：不同 bench 题目/代号不同，记录互不共享（防跨 bench 作弊）；
      token 明文不落盘（meta 只存 hint，目录名本身即 token 属挂载语义）。
 

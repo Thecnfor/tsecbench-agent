@@ -196,6 +196,8 @@ python3 tsec_agent/panel.py --once          # 只渲染一帧（脚本/测试）
 7. 循环直到全部通关或任务超时
 
 错误码处置、分题型渗透方法、输出约定全部在 `tsec_agent/prompt.py` 的系统提示词里。
+**平台返回 `invalid_state + already finished`（评测截止）= 终态**：agent 立即停掉所有
+worker、清理其容器并正常退出（`run_finish: platform_ended`），绝不重试。
 
 ## 退出码（entrypoint）
 

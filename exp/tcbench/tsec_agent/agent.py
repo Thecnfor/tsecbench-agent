@@ -25,14 +25,28 @@ from prompt import SYSTEM_PROMPT, TASK_TEMPLATE, CLOSING_SUMMARY_PROMPT
 from shell_tool import SHELL_TOOL_SCHEMA, dispatch_shell, set_task_cwd, get_task_cwd
 from records import init_records, rec
 import bench
-from bench import PlatformError
+from bench import PlatformError, TaskFinishedError
 
 import threading
 
 LOG_PATH = "agent.log"
 
+# 全局停止事件：平台任务结束（already finished 等终态）时置位，
+# 调度器/worker/watcher 全部收敛退出，不再重试。
+STOP = threading.Event()
+
 # 题目启动时间戳（code -> unix ts），用于 task_close 计算 duration
 TASK_START_TS: dict[str, float] = {}
+
+
+def platform_ended(where: str, e: Exception, results: dict | None = None) -> None:
+    """平台终态统一入口：记录一次、置位停止事件。幂等。"""
+    if STOP.is_set():
+        return
+    log(f"platform task FINISHED ({where}): {e} — stopping all agents/containers")
+    rec().event("platform_ended", {"where": where, "error": str(e)})
+    rec().run_finish(reason="platform_ended", detail=str(e), results=results or {})
+    STOP.set()
 
 
 def log(msg: str) -> None:
@@ -66,6 +80,8 @@ def call_llm(client: OpenAI, messages: list, use_tools: bool = True) -> object:
     delay = 2.0
     attempt = 0
     while True:
+        if STOP.is_set():
+            raise RuntimeError("stopped: platform ended")
         attempt += 1
         try:
             kwargs = dict(
@@ -117,21 +133,29 @@ def start_platform_watcher(interval: float = 20.0) -> None:
         return
 
     def _fetch() -> list | None:
-        req = urllib.request.Request(
-            f"{CFG.benchmark_base_url.rstrip('/')}/openapi/v1/challenges",
-            headers={"BENCHMARK_TOKEN": CFG.benchmark_token},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        # 复用 bench.api：自动分类 TaskFinishedError（already finished 终态）
+        # 并带网络重试；业务错误返回 None 走重试
+        try:
+            return bench.fetch_challenges()
+        except TaskFinishedError:
+            raise
+        except Exception:
+            return None
 
     def _watch():
         prev: dict = {}
         first = True
-        while True:
+        while not STOP.is_set():
             try:
                 items = _fetch()
             except Exception as e:
+                if isinstance(e, TaskFinishedError):
+                    platform_ended("watcher", e)
+                    return
                 rec().event("platform_poll_error", {"error": f"{type(e).__name__}: {e}"})
+                time.sleep(interval)
+                continue
+            if items is None:
                 time.sleep(interval)
                 continue
             cur = {c["unique_code"]: c for c in items}
@@ -227,6 +251,8 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
     last_content = ""
     turns_used = 0
     for turn in range(1, budget + 1):
+        if STOP.is_set():
+            return False, last_content, turns_used, messages
         if (rem := remaining_sec()) is not None and rem <= 0:
             return False, last_content, turns_used, messages
         try:
@@ -327,6 +353,7 @@ def run(client: OpenAI) -> int:
     所有记录持久化到当前 bench 目录（records.py）。
     """
     R = init_records(mode=CFG.mode, model=CFG.model)
+    STOP.clear()  # 进程复用场景下重置终态标记
     R.event("run_start", {"mode": CFG.mode, "model": CFG.model,
                           "max_turns": CFG.max_turns, "deadline_sec": CFG.deadline_sec})
     R.run_start(mode=CFG.mode, model=CFG.model, max_turns=CFG.max_turns)
@@ -341,6 +368,9 @@ def run(client: OpenAI) -> int:
     def snapshot() -> list | None:
         try:
             return bench.fetch_challenges()
+        except TaskFinishedError as e:
+            platform_ended("snapshot", e, results)
+            return None
         except PlatformError as e:
             if e.code == "task_not_found":
                 raise
@@ -368,8 +398,12 @@ def run(client: OpenAI) -> int:
 
     final = snapshot()
     _print_summary(results, final)
-    rec().event("run_finish", {"reason": "controller_done", "results": results})
-    rec().run_finish(reason="controller_done", results=results)
+    if STOP.is_set():
+        # platform_ended 已写过 run_finish，这里只补最终汇总事件
+        rec().event("final_summary", {"note": "after platform ended", "results": results})
+    else:
+        rec().event("run_finish", {"reason": "controller_done", "results": results})
+        rec().run_finish(reason="controller_done", results=results)
     return 0
 
 
@@ -464,6 +498,9 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 running.pop(code, None)
 
     while True:
+        if STOP.is_set():
+            log("platform ended; scheduler stopping")
+            break
         if (rem := remaining_sec()) is not None and rem <= 60:
             log("deadline near; stopping scheduler")
             break
@@ -475,6 +512,9 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
 
         items = snapshot()
         if items is None:
+            # 平台终态 → 直接收尾；否则短暂等待重试
+            if STOP.is_set():
+                break
             time.sleep(8)
             continue
         for code in bench.release_completed(items):
@@ -518,12 +558,16 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             if task["container_status"] != "available" or not addr:
                 started = False
                 slot_full = False
-                task_ended = False
                 for _try in range(3):
+                    if STOP.is_set():
+                        break
                     try:
                         resp = bench.start_challenge(code)
                         addr = _task_target(resp) or addr
                         started = True
+                        break
+                    except TaskFinishedError as e:
+                        platform_ended("start", e, results)
                         break
                     except PlatformError as e:
                         if e.code == "invalid_state" and "max active" in e.message:
@@ -536,8 +580,8 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                             slot_full = True
                             break
                         elif e.code == "invalid_state":
-                            log(f"platform task ended: {e.message}")
-                            task_ended = True
+                            # 任务侧状态问题：记 fail，不重试死循环
+                            log(f"[{code}] start invalid_state: {e.message}")
                             break
                         elif e.code == "resource_unavailable":
                             time.sleep(5)
@@ -550,8 +594,8 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                         rec().event("platform_poll_error",
                                             {"where": "start", "code": code, "error": str(e)})
                         time.sleep(5)
-                if task_ended:
-                    return  # 任务整体结束，交由 run() 收尾
+                if STOP.is_set():
+                    break  # 平台终态 → 退出候选循环，外层收尾
                 if slot_full:
                     break  # 名额满了，等 worker 完成后再扩
                 if not started:
@@ -597,6 +641,19 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
         t.join(timeout=180)
         if t.is_alive():
             log(f"[{code}] worker still running at shutdown; detached")
+
+    # 平台终态：所有 agent（worker 线程）已停，尽力关闭其靶场容器释放资源
+    #（平台已截止时 close 可能返回 invalid_state——忽略即可，平台侧会自动回收）
+    if STOP.is_set():
+        for code in list(attempts.keys()):
+            try:
+                bench.close_challenge(code)
+                rec().event("challenge_change", {"code": code, "field": "controller_close",
+                                                 "old": "available", "new": "closed",
+                                                 "note": "platform ended cleanup"})
+            except Exception:
+                pass
+        log("all workers stopped; active challenge containers cleanup attempted")
 
 
 def _print_summary(results: dict, items: list | None) -> None:

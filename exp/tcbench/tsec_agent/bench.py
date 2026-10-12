@@ -20,6 +20,10 @@ class PlatformError(Exception):
         self.status = status
 
 
+class TaskFinishedError(PlatformError):
+    """平台任务已结束（评测截止）——终态，应立即停止整个 agent，不重试。"""
+
+
 def api(path: str, method: str = "GET", timeout: float = 20.0, retries: int = 3):
     """返回解析后的 JSON；平台业务错误抛 PlatformError。
     网络类错误（超时/DNS/连接）有限重试，避免调度层被瞬时故障打断。"""
@@ -35,8 +39,12 @@ def api(path: str, method: str = "GET", timeout: float = 20.0, retries: int = 3)
             body = e.read().decode("utf-8", errors="replace")
             try:
                 err = json.loads(body)
-                raise PlatformError(err.get("code", str(e.code)),
-                                    err.get("message", body), e.code) from None
+                code = err.get("code", str(e.code))
+                msg = err.get("message", body)
+                # invalid_state + "finished" = 评测截止（终态）→ 专用异常，上层立即停止
+                if code == "invalid_state" and "finished" in msg.lower():
+                    raise TaskFinishedError(code, msg, e.code) from None
+                raise PlatformError(code, msg, e.code) from None
             except json.JSONDecodeError:
                 raise PlatformError(f"http_{e.code}", body, e.code) from None
         except (TimeoutError, urllib.error.URLError, OSError, json.JSONDecodeError) as e:
