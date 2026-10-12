@@ -168,6 +168,23 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
 - **反作弊**：任务不跨 bench 共享（题目/代号每轮不同）；`.gitignore` 排除 `docker/runs/`。
 - 查看对话：`jq . docker/runs/<TOKEN>/tasks/e1-01/conversation.jsonl`
 
+### 本地观察面板（panel.py）
+
+```bash
+python3 tsec_agent/panel.py                 # 自动发现最新 runs/<TOKEN>，5s 刷新
+python3 tsec_agent/panel.py --dir docker/runs/<TOKEN> --interval 3
+python3 tsec_agent/panel.py --once          # 只渲染一帧（脚本/测试）
+```
+
+单屏 ANSI 面板展示：
+- 全局：平台通关数/flag 数/总分（平台 API 不可达时**离线回退**本地记录统计）
+- 每题：`▶ RUNNING 已跑时长 / attempt / target`、`✔ PASS(flags/耗时)`、`✘ FAIL`
+- 进行中题目实时视角：**进行中的 shell 调用**（assistant 已发 tool_call 但未回结果 = 在跑，
+  如 `wait job_id=xx timeout_sec=30`、`run: sqlmap ...`）、最近一次模型输出/思考
+- 最近事件：llm_retry、parallel_cap、task_error 等
+
+数据源全部**只读**持久化记录 + 平台 API（token=目录名），不碰 agent 运行时；无第三方依赖。
+
 ## 平台流程（agent 提示词内置）
 
 1. `GET /openapi/v1/challenges` — 拉题列表与进度（优先 `is_completed=false`，由易到难）

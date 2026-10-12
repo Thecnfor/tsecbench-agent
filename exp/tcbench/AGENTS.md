@@ -73,6 +73,7 @@
 | `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill | 调工具行为 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl | 记录字段调整 |
+| `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、全局 flag 数） | 面板展示项 |
 | `tsec_agent/config.py` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
 | `tsec_agent/selftest.py` | 离线端到端自测（fake 模型驱动工具循环） | 改动主循环后必须跑 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + agent venv | 加工具/依赖（**镜像 ≤3GB 硬约束**） |
