@@ -1,0 +1,121 @@
+"""集中配置：双运行模式（local/hosted）+ 自动检测 + 平台凭证。
+
+模式说明：
+- local  本地模式：公网直连官方 DeepSeek API（开发调试用）
+- hosted 托管模式：官方平台内网转写网关，无公网（最终交付形态，镜像 ≤3GB）
+- auto   自动检测（默认）：先探测本地网关可达性，失败再试托管网关。
+
+配置优先级：真实环境变量 > 项目根 .env > 内置默认值。
+"""
+
+import os
+import urllib.request
+from dataclasses import dataclass, field
+
+# --- 加载项目根 .env（不覆盖已存在的真实环境变量） ---
+_DOTENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.isfile(_DOTENV):
+    with open(_DOTENV, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            _k, _v = _k.strip(), _v.strip()
+            if _k and _k not in os.environ:
+                os.environ[_k] = _v
+
+
+def _env(name: str, default: str) -> str:
+    val = os.environ.get(name)
+    return val if val not in (None, "") else default
+
+
+# --- 两套模型后端 ---
+LOCAL_BASE_URL = _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+LOCAL_API_KEY = _env("DEEPSEEK_API_KEY", "")
+LOCAL_MODEL = _env("AGENT_MODEL_LOCAL", "deepseek-flash")
+
+HOSTED_BASE_URL = _env("DEEPSEEK_BASE_URL_HOSTED", "http://api.deepseek.com.tsecbench.gw/v1")
+HOSTED_API_KEY = _env("DEEPSEEK_API_KEY_HOSTED", "tsec-bench")
+HOSTED_MODEL = _env("AGENT_MODEL_HOSTED", "deepseek-v4.1-flash-expires-on-0910")
+
+PROBE_TIMEOUT = float(_env("AGENT_PROBE_TIMEOUT", "8"))
+
+
+def _reachable(base_url: str) -> bool:
+    """GET {base}/models 探测网关可达性（2xx/4xx 都算可达，只看网络层）。"""
+    url = base_url.rstrip("/") + "/models"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+            return 200 <= resp.status < 500
+    except Exception:
+        return False
+
+
+def detect_mode() -> str:
+    """返回最终生效模式：'local' 或 'hosted'。"""
+    mode = _env("AGENT_MODE", "auto").lower()
+    if mode in ("local", "hosted"):
+        return mode
+    # auto：先 local（公网），后 hosted（内网）
+    if LOCAL_API_KEY and _reachable(LOCAL_BASE_URL):
+        return "local"
+    if _reachable(HOSTED_BASE_URL):
+        return "hosted"
+    return "local"  # 都不通时默认 local，由冒烟测试给出明确报错
+
+
+def backend_for(mode: str) -> tuple[str, str, str]:
+    """返回 (base_url, api_key, model)。"""
+    if mode == "hosted":
+        return HOSTED_BASE_URL, HOSTED_API_KEY, HOSTED_MODEL
+    return LOCAL_BASE_URL, LOCAL_API_KEY, LOCAL_MODEL
+
+
+@dataclass
+class Config:
+    # --- 运行模式（惰性解析，默认 auto 探测） ---
+    mode: str = field(default="")
+
+    # --- TSec Benchmark 平台 ---
+    benchmark_token: str = _env("BENCHMARK_TOKEN", "")
+    benchmark_base_url: str = _env("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com")
+    vpn_health_url: str = _env("VPN_HEALTH_URL", "http://10.0.100.58")
+
+    # --- 运行控制 ---
+    max_turns: int = int(_env("AGENT_MAX_TURNS", "400"))
+    deadline_sec: float = float(_env("AGENT_DEADLINE_SEC", "0"))
+    request_timeout: float = float(_env("AGENT_REQUEST_TIMEOUT", "300"))
+    api_max_retries: int = int(_env("AGENT_API_RETRIES", "5"))
+    # LLM 重试模式：forever=网络类错误（连接/超时/限流）无限退避重试，直到任务时限；
+    # finite=按 api_max_retries 次后放弃。4xx 认证/参数错误始终立即失败。
+    llm_retry_mode: str = _env("AGENT_LLM_RETRY_MODE", "forever").lower()
+    llm_retry_max_delay: float = float(_env("AGENT_LLM_RETRY_MAX_DELAY", "60"))
+
+    # shell 工具
+    shell_default_wait_ms: int = int(_env("AGENT_SHELL_WAIT_MS", "1500"))
+    shell_max_output: int = int(_env("AGENT_SHELL_MAX_OUTPUT", "32768"))
+
+    # 追加到 shell 子进程环境的变量
+    extra_env: dict = field(default_factory=lambda: {
+        "BENCHMARK_TOKEN": _env("BENCHMARK_TOKEN", ""),
+        "BENCHMARK_BASE_URL": _env("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com"),
+        "NO_PROXY": "127.0.0.1",
+        "no_proxy": "127.0.0.1",
+    })
+
+    # 模型后端（init 后由 _resolve 填充）
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    model: str = ""
+
+    def resolve(self) -> "Config":
+        """确定模式并填充模型后端配置。"""
+        self.mode = detect_mode()
+        self.llm_base_url, self.llm_api_key, self.model = backend_for(self.mode)
+        return self
+
+
+CFG = Config()

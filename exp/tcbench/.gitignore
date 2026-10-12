@@ -1,0 +1,17 @@
+# 凭证与本地配置，不入库
+.env
+*.env
+*.ovpn
+
+# 运行产物
+docker/work/
+tsec_agent/agent.log
+agent.tar.gz
+*.tar.gz
+__pycache__/
+*.pyc
+.venv/
+
+# log
+trace.log
+trace.jsonl
