@@ -55,10 +55,29 @@ class ConversationWriter:
             pass
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    def write(self, kind: str, **fields: Any) -> None:
-        """kind: user | assistant | tool"""
+    def write(self, kind: str, *, started_at: float | None = None,
+              ended_at: float | None = None, **fields: Any) -> None:
+        """kind: system | user | assistant | tool | note | error
+
+        时间戳（为甘特图准备）：
+        - started_at / ended_at：epoch 秒（毫秒精度），该消息/动作的开始与结束；
+          输入类（system/user/note）两者同刻；assistant = LLM 调用起止；
+          tool = 工具执行起止。未传则默认写入时刻。
+        - duration_ms：自动计算（ended - started）。
+        - ts：原可读本地时间（兼容旧消费方）。
+        """
         self._seq += 1
-        rec = {"ts": _now(), "seq": self._seq, "code": self.code, "kind": kind}
+        now = time.time()
+        started = started_at if started_at is not None else now
+        ended = ended_at if ended_at is not None else started
+        if ended < started:
+            ended = started
+        rec = {
+            "ts": _now(), "seq": self._seq, "code": self.code, "kind": kind,
+            "started_at": round(started, 3),
+            "ended_at": round(ended, 3),
+            "duration_ms": int(round((ended - started) * 1000)),
+        }
         rec.update(fields)  # 全量字段，调用方保证不裁剪
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")

@@ -158,7 +158,10 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
 └── tasks/<code>/
      ├── conversation.jsonl           # 完整 LLM 对话，**全量不裁剪**：
      │    system/user 任务卡、assistant{thinking,output,tool_calls}、tool{result}
-     │    每条含 ts/seq/turn/tool_call_id；**通关后同上下文追加复盘总结**
+     │    每条含 ts/seq/turn/tool_call_id + **成对起止时间戳（供甘特图）**：
+     │    started_at/ended_at（epoch 秒·毫秒精度）+ duration_ms（自动算）——
+     │    assistant=本次 LLM 调用起止、tool=工具执行起止、user/note=写入同刻；
+     │    **通关后同上下文追加复盘总结**
      │    （思路/工具困难/优化建议，assistant 条目带 kind_note:"closing_summary"）
      └── <AI 解题产物>
 ```

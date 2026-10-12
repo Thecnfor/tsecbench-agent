@@ -54,6 +54,9 @@
    - **对话忠诚不裁剪**：发送给模型的 system/user、模型的 thinking/output/tool_calls、
      工具 result 全部原样落 `conversation.jsonl`（含 ts/seq/turn/tool_call_id），
      **禁止任何 _clip/截断逻辑进对话记录**；
+     **每条消息带成对起止时间戳**（`started_at`/`ended_at` epoch 秒·毫秒精度 +
+     `duration_ms` 自动计算；assistant=LLM 调用起止、tool=工具执行起止，
+     埋点在 `solve_task`/`closing_summary`）——直接可画甘特图（llm/tool 泳道）；
    - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt}` /
      `task_close{closed_at,duration_sec,outcome,flags}`；
    - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求

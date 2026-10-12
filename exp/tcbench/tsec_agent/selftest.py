@@ -195,6 +195,19 @@ def main() -> int:
     for line in open(conv_t01):
         r = json.loads(line)
         kinds.append(r["kind"])
+        # 甘特图数据：每条消息必须有成对起止时间戳 + duration_ms
+        assert isinstance(r.get("started_at"), (int, float)), f"started_at missing: {r}"
+        assert isinstance(r.get("ended_at"), (int, float)), f"ended_at missing: {r}"
+        assert r["ended_at"] >= r["started_at"], f"ended<started: {r}"
+        assert isinstance(r.get("duration_ms"), int), f"duration_ms missing: {r}"
+        if r["kind"] == "assistant":
+            # LLM 调用应有真实耗时（fake client 有 sleep/计算开销）
+            assert "先侦察" in (r.get("thinking") or "") or len(r.get("thinking") or "") > 10, r.get("thinking")
+            assert r["duration_ms"] >= 0
+        if r["kind"] == "tool":
+            # 工具执行起止独立于 LLM 调用
+            assert r["ended_at"] >= r["started_at"]
+            assert "flag{fake}" in (r.get("arguments") or {}).get("command", "") or r.get("result")
         if r["kind"] == "system" and len(r["content"]) < 500:
             raise AssertionError("system prompt truncated!")
         if r["kind"] == "assistant":

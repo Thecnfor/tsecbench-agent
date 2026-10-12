@@ -293,18 +293,22 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
         if (rem := remaining_sec()) is not None and rem <= 0:
             return False, last_content, turns_used, messages
         turn += 1
+        t_llm_start = time.time()
         try:
             resp = call_llm(client, messages)
         except Exception as e:
             log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
-            conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}")
+            conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}",
+                       started_at=t_llm_start)
             return False, last_content, turns_used, messages
         turns_used += 1
+        t_llm_end = time.time()
 
         msg = resp.choices[0].message
         tlabel = f"{code}:{turn}"
         tool_calls_raw = getattr(msg, "tool_calls", None) or []
         # AI 输出全量落盘：thinking / output / tool_calls 原文
+        # started_at/ended_at = 本次 LLM 调用起止（供甘特图）
         conv.write(
             "assistant",
             turn=tlabel,
@@ -313,6 +317,8 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
             tool_calls=[{"id": tc.id, "name": tc.function.name,
                          "arguments": tc.function.arguments} for tc in tool_calls_raw],
             usage=getattr(resp, "usage", None),
+            started_at=t_llm_start,
+            ended_at=t_llm_end,
         )
         if msg.content:
             last_content = msg.content
@@ -334,6 +340,7 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
 
         for tc in tool_calls_raw:
             args = {}
+            t_tool_start = time.time()
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
@@ -343,9 +350,12 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
                     result = dispatch_shell(args)
                 else:
                     result = f"error: unknown tool {tc.function.name!r}"
+            t_tool_end = time.time()
             # 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联）
+            # started_at/ended_at = 工具执行起止（供甘特图）
             conv.write("tool", turn=tlabel, tool_call_id=tc.id, tool=tc.function.name,
-                       arguments=args, result=result)
+                       arguments=args, result=result,
+                       started_at=t_tool_start, ended_at=t_tool_end)
             log(f"tool#{tc.id[-6:]} {tc.function.name} -> {result.splitlines()[0][:160] if result else ''}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
@@ -359,12 +369,15 @@ def closing_summary(client: OpenAI, code: str, messages: list, conv) -> str:
     user_msg = {"role": "user", "content": CLOSING_SUMMARY_PROMPT}
     messages.append(user_msg)
     conv.write("user", turn=f"{code}:closing", content=CLOSING_SUMMARY_PROMPT)
+    t_llm_start = time.time()
     try:
         resp = call_llm(client, messages, use_tools=False)
     except Exception as e:
         log(f"[{code}] closing summary LLM error: {type(e).__name__}: {e}")
-        conv.write("error", turn=f"{code}:closing", error=f"{type(e).__name__}: {e}")
+        conv.write("error", turn=f"{code}:closing", error=f"{type(e).__name__}: {e}",
+                   started_at=t_llm_start)
         return ""
+    t_llm_end = time.time()
     msg = resp.choices[0].message
     assistant_msg = {"role": "assistant", "content": msg.content}
     messages.append(assistant_msg)
@@ -372,7 +385,9 @@ def closing_summary(client: OpenAI, code: str, messages: list, conv) -> str:
                thinking=getattr(msg, "reasoning_content", None),
                output=msg.content,
                kind_note="closing_summary",   # 标记本条为通关复盘
-               usage=getattr(resp, "usage", None))
+               usage=getattr(resp, "usage", None),
+               started_at=t_llm_start,
+               ended_at=t_llm_end)
     log(f"[{code}] closing summary recorded ({len(msg.content or '')} chars)")
     return msg.content or ""
 
