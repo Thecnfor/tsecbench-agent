@@ -134,6 +134,9 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `DEEPSEEK_API_KEY_HOSTED` | 托管模式网关鉴权 | `tsec-bench` |
 | `AGENT_MODEL_HOSTED` | 托管模式模型 | `deepseek-v4.1-flash-expires-on-0910` |
 | `AGENT_PROBE_TIMEOUT` | auto 模式探测超时（秒） | `8` |
+| `VPN_GUARD` | 运行时 VPN 守卫 `auto`/`1`/`0`（auto=hosted 开、local 关） | `auto` |
+| `VPN_PROBE_INTERVAL` | VPN 探测间隔秒 | `20` |
+| `AGENT_VPN_WAIT_MAX` | VPN 挂起时 worker 最长等待秒（超时弃题） | `600` |
 | `AGENT_MAX_TURNS` | 最大 LLM 轮次 | `400` |
 | `AGENT_DEADLINE_SEC` | 任务总时限秒（0=不限） | `0` |
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |

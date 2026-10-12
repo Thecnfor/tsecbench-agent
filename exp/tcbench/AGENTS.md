@@ -66,6 +66,12 @@
      调度器/worker（solve_task 每轮检测）/watcher/call_llm 重试全部收敛退出，
      join 所有 worker 后尽力 close 其靶场容器，写 `run_finish{reason:"platform_ended"}`
      正常退出（exit 0，容器随之停止）。**禁止把终态当普通网络错误无限重试**；
+   - **VPN 运行时守卫**（`VPN_GUARD`，auto=hosted 开/local 关，或 1/0 显式）：调度器周期
+     （默认 20s）探测预检地址，**连续 3 次失败** → 置 `VPN_DOWN`：暂停派发新题
+     （**不消耗 attempts**；平台 API 走公网，snapshot/终态检测/释放照常）；worker 的
+     `solve_task` 检测到后**挂起等待**（不烧轮次预算，conv 记 suspend/resume note，
+     上限 `AGENT_VPN_WAIT_MAX` 默认 600s 超时才弃题）；探测恢复 → 自动清除、原地续跑。
+     **判弱点：绝不因 VPN 中断把题库烧成假 fail**；
    - **任务不跨 bench 共享**：不同 bench 题目/代号不同，记录互不共享（防跨 bench 作弊）；
      token 明文不落盘（meta 只存 hint，目录名本身即 token 属挂载语义）。
 

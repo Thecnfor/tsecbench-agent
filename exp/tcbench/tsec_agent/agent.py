@@ -49,6 +49,22 @@ def platform_ended(where: str, e: Exception, results: dict | None = None) -> Non
     STOP.set()
 
 
+# --- VPN 运行时守卫（弱点1修复）：VPN 中途挂 → 暂停派发新题、worker 挂起等待 ---
+# 不判死刑：VPN 恢复即自动继续；等待期间不烧轮次、不消耗 attempts。
+VPN_DOWN = threading.Event()
+
+
+def _vpn_ok(timeout: float = 4.0) -> bool:
+    """探测靶场预检地址（与 entrypoint 预检同一标准）。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(CFG.vpn_health_url, timeout=timeout) as r:
+            body = r.read().decode("utf-8", errors="replace")
+        return '"status"' in body and '"ok"' in body
+    except Exception:
+        return False
+
+
 def log(msg: str) -> None:
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
@@ -250,11 +266,33 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
     conv.write("user", turn=f"{code}:0", content=task_card)
     last_content = ""
     turns_used = 0
-    for turn in range(1, budget + 1):
+    turn = 0
+    while turn < budget:
         if STOP.is_set():
             return False, last_content, turns_used, messages
+        # VPN 守卫：VPN 挂起 → 本题挂起等待恢复（不烧轮次预算），恢复后原地继续。
+        # 等待超过 AGENT_VPN_WAIT_MAX（默认 600s）仍未恢复才放弃本题。
+        if VPN_DOWN.is_set():
+            wait_max = float(os.environ.get("AGENT_VPN_WAIT_MAX", "600"))
+            t0 = time.time()
+            conv.write("note", turn=f"{code}:{turn}",
+                       content=f"VPN down detected; suspending task (max {wait_max:.0f}s)")
+            log(f"[{code}] VPN down; task suspended (waiting for recovery)")
+            while VPN_DOWN.is_set() and not STOP.is_set() and time.time() - t0 < wait_max:
+                time.sleep(3)
+            waited = time.time() - t0
+            if VPN_DOWN.is_set():
+                conv.write("error", turn=f"{code}:{turn}",
+                           error=f"VPN still down after {waited:.0f}s; abandoning task")
+                log(f"[{code}] VPN still down after {waited:.0f}s; abandoning")
+                return False, last_content, turns_used, messages
+            conv.write("note", turn=f"{code}:{turn}",
+                       content=f"VPN recovered after {waited:.0f}s; resuming")
+            log(f"[{code}] VPN recovered after {waited:.0f}s; resuming task")
+            continue  # 恢复后从当前 turn 继续（不烧预算）
         if (rem := remaining_sec()) is not None and rem <= 0:
             return False, last_content, turns_used, messages
+        turn += 1
         try:
             resp = call_llm(client, messages)
         except Exception as e:
@@ -429,6 +467,19 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     running: dict[str, threading.Thread] = {}
     cap = int(os.environ.get("AGENT_MAX_PARALLEL", "5"))
 
+    # VPN 守卫：auto=模式感知（hosted 强制；local 模式只在 VPN 曾经通时启用，不伤裸机开发），
+    # 1/0 显式开关。探测连续失败 N 次 → VPN_DOWN 置位：暂停派发新题（不消耗 attempts），
+    # worker 挂起等待；恢复成功即解除。探测间隔 20s，只在调度线程跑。
+    vpn_mode = os.environ.get("VPN_GUARD", "auto").lower()
+    if vpn_mode == "auto":
+        vpn_mode = "1" if CFG.mode == "hosted" else "0"
+    vpn_probe_fail = 0
+    vpn_guard_on = vpn_mode in ("1", "on", "true")
+    last_vpn_probe = 0.0
+    VPN_PROBE_INTERVAL = float(os.environ.get("VPN_PROBE_INTERVAL", "20"))
+    if vpn_guard_on:
+        rec().event("vpn_guard_enabled", {"mode": CFG.mode, "vpn_mode": vpn_mode})
+
     def worker(task: dict, addr: str, attempt: int) -> None:
         code = task["unique_code"]
         set_task_cwd(_task_workdir(code))
@@ -505,6 +556,23 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             log("deadline near; stopping scheduler")
             break
 
+        # --- VPN 运行时守卫：周期（默认 20s）探测，连续失败 → 置位暂停派发；成功即恢复 ---
+        if vpn_guard_on and not STOP.is_set() and time.time() - last_vpn_probe >= VPN_PROBE_INTERVAL:
+            last_vpn_probe = time.time()
+            if _vpn_ok(timeout=5):
+                vpn_probe_fail = 0
+                if VPN_DOWN.is_set():
+                    VPN_DOWN.clear()
+                    rec().event("vpn_recovered", {})
+                    log("VPN probe OK — resume dispatching new tasks")
+            else:
+                vpn_probe_fail += 1
+                if vpn_probe_fail >= 3 and not VPN_DOWN.is_set():
+                    VPN_DOWN.set()
+                    rec().event("vpn_down", {"consecutive_fails": vpn_probe_fail})
+                    log(f"VPN DOWN ({vpn_probe_fail} consecutive probe failures) — "
+                        f"pausing dispatch; running workers will wait")
+
         # 回收已完成 worker
         with lock:
             for code in [c for c, t in running.items() if not t.is_alive()]:
@@ -547,6 +615,12 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
 
         if not candidates and not running:
             break  # 全部完成或全部放弃
+
+        if VPN_DOWN.is_set():
+            # 暂停派发（平台 API 走公网不依赖 VPN，snapshot/终态检测/释放照常；
+            # 只有靶场渗透需要 VPN）：不 start、不消耗 attempts，等探测恢复后放行
+            time.sleep(10)
+            continue
 
         # 扩容：直到槽位用尽或平台拒绝（max active）
         for task in candidates:
