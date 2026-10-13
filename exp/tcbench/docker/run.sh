@@ -21,7 +21,14 @@ mkdir -p "$BENCH_DIR"
 echo "bench dir: $BENCH_DIR (mounted as /work)"
 echo "using vpn config: $VPN_CONF"
 
-[ -f work/openvpn.log ] 2>/dev/null || touch "$BENCH_DIR/openvpn.log" 2>/dev/null || true
+# 预建 openvpn 日志为宿主机用户所有：容器内 openvpn 以 root 新建日志是 0600 root，
+# 宿主机 tar 归档时读不到（archive_runs.sh 会失败）；实测 openvpn 对已存在的日志
+# 只写内容、不改属主/权限，所以预建即可。历史遗留的 root 0600 日志挪开重建。
+if [ -e "$BENCH_DIR/openvpn.log" ] && [ ! -r "$BENCH_DIR/openvpn.log" ]; then
+    mv "$BENCH_DIR/openvpn.log" "$BENCH_DIR/openvpn.log.root-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+fi
+touch "$BENCH_DIR/openvpn.log" 2>/dev/null || true
+chmod 644 "$BENCH_DIR/openvpn.log" 2>/dev/null || true
 
 CONTAINER="tsec-agent-$(echo "$TOKEN" | cut -c1-8)"
 
@@ -40,4 +47,4 @@ docker run -d \
 "
 echo "started. logs: docker logs -f $CONTAINER"
 echo "records:  $BENCH_DIR"
-echo "archive:  ./archive_runs.sh $TOKEN   (归档到 docker 目录外)"
+echo "archive:  ./archive_runs.sh $TOKEN   (归档到 docker/archives/)"

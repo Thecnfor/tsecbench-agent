@@ -69,7 +69,12 @@
    - 记录目录唯一键 = **token**（`docker/runs/<TOKEN>/`，无时间戳；同 token 重启 append）；
    - **隔离靠挂载边界**：`run.sh` 只挂当前 token 目录为 `/work`——容器内只见当前 bench，
      其他 bench 不在挂载内；**不做 shell 拦截**；旧 bench 由 `docker/archive_runs.sh`
-     归档到 docker 目录外（`~/tsec_bench_runs/`，存留用户自行管理），归档后彻底不可读；
+     归档到项目内 `docker/archives/`（挂载范围外、gitignore 排除，存留用户自行管理），
+     归档后容器挂载内彻底不可读；
+     容器内 root 产物（openvpn 强制 0600 的日志、root 属主的 `tasks/` 目录）会让宿主机
+     tar/rm 失败：`run.sh` 启动前预建宿主机属主的 `openvpn.log`（openvpn 只写内容不改属主），
+     归档脚本在失败时用 `tsec-agent` 镜像以 root 归位属主后重试（docker 组走 newgrp，
+     同时修好"运行中容器占用检查"），docker 不可用则报错并保留源目录；
    - **对话忠诚不裁剪**：发送给模型的 system/user、模型的 thinking/output/tool_calls、
      工具 result 全部原样落 `conversation.jsonl`（含 ts/seq/turn/tool_call_id），
      **禁止任何 _clip/截断逻辑进对话记录**；

@@ -199,9 +199,14 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
 
 - **隔离**：`run.sh` 只挂 `runs/<TOKEN>:/work` → 容器内只有当前 bench；
   其他 bench 不在挂载内（bench 内可读、bench 外不可读），不做 shell 拦截。
-- **归档**：`docker/archive_runs.sh [TOKEN...]` 把记录打包到 docker 目录外
-  （默认 `~/tsec_bench_runs/<TOKEN>_<ts>.tar.gz`）并删除源目录；归档包数量/存留自行管理。
+- **归档**：`docker/archive_runs.sh [TOKEN...]` 把记录打包到项目内 `docker/archives/`
+  （默认 `<TOKEN>_<ts>.tar.gz`；在挂载范围外、gitignore 排除，容器永远读不到）并删除源目录；
+  归档包存留自行管理，`ARCHIVE_DIR` 可改目标目录。
   运行中的 bench 会拒绝归档。
+  容器内 root 产物（openvpn 强制 0600 的日志、root 属主的 `tasks/` 目录）宿主机用户读不动也删不掉：
+  `run.sh` 启动前预建宿主机属主的 `openvpn.log` 规避（实测 openvpn 只写内容、不改属主/权限）；
+  归档脚本在打包/删除失败时自动用 `tsec-agent` 镜像以 root 把属主归位后重试
+  （需 docker 权限，历史残留目录同样可归档；docker 不可用则明确报错并保留源目录）。
 - **反作弊**：任务不跨 bench 共享（题目/代号每轮不同）；`.gitignore` 排除 `docker/runs/`。
 - 查看对话：`jq . docker/runs/<TOKEN>/tasks/e1-01/conversation.jsonl`
 
@@ -268,8 +273,10 @@ tcbench/
 ├── docker/
 │   ├── Dockerfile                 # Kali + 渗透工具 + openvpn + agent venv
 │   ├── entrypoint.sh              # VPN → 预检 → DNS → 冒烟 → 跑分
-│   ├── run.sh                     # 一键启动
-│   └── work/                      # openvpn.log、agent.log 等运行产物
+│   ├── run.sh                     # 一键启动（挂 runs/<TOKEN>:/work，预建宿主机属主的 openvpn.log）
+│   ├── archive_runs.sh            # 归档记录到 archives/（root 残留用镜像归位属主兜底）
+│   ├── runs/<TOKEN>/              # bench 记录：meta.json、events/tasks.jsonl、openvpn.log、tasks/
+│   └── archives/                  # 归档包 <TOKEN>_<ts>.tar.gz（挂载范围外、gitignore 排除）
 └── .venv/                         # 宿主机开发用 python 环境（selftest）
 ```
 
@@ -285,7 +292,8 @@ cd tsec_agent
 
 | 现象 | 排查 |
 | --- | --- |
-| 容器 exit 11 | `docker/work/openvpn.log` 看握手/路由；宿主机 `curl http://10.0.100.58` |
+| 容器 exit 11 | `docker/runs/<TOKEN>/openvpn.log` 看握手/路由；宿主机 `curl http://10.0.100.58` |
+| 归档报 `tar: ... 权限不够` | 容器内 root 产物（openvpn 0600 日志等）；`./archive_runs.sh` 会自动用镜像以 root 归位属主重试，docker 不可用时按提示 `sudo chown -R $(id -u):$(id -g) docker/runs/<TOKEN>` 后重跑 |
 | 网关域名解析失败 | entrypoint 会从 openvpn push 提取 DNS；检查日志 `gateway DNS resolved` |
 | `docker pull` 超时 | registry-mirrors（见上）；或手动 `docker pull docker.m.daocloud.io/<image>` 再 tag |
 | 平台 404 task_not_found | `BENCHMARK_TOKEN` 失效/未注入 |
