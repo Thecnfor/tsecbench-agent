@@ -130,6 +130,10 @@ class Config:
     # shell 工具
     shell_default_wait_ms: int = int(_env("AGENT_SHELL_WAIT_MS", "1500"))
     shell_max_output: int = int(_env("AGENT_SHELL_MAX_OUTPUT", "32768"))
+    # 后台命令硬上限：到点整组 kill（有 out_file/日志兜底，杀掉不丢数据）；0=永不杀
+    shell_hard_sec: float = float(_env("AGENT_SHELL_HARD_SEC", "1800"))
+    # 同时在跑的后台 job 上限（满了拒绝新 run，提示先收/wait/kill）
+    shell_max_jobs: int = int(_env("AGENT_SHELL_MAX_JOBS", "8"))
 
     # 追加到 shell 子进程环境的变量
     extra_env: dict = field(default_factory=lambda: {

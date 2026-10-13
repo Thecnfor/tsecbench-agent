@@ -30,9 +30,14 @@
 
 1. **单工具设计**：agent 只有 `shell` 一个工具（异步 background 模式），**没有 MCP、没有 subagent**。
    这是评测方的设计要求，不要往里加 read/write/web 等工具。
-2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/status/kill/list` 轮询。
-   快速命令有 1.5s 同步窗口（`AGENT_SHELL_WAIT_MS`）。进程必须 `start_new_session`（独立进程组），
-   kill 时整组杀，超时由 watcher 线程兜底。
+2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/wait_any/status/kill/list` 收结果。
+   - 快速命令有 1.5s 同步窗口（`AGENT_SHELL_WAIT_MS`）；`run` 可带 `wait_sec`（≤300s），
+     **工具替模型决定何时返回**（命令结束 / 攒够 ≥2KB 新输出 / 到点，先到先返回）。
+   - `wait` 同为**边沿触发**，不再干等；输出分页 `offset/lines`（每条带 `next_offset` 续读），
+     `out_file` 直接落盘到 workdir（被杀不丢，可 `tail`）。
+   - 上限：同时在跑 `AGENT_SHELL_MAX_JOBS`（8，满了拒绝新 `run` 并提示先收）；
+     硬上限 `AGENT_SHELL_HARD_SEC`（1800s，到点整组 kill，0=永不杀）——**不做 300s 软提醒**。
+   - 进程必须 `start_new_session`（独立进程组），kill 时整组杀，超时由 watcher 线程兜底。
 3. **模型网关双模式**：local=官方 `https://api.deepseek.com/v1`（公网，key 在 `.env`），
    hosted=平台内网转写网关 `http://api.deepseek.com.tsecbench.gw/v1`（**依赖 VPN 内网 DNS，只在容器连上 VPN 后可解析**）。
    默认 `AGENT_MODE=auto` 自动探测切换，见架构不变量前的「运行模式」小节。
@@ -94,7 +99,7 @@
 | --- | --- | --- |
 | `tsec_agent/agent.py` | 控制器主循环：选题 → start → `solve_task` 单题上下文 → 校验 → close；LLM 重试 | 加运行控制逻辑 |
 | `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
-| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`parse_tool_arguments` 工具参数容错（坏参数自动修复） | 调工具行为、参数解析 |
+| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parse_tool_arguments` 工具参数容错（坏参数自动修复） | 调工具行为、参数解析 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuild_messages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
 | `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、全局 flag 数） | 面板展示项 |

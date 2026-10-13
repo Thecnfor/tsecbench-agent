@@ -271,6 +271,33 @@ def main() -> int:
     assert len(t02_starts) >= 3, f"t-02 should pause+resume, starts={len(t02_starts)}"
     assert any(r.get("resume") for r in t02_starts), "resume task_start missing"
 
+    # ---- shell 新参数：边沿等待 / 分页 / 落盘 / wait_any / job 上限 ----
+    import shell_tool as _st
+    from config import CFG as _CFG
+    _w = tempfile.mkdtemp(prefix="selftest_shell_")
+    _st.set_task_cwd(_w)
+    _p = _st.SHELL.run("for i in $(seq 1 200); do printf 'L%03d abcdefghij\\n' $i; sleep 0.05; done",
+                       wait_ms=0, wait_sec=4)
+    assert "hard limit" in _p, _p[:200]
+    _jid = _p.split("[job ")[1].split("]")[0]
+    if "running" in _p:
+        assert int(_p.split("out=")[1].split("B")[0]) > 0    # 提前返回也带回了输出
+    _pg = _st.SHELL.status(_jid, lines=3)
+    assert "output[tail]:" in _pg and "next_offset=" in _pg, _pg[:200]
+    _st.SHELL.kill(_jid)
+    _of = _st.SHELL.run("echo ONDISK; sleep 1", out_file="s.log", wait_ms=0, wait_sec=2)
+    assert os.path.isfile(os.path.join(_w, "s.log")), "out_file 未落盘"
+    _st.SHELL.kill(_of.split("[job ")[1].split("]")[0])
+    assert _st.dispatch_shell({"job_id": "nonexist"}).startswith("error:"), "省略 action 未兜底"
+    _old = _CFG.shell_max_jobs
+    _CFG.shell_max_jobs = 1
+    _sl = _st.SHELL.run("sleep 10", wait_ms=0)
+    assert _st.SHELL.run("echo x", wait_ms=0).startswith("error: 后台 job 已满"), "job 上限未生效"
+    _st.SHELL.kill(_sl.split("[job ")[1].split("]")[0])
+    _CFG.shell_max_jobs = _old
+    _st.set_task_cwd("")
+    print("  ok: shell 新参数（边沿等待/分页/落盘/上限/省略 action）")
+
     # ---- 工具参数序列化容错（形状取自上一轮真实跑分里的损坏样本）----
     import json as _json
     from shell_tool import parse_tool_arguments

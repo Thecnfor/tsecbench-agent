@@ -122,6 +122,13 @@ class Job:
             + tail.decode("utf-8", errors="replace")
         )
 
+    def size(self) -> int:
+        """当前输出文件字节数（用于增量/边沿等待）。"""
+        try:
+            return os.path.getsize(self.out_path)
+        except OSError:
+            return 0
+
 
 class ShellManager:
     def __init__(self):
@@ -134,8 +141,10 @@ class ShellManager:
         self,
         command: str,
         cwd: str | None = None,
-        timeout: float | None = 300.0,
+        timeout: float | None = None,
         wait_ms: int | None = None,
+        wait_sec: float | None = None,
+        out_file: str | None = None,
     ) -> str:
         cwd = cwd or get_task_cwd() or self._cwd
         if not os.path.isdir(cwd):
@@ -147,9 +156,30 @@ class ShellManager:
             wait_ms = CFG.shell_default_wait_ms
         wait_ms = max(0, min(int(wait_ms), 30_000))
 
+        # job 上限：满了拒绝新命令，避免后台 job 堆成僵尸
+        with self._lock:
+            active = [j for j in self._jobs.values() if not j.finished]
+        if len(active) >= CFG.shell_max_jobs:
+            ids = ", ".join(f"{j.job_id}({int(time.time() - j.started_at)}s)"
+                            for j in active)
+            return (f"error: 后台 job 已满（{len(active)}/{CFG.shell_max_jobs}）：{ids}\n"
+                    f"先 action=list 看进度，用 wait/wait_any 收结果，"
+                    f"或 kill 掉不需要的 job，再启动新命令。")
+        # 硬上限：到点整组 kill（输出已落盘，杀掉不丢数据）；
+        # 未传用配置默认 1800s；显式传 0/负数 = 永不杀
+        if timeout is None:
+            timeout = CFG.shell_hard_sec
+
         job_id = uuid.uuid4().hex[:8]
-        fd, out_path = tempfile.mkstemp(prefix=f"shell_{job_id}_", suffix=".log")
-        os.close(fd)
+        if out_file:
+            path = out_file if os.path.isabs(out_file) else os.path.join(cwd, out_file)
+            try:
+                os.makedirs(os.path.dirname(path) or cwd, exist_ok=True)
+                out_path = path          # 直接写到 workdir，模型可随时 tail
+            except OSError:
+                out_path = self._new_log(job_id)
+        else:
+            out_path = self._new_log(job_id)
         env = os.environ.copy()
         env.update(CFG.extra_env)
 
@@ -158,7 +188,7 @@ class ShellManager:
                 command,
                 shell=True,
                 cwd=cwd,
-                stdout=open(out_path, "ab"),
+                stdout=open(out_path, "wb"),
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 env=env,
@@ -184,24 +214,82 @@ class ShellManager:
         deadline = time.time() + wait_ms / 1000.0
         while time.time() < deadline and not job.finished:
             time.sleep(0.05)
-        return self._status_payload(job, brief_running=True)
+        # wait_sec：工具替模型决定「什么时候回来叫它」——
+        # 命令结束 / 攒够一批新输出（>2KB）/ 到点，三者先到先返回
+        if wait_sec and not job.finished:
+            limit = time.time() + max(0.0, min(float(wait_sec), 300.0))
+            base = job.size()
+            while not job.finished and time.time() < limit:
+                if job.size() > base + 2048:
+                    break
+                time.sleep(0.1)
+        payload = self._status_payload(job)
+        extra = []
+        with self._lock:
+            others = [j.job_id for j in self._jobs.values()
+                      if not j.finished and j.job_id != job.job_id]
+        if others:
+            extra.append(f"后台还有 {len(others)} 个 job 在跑 ({', '.join(others)})："
+                         f"发完这条就去做别的事，要同时盯多个用 action=wait_any")
+        else:
+            extra.append("命令已在后台：先去做别的事，需要时用 wait/status 读结果"
+                         "（支持 offset 分页）；长命令建议 out_file 落盘")
+        return payload + "\n" + "\n".join(extra)
 
-    # ---- 动作：等待完成 ----
-    def wait(self, job_id: str, timeout: float = 30.0) -> str:
+    @staticmethod
+    def _new_log(job_id: str) -> str:
+        fd, path = tempfile.mkstemp(prefix=f"shell_{job_id}_", suffix=".log")
+        os.close(fd)
+        return path
+
+    # ---- 动作：等待（边沿触发：结束 / 攒够新输出 / 超时，先到先返回） ----
+    def wait(self, job_id: str, timeout: float = 30.0,
+             offset: int | None = None, lines: int | None = None) -> str:
         job = self._get(job_id)
         if job is None:
             return f"error: unknown job_id {job_id}"
         deadline = time.time() + max(0.0, min(timeout, 300.0))
+        base = int(offset) if offset is not None else job.size()
         while not job.finished and time.time() < deadline:
+            if job.size() > base + 2048:   # 已攒够一批新输出 → 不必等到底
+                break
             time.sleep(0.1)
-        return self._status_payload(job, brief_running=True)
+        return self._status_payload(job, offset=offset, lines=lines)
 
-    # ---- 动作：查看状态/输出（不阻塞） ----
-    def status(self, job_id: str) -> str:
+    # ---- 动作：同时等多个 job，任一有动静就返回 ----
+    def wait_any(self, job_ids, timeout: float = 60.0,
+                 lines: int | None = None) -> str:
+        if isinstance(job_ids, str):
+            job_ids = [job_ids]
+        ids = [j for j in (job_ids or []) if j]
+        if not ids:
+            return "error: `job_ids` is required for action=wait_any (array of job ids)"
+        pairs = [(jid, self._get(jid)) for jid in ids]
+        missing = [jid for jid, jb in pairs if jb is None]
+        pairs = [(jid, jb) for jid, jb in pairs if jb is not None]
+        if not pairs:
+            return f"error: unknown job_ids {ids}"
+        base = {jid: jb.size() for jid, jb in pairs}
+        deadline = time.time() + max(0.0, min(float(timeout), 300.0))
+        while time.time() < deadline:
+            if any(jb.finished for _, jb in pairs):
+                break
+            if any(jb.size() > base[jid] + 512 for jid, jb in pairs):
+                break
+            time.sleep(0.1)
+        parts = [self._status_payload(jb, lines=lines) for _, jb in pairs]
+        tail = "\n未结束的 job 继续在后台跑；继续盯可再用 wait_any 或单独 wait。"
+        if missing:
+            tail += f"\n(已忽略未知 job_id: {', '.join(missing)})"
+        return "任一 job 有新输出或结束即返回\n" + "\n---\n".join(parts) + tail
+
+    # ---- 动作：查看状态/输出（不阻塞，支持分页） ----
+    def status(self, job_id: str, offset: int | None = None,
+               lines: int | None = None) -> str:
         job = self._get(job_id)
         if job is None:
             return f"error: unknown job_id {job_id}"
-        return self._status_payload(job, brief_running=True)
+        return self._status_payload(job, offset=offset, lines=lines)
 
     # ---- 动作：列出所有 job ----
     def list(self) -> str:
@@ -209,35 +297,78 @@ class ShellManager:
             jobs = list(self._jobs.values())
         if not jobs:
             return "no jobs"
-        lines = [self._status_payload(j, brief_running=True) for j in jobs[-20:]]
-        return "\n".join(lines)
+        lines = []
+        for j in jobs[-20:]:
+            state = (f"done rc={j.exit_code}" if j.finished
+                     else f"RUN {int(time.time() - j.started_at)}s/{j.timeout or 0:.0f}s")
+            mark = "*" if not j.finished else " "
+            lines.append(f"{mark}{j.job_id}  {state:16} out={j.size():>8}B  "
+                         f"{j.command[:72]}")
+        n_run = sum(1 for j in jobs if not j.finished)
+        return ("\n".join(lines)
+                + f"\n(* = 在跑，{n_run}/{CFG.shell_max_jobs}；wait/status 读输出（offset 分页），"
+                  f"wait_any 同时等多个，kill 停止)")
 
     # ---- 动作：杀掉 ----
-    def kill(self, job_id: str) -> str:
+    def kill(self, job_id: str, lines: int | None = None) -> str:
         job = self._get(job_id)
         if job is None:
             return f"error: unknown job_id {job_id}"
         job.kill(reason="user")
         time.sleep(0.2)
-        return self._status_payload(job, brief_running=True)
+        payload = self._status_payload(job, lines=lines or 40)
+        return payload + (f"\nnote: 已终止；完整输出已落盘 {job.out_path}"
+                          f"（可 run \"tail -n 200 {job.out_path}\" 继续读）")
 
     def _get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
 
-    def _status_payload(self, job: Job, brief_running: bool = True) -> str:
-        out = job.output()
+    @staticmethod
+    def _read_page(job: Job, offset: int | None, lines: int | None) -> tuple:
+        """读输出分页：offset 给定 → 从该字节续读；否则 → 末尾 N 行（默认 200）。"""
+        try:
+            total = job.size()
+            with open(job.out_path, "rb") as f:
+                if offset is None:
+                    want = max(1, min(int(lines or 200), 2000))
+                    start = max(0, total - max(want * 160, 8192))
+                    f.seek(start)
+                    data = f.read()
+                    txt = data.decode("utf-8", errors="replace").splitlines()
+                    page = "\n".join(txt[-want:])
+                    omitted = total - len(data)
+                    more = (f"（更早还有 {omitted} 字节，offset=0 可从头分页读）"
+                            if omitted else "")
+                    return page, total, more
+                off = max(0, int(offset))
+                f.seek(off)
+                data = f.read(CFG.shell_max_output)
+                page = data.decode("utf-8", errors="replace")
+                nxt = off + len(data)
+                more = (f"（后面还有 {total - nxt} 字节，offset={nxt} 续读）"
+                        if nxt < total else "")
+                return page, nxt, more
+        except OSError:
+            return "", 0, ""
+
+    def _status_payload(self, job: Job, offset: int | None = None,
+                        lines: int | None = None) -> str:
         if job.finished:
             state = f"finished exit_code={job.exit_code}"
             if job.killed and job.exit_code not in (0, None):
                 state += " (killed: timeout or manual kill)"
         else:
             elapsed = time.time() - job.started_at
-            state = f"running elapsed={elapsed:.1f}s"
-        header = f"[job {job.job_id}] {state}\ncmd: {job.command}"
-        if out:
-            return f"{header}\noutput:\n{out}"
-        return f"{header}\noutput: (empty)"
+            state = f"running elapsed={elapsed:.1f}s (hard limit {job.timeout or 0:.0f}s)"
+        page, nxt, more = self._read_page(job, offset, lines)
+        header = (f"[job {job.job_id}] {state} out={job.size()}B\n"
+                  f"log: {job.out_path}\ncmd: {job.command}")
+        if not page:
+            return f"{header}\noutput: (empty)"
+        pos = f"from_offset={offset}" if offset is not None else "tail"
+        tail = f"\nnext_offset={nxt}" + (f" {more}" if more else "")
+        return f"{header}\noutput[{pos}]:\n{page}{tail}"
 
 
 SHELL_TOOL_SCHEMA = {
@@ -245,37 +376,76 @@ SHELL_TOOL_SCHEMA = {
     "function": {
         "name": "shell",
         "description": (
-            "Run a shell command on the local machine. Commands run ASYNCHRONOUSLY in the "
-            "background: the call returns quickly with a job_id. Use action='wait' to block "
-            "until the command finishes (up to `timeout` seconds) and get its output. "
-            "Quick commands (finishing within ~1.5s) return their full output immediately. "
-            "Environment already contains BENCHMARK_TOKEN and BENCHMARK_BASE_URL. "
-            "Actions: run (start command), wait (block for output), status (peek), "
-            "kill (stop), list (show recent jobs)."
+            "Run a shell command on the local machine. Commands run ASYNCHRONOUSLY: the "
+            "call returns a job_id quickly (commands finishing in the ~1.5s sync window "
+            "return their full output immediately). `command` is the only field you must "
+            "send — action is optional and defaults to run (sending only job_id means "
+            "status). Waiting is edge-triggered: wait returns as soon as the command "
+            "FINISHES, or has accumulated >=2KB of NEW output, or the timeout hits — "
+            "whichever comes first, so it never blocks the full timeout for nothing. "
+            "On run, pass wait_sec to let the tool decide when to wake you; meanwhile go "
+            "do other work instead of idling. Read output incrementally: each response "
+            "carries next_offset, continue with offset=next_offset (or lines for the "
+            "tail). For long scans pass out_file to write straight into your workdir so "
+            "the output survives kills and you can tail it. Jobs are killed at the hard "
+            "limit (default 1800s); kill sooner if stuck — output stays on disk. Max 8 "
+            "concurrent jobs (new run is rejected until you wait/kill). "
+            "Actions: run (default), wait, wait_any (block until ANY of several jobs "
+            "makes progress), status, kill, list. "
+            "Environment already contains BENCHMARK_TOKEN and BENCHMARK_BASE_URL."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "wait", "status", "kill", "list"],
-                    "description": "run=start command (default); wait=block for completion; "
+                    "enum": ["run", "wait", "wait_any", "status", "kill", "list"],
+                    "description": "optional (default run); wait=block for progress; "
+                                   "wait_any=block until any of job_ids progresses; "
                                    "status=non-blocking peek; kill=stop; list=recent jobs",
                 },
                 "command": {"type": "string", "description": "shell command (action=run)"},
                 "job_id": {"type": "string", "description": "job id (wait/status/kill)"},
+                "job_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "job ids to watch together (action=wait_any)",
+                },
                 "cwd": {"type": "string", "description": "working directory (action=run)"},
-                "timeout_sec": {
+                "out_file": {
+                    "type": "string",
+                    "description": "action=run: write output straight to this path "
+                                   "(absolute or relative to cwd), e.g. nmap.log in your "
+                                   "workdir — survives kills, you can tail it later",
+                },
+                "wait_sec": {
                     "type": "number",
-                    "description": "action=run: kill command after N sec (default 300); "
-                                   "action=wait: max block N sec (default 30, max 300)",
+                    "description": "action=run: block up to N sec (max 300) so this single "
+                                   "call already returns real output when the command "
+                                   "finishes or streams >=2KB new output. Use it instead "
+                                   "of calling wait right after run. Try 60 for scans.",
                 },
                 "wait_ms": {
                     "type": "integer",
-                    "description": "action=run: initial sync wait window in ms (default 1500, max 30000)",
+                    "description": "action=run: initial sync window in ms (default 1500, max 30000)",
+                },
+                "timeout_sec": {
+                    "type": "number",
+                    "description": "action=run: hard kill after N sec (default 1800, 0=never); "
+                                   "action=wait/wait_any: max block N sec (wait default 30, "
+                                   "wait_any default 60, max 300)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "wait/status: byte offset to read output from — use the "
+                                   "next_offset returned earlier to page without re-reading",
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "wait/status/wait_any/kill: number of trailing lines to "
+                                   "return (default 200)",
                 },
             },
-            "required": ["action"],
         },
     },
 }
@@ -428,6 +598,23 @@ def dispatch_shell(tool_args: dict) -> str:
         tool_args, _ = repair_tool_args(tool_args or {})
     except Exception:
         pass  # 修复失败按原样走，由下面的分支给出正常错误
+    # action 可省略：只有 job_id 没 command → 当作 status（省得模型补 action）
+    if ("action" not in tool_args and not tool_args.get("command")
+            and tool_args.get("job_id")):
+        tool_args = dict(tool_args, action="status")
+
+    def _int(v):
+        try:
+            return None if v is None else int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _float(v, default):
+        try:
+            return default if v is None else float(v)
+        except (TypeError, ValueError):
+            return default
+
     action = tool_args.get("action", "run")
     try:
         if action == "run":
@@ -437,29 +624,38 @@ def dispatch_shell(tool_args: dict) -> str:
             return SHELL.run(
                 command=command,
                 cwd=tool_args.get("cwd"),
-                timeout=tool_args.get("timeout_sec", 300.0),
-                wait_ms=tool_args.get("wait_ms"),
+                timeout=_float(tool_args.get("timeout_sec"), None),  # 缺省→配置默认 1800s
+                wait_ms=_int(tool_args.get("wait_ms")),
+                wait_sec=_float(tool_args.get("wait_sec"), None),
+                out_file=tool_args.get("out_file"),
             )
         if action == "wait":
             job_id = tool_args.get("job_id")
             if not job_id:
                 return "error: `job_id` is required for action=wait"
-            return SHELL.wait(job_id, timeout=float(tool_args.get("timeout_sec", 30.0)))
+            return SHELL.wait(job_id, timeout=_float(tool_args.get("timeout_sec"), 30.0),
+                              offset=_int(tool_args.get("offset")),
+                              lines=_int(tool_args.get("lines")))
+        if action == "wait_any":
+            ids = tool_args.get("job_ids") or tool_args.get("job_id")
+            return SHELL.wait_any(ids, timeout=_float(tool_args.get("timeout_sec"), 60.0),
+                                  lines=_int(tool_args.get("lines")))
         if action == "status":
             job_id = tool_args.get("job_id")
             if not job_id:
                 return "error: `job_id` is required for action=status"
-            return SHELL.status(job_id)
+            return SHELL.status(job_id, offset=_int(tool_args.get("offset")),
+                                lines=_int(tool_args.get("lines")))
         if action == "kill":
             job_id = tool_args.get("job_id")
             if not job_id:
                 return "error: `job_id` is required for action=kill"
-            return SHELL.kill(job_id)
+            return SHELL.kill(job_id, lines=_int(tool_args.get("lines")))
         if action == "list":
             return SHELL.list()
         return (f"error: unknown action {action!r}; 请用 "
                 f'{{"action":"run","command":"<命令>"}} 或 '
-                f'{{"action":"wait","job_id":"<job>"}}（可选 status/kill/list）')
+                f'{{"action":"wait","job_id":"<job>"}}（可选 wait_any/status/kill/list）')
     except Exception as e:  # 兜底，绝不让工具异常打断主循环
         return f"error: shell tool failed: {type(e).__name__}: {e}"
 

@@ -69,8 +69,9 @@
 │    model: deepseek-v4.1-flash-expires-on-0910                     │
 │    gateway: http://api.deepseek.com.tsecbench.gw/v1（OpenAI 兼容）│
 │    tools: 仅 shell（异步 background），无 MCP、无 subagent         │
-│      └─ run: 后台启动命令返回 job_id（1.5s 快速窗口）             │
-│         wait / status / kill / list：轮询与控制                   │
+│      └─ run: 后台启动返回 job_id（1.5s 快速窗口，可带 wait_sec）     │
+│         wait / wait_any / status / kill / list：边沿等待+分页读        │
+│         （offset/lines），输出可 out_file 落盘，1800s 硬上限才 kill   │
 │                                                                   │
 │  预装工具：nmap masscan whatweb sqlmap gobuster ffuf nikto dirb   │
 │            hydra netcat dig tcpdump python3(含 requests) ...      │
@@ -160,6 +161,8 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_MAX_FAILURES` | 真失败（LLM 致命错/上下文超限/VPN 放弃）放弃上限（≥1） | `2` |
 | `AGENT_DEADLINE_SEC` | 任务总时限秒（0=不限） | `0` |
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
+| `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
+| `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
 | `VPN_WAIT_SEC` | VPN 预检最长等待（hosted 强制） | `90` |
 
