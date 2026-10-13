@@ -82,6 +82,18 @@
 - **VPN 只在容器内**：宿主机不需要 openvpn、不需要 root 改路由；断线/重连都不影响宿主机。
 - **网络隔离**：容器 `NET_ADMIN + tun` 仅作用于自身 netns；宿主机路由表、DNS 均不被修改。
 
+### 分段解题（每题独立上下文 + 暂停/续跑）
+
+- 每题每次 **`AGENT_TASK_MAX_TURNS`（默认 60）轮为一段**：到点**不判死**，而是
+  **关闭题目释放名额**（`task_close{outcome:"paused"}`）→ 上下文原样保留（`resume_meta`，
+  可从 `conversation.jsonl` 重建）→ 排到队尾，**等没有新题可派时再 `start` 续跑**。
+- 续跑会**重启靶机**（拿到新 target），并在上下文末尾追加一条续跑通知：
+  告知「靶机已重启、靶机内状态重置、workdir 文件仍在、已提交的 flag 不丢、从上次进度继续」。
+- **只有三种情况才终止本题**：① 上下文超出模型窗口（`context_length_exceeded`，
+  立即停、不重试）；② 连续 `AGENT_GIVEUP_MAX` 段「没通关就输出总结」；③ 真失败
+  （LLM 致命错/VPN 超时/时限）累计 `AGENT_MAX_FAILURES` 次。
+- 除这三种情况外**题目一直续跑到通关或平台终态**；暂停/续跑不消耗失败次数。
+
 ## 快速开始
 
 ```bash
@@ -138,6 +150,10 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `VPN_PROBE_INTERVAL` | VPN 探测间隔秒 | `20` |
 | `AGENT_VPN_WAIT_MAX` | VPN 挂起时 worker 最长等待秒（超时弃题） | `600` |
 | `AGENT_MAX_TURNS` | 最大 LLM 轮次 | `400` |
+| `AGENT_TASK_MAX_TURNS` | 每段轮次预算（到点暂停、保留上下文，见「分段解题」） | `60` |
+| `AGENT_PAUSE_MAX` | 每题最多暂停续跑次数（`0`=不限，一直续跑直到通关） | `0` |
+| `AGENT_GIVEUP_MAX` | 连续「未通关就输出总结」的段数上限（`0`=不限；达上限判 fail） | `3` |
+| `AGENT_MAX_FAILURES` | 真失败（LLM 致命错/上下文超限/VPN 放弃）放弃上限（≥1） | `2` |
 | `AGENT_DEADLINE_SEC` | 任务总时限秒（0=不限） | `0` |
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
@@ -152,8 +168,9 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 token 重启则 append）
 ├── meta.json                         # mode/model、runs[]（每次运行 started_at/finished_at/结果）
 ├── events.jsonl                      # run 级事件：llm_retry、platform_poll_error、final_summary…
-├── tasks.jsonl                       # 题目生命周期：task_start{started_at,target,attempt}
+├── tasks.jsonl                       # 题目生命周期：task_start{started_at,target,attempt,resume}
 │                                      / task_close{closed_at,duration_sec,outcome,flags}
+│                                      # outcome ∈ pass | fail | paused（paused=本段到点，稍后续跑）
 ├── openvpn.log
 └── tasks/<code>/
      ├── conversation.jsonl           # 完整 LLM 对话，**全量不裁剪**：
@@ -161,6 +178,7 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
      │    每条含 ts/seq/turn/tool_call_id + **成对起止时间戳（供甘特图）**：
      │    started_at/ended_at（epoch 秒·毫秒精度）+ duration_ms（自动算）——
      │    assistant=本次 LLM 调用起止、tool=工具执行起止、user/note=写入同刻；
+     │    **同时是分段解题续跑时重建上下文的唯一来源**（`records.rebuild_messages`）
      │    **通关后同上下文追加复盘总结**
      │    （思路/工具困难/优化建议，assistant 条目带 kind_note:"closing_summary"）
      └── <AI 解题产物>

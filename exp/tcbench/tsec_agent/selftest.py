@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""离线自测：不依赖 VPN / 网关 / 平台，验证「控制器 + 单题独立上下文」主逻辑。
+"""离线自测：不依赖 VPN / 网关 / 平台，验证「控制器 + 单题独立上下文 + 分段解题」主逻辑。
 
 用假的 OpenAI client 模拟两道题的解题过程：
   题 t-01：第 1 轮发起 shell tool call，第 2 轮输出总结（模拟通关）
-  题 t-02：第 1 轮直接输出总结（模拟放弃）
+  题 t-02：每段第 1 轮直接输出总结（模拟"未通关就想收尾"）→ 关题暂停、带上下文续跑，
+           连续 3 段仍不通关 → 判 fail（验证 paused→resume→abandon 链路与记录断言）
 平台层（bench.*）用内存 fake 替换。
 """
 
@@ -186,7 +187,8 @@ def main() -> int:
             assert r.get("started_at") and r.get("target"), f"task_start fields: {r}"
         if r["phase"] == "task_close":
             assert r.get("closed_at") and r.get("duration_sec") is not None, f"task_close fields: {r}"
-            assert r.get("outcome") in ("pass", "fail"), f"outcome: {r}"
+            # paused = 分段解题：本轮到点关题保留上下文，稍后续跑（不判死）
+            assert r.get("outcome") in ("pass", "fail", "paused"), f"outcome: {r}"
     assert phases.get("t-01") >= {"task_start", "task_close"}, f"t-01 lifecycle: {phases.get('t-01')}"
     # conversation.jsonl：全量不裁剪——assistant 含 thinking/output/tool_calls，tool 含 result
     conv_t01 = os.path.join(recdir, "tasks", "t-01", "conversation.jsonl")
@@ -239,6 +241,35 @@ def main() -> int:
     # events.jsonl 存在且有 run_start/run_finish/final_summary
     evs = [json.loads(l)["type"] for l in open(os.path.join(recdir, "events.jsonl"))]
     assert "run_start" in evs and "run_finish" in evs and "final_summary" in evs, evs
+    # 分段解题：t-02 每段"未通关就收尾" → 暂停关题、带上下文续跑，直到连续收尾达上限判 fail
+    assert "task_paused" in evs, f"pause event missing: {evs}"
+    assert "task_abandoned" in evs, f"abandon event missing: {evs}"
+    t02_events = [r for r in (json.loads(l) for l in open(os.path.join(recdir, "events.jsonl")))
+                  if r.get("code") == "t-02"]
+    assert any(e["type"] == "task_abandoned" and
+               e.get("status") == "giveup_loop" for e in t02_events), t02_events
+    # 续跑：t-02 的对话里应有"继续解题"通知，且排在重建出的上下文之后
+    # （system + 任务卡只在首段写一次，续跑不重写 → 文件里仍是 1 条 system）
+    recs_t02 = [json.loads(l) for l in open(conv_t02)]
+    assert sum(1 for r in recs_t02 if r["kind"] == "system") == 1, "resume must not rewrite system"
+    resume_notes = [r for r in recs_t02 if r["kind"] == "user" and "继续解题" in (r.get("content") or "")]
+    assert resume_notes, "resume note missing in t-02 conversation"
+    # 续跑时上下文从记录重建：断言重建结果自洽（每个 tool_calls 都紧跟同 id 的 tool 结果）
+    rebuilt = records.rebuild_messages(conv_t02)
+    assert rebuilt and rebuilt[0]["role"] == "system", "rebuild: system missing"
+    for i, m in enumerate(rebuilt):
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            ids = {t["id"] for t in m["tool_calls"]}
+            got = {x.get("tool_call_id") for x in rebuilt[i + 1:]
+                   if x["role"] == "tool"} if i + 1 < len(rebuilt) else set()
+            if m is rebuilt[-1]:
+                continue  # 尾部总结性 assistant（无后续）由结束约定负责
+            assert ids <= got, f"rebuild: orphan tool_calls at {i}"
+    # tasks.jsonl：t-02 至少有一次 resume=True 的 task_start（续跑重新 start）
+    t02_starts = [r for r in (json.loads(l) for l in open(os.path.join(recdir, "tasks.jsonl")))
+                  if r.get("phase") == "task_start" and r.get("code") == "t-02"]
+    assert len(t02_starts) >= 3, f"t-02 should pause+resume, starts={len(t02_starts)}"
+    assert any(r.get("resume") for r in t02_starts), "resume task_start missing"
 
     shutil.rmtree(recdir, ignore_errors=True)
     print("PASS: controller + per-task context + persistent records end-to-end OK")

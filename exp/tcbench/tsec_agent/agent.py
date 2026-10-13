@@ -21,7 +21,8 @@ import time
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 
 from config import CFG
-from prompt import SYSTEM_PROMPT, TASK_TEMPLATE, CLOSING_SUMMARY_PROMPT
+from prompt import (SYSTEM_PROMPT, TASK_TEMPLATE, CLOSING_SUMMARY_PROMPT,
+                    RESUME_NOTE, GIVEUP_NOTE)
 from shell_tool import SHELL_TOOL_SCHEMA, dispatch_shell, set_task_cwd, get_task_cwd
 from records import init_records, rec
 import bench
@@ -249,27 +250,48 @@ def smoke_test(client: OpenAI) -> int:
     return 0 if ok else 1
 
 
-def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
-               conv) -> tuple[bool, str, int, list]:
-    """单题独立上下文：解题直到模型输出最终总结（无工具调用）或轮次预算耗尽。
+def _is_context_overflow(e: BaseException) -> bool:
+    """LLM 上下文超限判定：这类错误重试/续跑都无意义，只能终止本题。"""
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(k in text for k in (
+        "context_length_exceeded", "context_length", "context window",
+        "maximum context length", "maximum context window",
+        "too many tokens", "reduce the length", "input length and `max_tokens`",
+        "string too long", "prompt is too long",
+    ))
 
-    返回 (got_summary, last_content, turns_used, messages)——messages 交还调用方用于
-    通关后的复盘总结（同上下文），复盘完成即销毁。
+
+def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
+               *, messages: list | None = None,
+               start_turn: int = 0) -> tuple[str, str, int, list]:
+    """单题分段解题：本段直到模型输出最终总结（无工具调用）或本段轮次预算到点。
+
+    返回 (status, last_content, turns_used, messages)：
+      done            模型输出无工具总结（本段结束，是否通关由控制器查平台判定）
+      paused          本段轮次预算到点 → 控制器关闭题目释放名额、保留上下文，稍后续跑
+      stopped         平台终态（STOP 置位）
+      vpn_abandon     VPN 长时间未恢复，放弃本题
+      deadline        全局任务时限耗尽
+      llm_error       LLM 调用致命错误
+      context_overflow 上下文超出模型窗口（本题不可再续跑）
+    messages/start_turn：续跑时传入重建好的上下文与轮次偏移，此时不再写 system/user
+    （system/user 已在首段落盘，续跑只追加续跑通知）。
     对话全量、忠实落盘（conversation.jsonl）：发送什么、输出什么，原样记录不裁剪。
     """
-    messages: list = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": task_card},
-    ]
-    # 忠实记录本题输入（system + 任务卡）
-    conv.write("system", turn=f"{code}:0", content=SYSTEM_PROMPT)
-    conv.write("user", turn=f"{code}:0", content=task_card)
+    if messages is None:
+        messages: list = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task_card},
+        ]
+        # 忠实记录本题输入（system + 任务卡）
+        conv.write("system", turn=f"{code}:0", content=SYSTEM_PROMPT)
+        conv.write("user", turn=f"{code}:0", content=task_card)
     last_content = ""
     turns_used = 0
     turn = 0
     while turn < budget:
         if STOP.is_set():
-            return False, last_content, turns_used, messages
+            return "stopped", last_content, turns_used, messages
         # VPN 守卫：VPN 挂起 → 本题挂起等待恢复（不烧轮次预算），恢复后原地继续。
         # 等待超过 AGENT_VPN_WAIT_MAX（默认 600s）仍未恢复才放弃本题。
         if VPN_DOWN.is_set():
@@ -285,13 +307,13 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
                 conv.write("error", turn=f"{code}:{turn}",
                            error=f"VPN still down after {waited:.0f}s; abandoning task")
                 log(f"[{code}] VPN still down after {waited:.0f}s; abandoning")
-                return False, last_content, turns_used, messages
+                return "vpn_abandon", last_content, turns_used, messages
             conv.write("note", turn=f"{code}:{turn}",
                        content=f"VPN recovered after {waited:.0f}s; resuming")
             log(f"[{code}] VPN recovered after {waited:.0f}s; resuming task")
             continue  # 恢复后从当前 turn 继续（不烧预算）
         if (rem := remaining_sec()) is not None and rem <= 0:
-            return False, last_content, turns_used, messages
+            return "deadline", last_content, turns_used, messages
         turn += 1
         t_llm_start = time.time()
         try:
@@ -300,12 +322,13 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
             log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
             conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}",
                        started_at=t_llm_start)
-            return False, last_content, turns_used, messages
+            status = "context_overflow" if _is_context_overflow(e) else "llm_error"
+            return status, last_content, turns_used, messages
         turns_used += 1
         t_llm_end = time.time()
 
         msg = resp.choices[0].message
-        tlabel = f"{code}:{turn}"
+        tlabel = f"{code}:{start_turn + turn}"
         tool_calls_raw = getattr(msg, "tool_calls", None) or []
         # AI 输出全量落盘：thinking / output / tool_calls 原文
         # started_at/ended_at = 本次 LLM 调用起止（供甘特图）
@@ -335,8 +358,8 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
         messages.append(clean)
 
         if not tool_calls_raw:
-            # 本题上下文的最终总结 → 交还控制器
-            return True, msg.content or "", turns_used, messages
+            # 本题上下文的最终总结 → 交还控制器（是否通关由控制器查平台）
+            return "done", msg.content or "", turns_used, messages
 
         for tc in tool_calls_raw:
             args = {}
@@ -359,8 +382,9 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int,
             log(f"tool#{tc.id[-6:]} {tc.function.name} -> {result.splitlines()[0][:160] if result else ''}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    log(f"[{code}] per-task turn budget ({budget}) exhausted")
-    return False, last_content, turns_used, messages
+    log(f"[{code}] segment turn budget ({budget}) reached "
+        f"(total {start_turn + turn} turns) — pausing, context kept")
+    return "paused", last_content, turns_used, messages
 
 
 def closing_summary(client: OpenAI, code: str, messages: list, conv) -> str:
@@ -412,9 +436,9 @@ def run(client: OpenAI) -> int:
     R.run_start(mode=CFG.mode, model=CFG.model, max_turns=CFG.max_turns)
     log(f"records dir: {R.dir}")
     start_platform_watcher()
-    task_budget = int(os.environ.get("AGENT_TASK_MAX_TURNS", "60"))
+    task_budget = CFG.task_max_turns
     task_filter = os.environ.get("AGENT_TASK_FILTER", "").strip()
-    results: dict[str, str] = {}   # code -> outcome(pass/fail)
+    results: dict[str, str] = {}   # code -> outcome(pass/fail)；暂停题不写（保留续跑）
     attempts: dict[str, int] = {}
     total_turns = 0
 
@@ -475,7 +499,10 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     - 并发上限 AGENT_MAX_PARALLEL（默认 5）为本地意愿；平台 start 返回
       "max active" 时收缩为平台实际活跃数，之后随完成动态补齐。
     - 防冲突：每题独立上下文 + 独立线程 + 独立工作目录（thread-local cwd）；
-      results/attempts 由锁保护；平台 start/close 由调度线程串行执行。
+      results/attempts/failures/resume_meta 由锁保护；平台 start/close 由调度线程串行执行。
+    - 分段解题：每题每段 task_budget 轮，到点不判死——关闭题目释放名额、保留全量上下文
+      （resume_meta），等没有新题可派时再 start 续跑（重启靶机 + 追加续跑通知）。
+      只有上下文超模型窗口 / 连续收尾不通关达上限 / 真失败达 max_failures 才终止本题。
     - 调度线程绝不因单个题的异常崩溃（worker 异常记 fail 继续）。
     """
     lock = threading.Lock()
@@ -495,14 +522,27 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     if vpn_guard_on:
         rec().event("vpn_guard_enabled", {"mode": CFG.mode, "vpn_mode": vpn_mode})
 
-    def worker(task: dict, addr: str, attempt: int) -> None:
+    # 分段解题状态（调度线程与 worker 共享，受 lock 保护）：
+    #   failures:  真失败次数（LLM 致命错/上下文超限/VPN 放弃/时限），达上限才判死
+    #   resume_meta: 暂停题的续跑状态 {pauses, gives, target, turns}
+    failures: dict[str, int] = {}
+    resume_meta: dict[str, dict] = {}
+
+    def worker(task: dict, addr: str, attempt: int, resume: bool = False) -> None:
         code = task["unique_code"]
         set_task_cwd(_task_workdir(code))
         last = ""
         state = None
         closing_text = ""
+        status = "llm_error"
+        outcome = "fail"
         conv = rec().conversation(code)
         messages: list | None = None
+        meta = resume_meta.get(code) or {}
+        pauses = int(meta.get("pauses", 0))
+        gives = int(meta.get("gives", 0))
+        old_target = meta.get("target", "")
+        start_turn = 0
         try:
             card = TASK_TEMPLATE.format(
                 code=code, difficulty=task["difficulty"], level=task["level"],
@@ -513,7 +553,27 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
             budget = task_budget
             if rem := remaining_sec():
                 budget = max(10, min(task_budget, int(rem // 6)))
-            _, last, _, messages = solve_task(client, code, card, budget, conv)
+
+            if resume:
+                # 续跑：从 conversation.jsonl 重建全量上下文（记录即事实），
+                # 再追加「靶机已重启」的续跑通知；不重写 system/user。
+                loaded = rec().load_messages(code)
+                if loaded:
+                    messages = loaded
+                    start_turn = sum(1 for m in messages if m["role"] == "assistant")
+                    note = (GIVEUP_NOTE if meta.get("reason") == "giveup" else RESUME_NOTE).format(
+                        new_target=addr, old_target=old_target or "（未知）",
+                        workdir=get_task_cwd() or _task_workdir(code),
+                        budget=budget, turns=start_turn)
+                    messages.append({"role": "user", "content": note})
+                    conv.write("user", turn=f"{code}:{start_turn}", content=note)
+                    log(f"[{code}] resume segment: {start_turn} prior turns restored, "
+                        f"target={addr} (was {old_target or '?'})")
+                else:
+                    log(f"[{code}] resume context unavailable; starting fresh segment")
+
+            status, last, used, messages = solve_task(
+                client, code, card, budget, conv, messages=messages, start_turn=start_turn)
 
             # 校验平台状态（快照失败重试，避免误判）
             for _try in range(3):
@@ -523,18 +583,75 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                     if state is not None:
                         break
                 time.sleep(4)
+            completed = bool(state and state["is_completed"])
 
             # 通关后：同一上下文直接追加复盘请求，总结像普通消息一样落 conversation.jsonl
-            if state and state["is_completed"] and messages is not None:
+            if completed and messages is not None:
                 closing_text = closing_summary(client, code, messages, conv)
+
+            if completed:
+                outcome = "pass"
+                with lock:
+                    resume_meta.pop(code, None)
+            elif status in ("llm_error", "context_overflow", "vpn_abandon", "deadline"):
+                # 真失败：上下文不保留，计入失败次数，达上限后不再派发
+                with lock:
+                    failures[code] = (max(CFG.max_failures, 1) if status == "context_overflow"
+                                      else failures.get(code, 0) + 1)
+                    resume_meta.pop(code, None)
+                outcome = "fail"
+                rec().event("task_abandoned", {"code": code, "status": status,
+                                               "failures": failures.get(code, 0)})
+                log(f"[{code}] abandoned ({status}); failures={failures.get(code, 0)}"
+                    f"{' (context overflow — task stopped)' if status == 'context_overflow' else ''}")
+            elif status == "stopped":
+                outcome = "fail"  # 平台终态，见 platform_ended
+                with lock:
+                    resume_meta.pop(code, None)
+            else:
+                # paused（本段轮次到点）或 done 但未通关（模型提前收尾）→
+                # 关闭题目释放名额，保留上下文排到队尾，等没有新题时再续跑。
+                giveup = status == "done"
+                gives = gives + 1 if giveup else 0
+                pauses += 1
+                too_many = ((CFG.giveup_max > 0 and gives >= CFG.giveup_max) or
+                            (CFG.pause_max > 0 and pauses > CFG.pause_max))
+                if too_many:
+                    with lock:
+                        # 终止式放弃：直接置满失败上限，不再被重新派发
+                        # （否则会被当成新题从头再跑，白白烧轮次）
+                        failures[code] = max(CFG.max_failures, 1)
+                        resume_meta.pop(code, None)
+                    outcome = "fail"
+                    rec().event("task_abandoned", {
+                        "code": code,
+                        "status": "giveup_loop" if giveup else "pause_limit",
+                        "pauses": pauses, "gives": gives})
+                    log(f"[{code}] abandoning after {pauses} segments "
+                        f"({'consecutive give-ups' if giveup else 'pause limit'})")
+                else:
+                    outcome = "paused"
+                    with lock:
+                        resume_meta[code] = {"pauses": pauses, "gives": gives,
+                                             "target": addr, "turns": start_turn + used,
+                                             "reason": "giveup" if giveup else "paused"}
+                    rec().event("task_paused", {
+                        "code": code, "pauses": pauses, "gives": gives,
+                        "reason": "giveup" if giveup else "turn_budget",
+                        "turns": start_turn + used, "target": addr})
+                    log(f"[{code}] segment done ({status}); pausing & releasing slot "
+                        f"(segment {pauses}, {start_turn + used} total turns)")
         except Exception as e:
             log(f"[{code}] worker error: {type(e).__name__}: {e}")
             rec().event("task_error", {"code": code, "error": f"{type(e).__name__}: {e}"})
+            outcome = "fail"
         finally:
-            messages = None  # 该题上下文销毁（引用丢弃，随 GC 回收）
+            messages = None  # 该题上下文交还给 resume_meta/记录（暂停时已存），随 GC 回收
             set_task_cwd("")  # 线程结束清 thread-local
             closed_at = time.strftime("%Y-%m-%d %H:%M:%S")
             completed = bool(state and state["is_completed"])
+            if outcome == "pass" and not completed:
+                outcome = "fail"  # 快照异常兜底：平台未确认通关不算 pass
             try:
                 bench.close_challenge(code)
                 rec().event("challenge_change", {"code": code, "field": "controller_close",
@@ -547,9 +664,10 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 log(f"[{code}] close network error: {type(e).__name__}: {e}")
                 rec().event("platform_poll_error",
                             {"where": "close", "code": code, "error": str(e)})
-            outcome = "pass" if completed else "fail"
-            with lock:
-                results[code] = outcome
+            if outcome != "paused":
+                # 暂停不算结果：题目保留，排到队尾等续跑
+                with lock:
+                    results[code] = outcome
             # 题目生命周期：关闭时间 + 耗时 + 结果（task_close 对应 task_start）
             rec().task_event(code, "task_close",
                              closed_at=closed_at,
@@ -608,7 +726,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 results.setdefault(code, "pass")
         items = snapshot() or items
 
-        # 候选：未通关、不在跑、未超重试上限、通过过滤
+        # 候选：未通关、不在跑、未超真失败上限、通过过滤
         def eligible(c: dict) -> bool:
             if c["is_completed"]:
                 return False
@@ -617,19 +735,25 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                     return False
                 if results.get(c["unique_code"]) == "pass":
                     return False
-                if attempts.get(c["unique_code"], 0) >= 2:
+                if failures.get(c["unique_code"], 0) >= max(CFG.max_failures, 1):
                     return False
             return not (task_filter and c["unique_code"] != task_filter)
 
-        candidates = sorted(
-            [c for c in items if eligible(c)],
-            key=lambda c: (0 if c["container_status"] == "available" else 1,
-                           bench.DIFF_RANK.get(c["difficulty"], 9),
-                           c.get("level", 9), c["unique_code"]),
-        )
+        def _key(c: dict) -> tuple:
+            return (0 if c["container_status"] == "available" else 1,
+                    bench.DIFF_RANK.get(c["difficulty"], 9),
+                    c.get("level", 9), c["unique_code"])
+
+        fresh = sorted([c for c in items if eligible(c) and c["unique_code"] not in resume_meta],
+                       key=_key)
+        resumable = sorted([c for c in items if eligible(c) and c["unique_code"] in resume_meta],
+                           key=lambda c: (resume_meta.get(c["unique_code"], {}).get("pauses", 0),
+                                          c["unique_code"]))
+        # 分段策略：暂停题只在没有新题可派时才续跑——名额与轮次先留给还没跑的题（含简单题）
+        candidates = fresh or resumable
 
         if not candidates and not running:
-            break  # 全部完成或全部放弃
+            break  # 全部完成或全部结束（真失败达上限）
 
         if VPN_DOWN.is_set():
             # 暂停派发（平台 API 走公网不依赖 VPN，snapshot/终态检测/释放照常；
@@ -644,7 +768,9 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                     break
             code = task["unique_code"]
             addr = _task_target(task)
-            if task["container_status"] != "available" or not addr:
+            # 续跑必须重新 start：题目容器要重启（释放名额期间已被关闭），
+            # 以便拿到新 target 并在续跑通知里如实告知模型「靶机已重置」
+            if task["container_status"] != "available" or not addr or code in resume_meta:
                 started = False
                 slot_full = False
                 for _try in range(3):
@@ -672,6 +798,10 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                             # 任务侧状态问题：记 fail，不重试死循环
                             log(f"[{code}] start invalid_state: {e.message}")
                             break
+                        elif e.code == "duplicate":
+                            # 幂等：容器已在跑，直接复用现有地址
+                            started = True
+                            break
                         elif e.code == "resource_unavailable":
                             time.sleep(5)
                             continue
@@ -688,31 +818,37 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 if slot_full:
                     break  # 名额满了，等 worker 完成后再扩
                 if not started:
-                    # start 失败也计入 attempts，避免同一题无限重试死循环
+                    # start 失败计入真失败上限，避免同一题无限重试死循环
                     with lock:
                         attempts[code] = attempts.get(code, 0) + 1
-                        results[code] = "fail" if attempts[code] >= 2 else results.get(code, "fail")
+                        failures[code] = failures.get(code, 0) + 1
+                        if failures[code] >= max(CFG.max_failures, 1):
+                            results[code] = "fail"
                     continue
             if not addr:
                 log(f"[{code}] no container_addr from start")
                 with lock:
                     attempts[code] = attempts.get(code, 0) + 1
+                    failures[code] = failures.get(code, 0) + 1
                     results[code] = "fail"
                 continue
 
             with lock:
                 attempts[code] = attempts.get(code, 0) + 1
                 attempt_no = attempts[code]
+                is_resume = code in resume_meta
             # 题目生命周期：启动时间（task_start，对应 task_close 的 closed_at/duration）
             rec().task_event(code, "task_start",
                              started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                              target=addr, attempt=attempt_no,
+                             resume=is_resume,
                              parallel=len(running) + 1,
                              flags=f"0/{task['flag_count']}")
             TASK_START_TS[code] = time.time()
             log(f"=== task {code} attempt {attempt_no} target={addr} "
+                f"{'(resume segment) ' if is_resume else ''}"
                 f"[parallel {len(running) + 1}/{cap}] ===")
-            t = threading.Thread(target=worker, args=(task, addr, attempt_no),
+            t = threading.Thread(target=worker, args=(task, addr, attempt_no, is_resume),
                                  name=f"task-{code}", daemon=True)
             with lock:
                 running[code] = t
@@ -730,6 +866,17 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
         t.join(timeout=180)
         if t.is_alive():
             log(f"[{code}] worker still running at shutdown; detached")
+
+    # 运行终止（平台终态/时限）时仍有暂停中的题：补记 fail，
+    # 保证 results/run_finish 完整（暂停态本身已落 task_close{outcome:paused}）
+    if resume_meta:
+        with lock:
+            for code in list(resume_meta):
+                results.setdefault(code, "fail")
+                rec().event("task_abandoned", {"code": code, "status": "run_ended",
+                                               "pauses": resume_meta[code].get("pauses", 0)})
+                log(f"[{code}] still paused at shutdown; recorded as fail")
+            resume_meta.clear()
 
     # 平台终态：所有 agent（worker 线程）已停，尽力关闭其靶场容器释放资源
     #（平台已截止时 close 可能返回 invalid_state——忽略即可，平台侧会自动回收）

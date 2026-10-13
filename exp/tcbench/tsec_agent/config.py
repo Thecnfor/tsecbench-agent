@@ -113,6 +113,12 @@ class Config:
 
     # --- 运行控制 ---
     max_turns: int = int(_env("AGENT_MAX_TURNS", "400"))
+    # 分段解题：每段轮次到点 → 关闭题目释放名额、保留上下文，排到队尾稍后续跑。
+    # 本题不因轮次被判死；只有上下文超模型窗口/连续收尾不通关/真失败才终止。
+    task_max_turns: int = int(_env("AGENT_TASK_MAX_TURNS", "60"))
+    pause_max: int = int(_env("AGENT_PAUSE_MAX", "0"))     # 每题最多暂停续跑次数，0=不限
+    giveup_max: int = int(_env("AGENT_GIVEUP_MAX", "3"))   # 连续"未通关就收尾"上限，0=不限
+    max_failures: int = int(_env("AGENT_MAX_FAILURES", "2"))  # 真失败放弃上限（≥1，0 按 1）
     deadline_sec: float = float(_env("AGENT_DEADLINE_SEC", "0"))
     request_timeout: float = float(_env("AGENT_REQUEST_TIMEOUT", "300"))
     api_max_retries: int = int(_env("AGENT_API_RETRIES", "5"))

@@ -43,9 +43,19 @@
    不允许用平台地址代替该预检。
 6. **错误处置在提示词里**：`invalid_state`/`duplicate`/`task_not_found` 等平台错误码的处理规则
    写在 `prompt.py`，与平台规则一一对应，改动前对照 README「平台流程」章节。
-7. **上下文按题隔离（方案 A）**：平台编排（选题/start/close/名额）由 `agent.py` 控制器 +
-   `bench.py` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solve_task`），
-   题目做完上下文即弃。**不要改回单一大上下文**。失败题重试上限 2 次（attempts 字典）。
+7. **上下文按题隔离（方案 A）+ 分段解题**：平台编排（选题/start/close/名额）由 `agent.py` 控制器 +
+   `bench.py` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solve_task`）。
+   **不要改回单一大上下文**。
+   - **每段 `AGENT_TASK_MAX_TURNS`（默认 60）轮到点不判死**：`task_close{outcome:"paused"}`
+     关题释放名额 → 上下文保留（`resume_meta`；需要时由 `records.rebuild_messages` 从
+     conversation.jsonl 重建）→ 没有新题可派时才 `start` 续跑（重启靶机），
+     续跑在上下文末尾追加 `prompt.RESUME_NOTE`（新 target / 靶机内状态已重置 / workdir 保留 /
+     已提交 flag 不丢 / 从上次进度继续）。
+   - **只有三种终止**：上下文超模型窗口（`context_overflow`，立即停不重试）、
+     连续 `AGENT_GIVEUP_MAX`（默认 3）段「未通关就输出总结」、真失败累计
+     `AGENT_MAX_FAILURES`（默认 2）次；其余情况一律续跑到通关或平台终态。
+     真失败/启动失败计入 `failures` 字典；`attempts` 只用于 attempt 编号与启动失败计数。
+   - 暂停、续跑**不消耗**失败次数。
 8. **bench 记录与隔离（records.py）**：
    - 记录目录唯一键 = **token**（`docker/runs/<TOKEN>/`，无时间戳；同 token 重启 append）；
    - **隔离靠挂载边界**：`run.sh` 只挂当前 token 目录为 `/work`——容器内只见当前 bench，
@@ -57,8 +67,8 @@
      **每条消息带成对起止时间戳**（`started_at`/`ended_at` epoch 秒·毫秒精度 +
      `duration_ms` 自动计算；assistant=LLM 调用起止、tool=工具执行起止，
      埋点在 `solve_task`/`closing_summary`）——直接可画甘特图（llm/tool 泳道）；
-   - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt}` /
-     `task_close{closed_at,duration_sec,outcome,flags}`；
+   - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt,resume}` /
+     `task_close{closed_at,duration_sec,outcome,flags}`（`outcome` ∈ `pass`/`fail`/`paused`）；
    - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求
      （`prompt.py: CLOSING_SUMMARY_PROMPT`：解题思路 / 工具使用困难 / 工具集优化建议），
      由 deepseek 输出；复盘作为**普通 user/assistant 消息**原样写入同一 conversation.jsonl
@@ -86,7 +96,7 @@
 | `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
 | `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill | 调工具行为 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
-| `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl | 记录字段调整 |
+| `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuild_messages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
 | `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、全局 flag 数） | 面板展示项 |
 | `tsec_agent/config.py` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
 | `tsec_agent/selftest.py` | 离线端到端自测（fake 模型驱动工具循环） | 改动主循环后必须跑 |

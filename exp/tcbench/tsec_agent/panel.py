@@ -268,6 +268,8 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     running = [t for t in tasks.values() if t.get("running")]
     done = [t for t in tasks.values() if t.get("outcome") == "pass"]
     failed = [t for t in tasks.values() if t.get("outcome") == "fail"]
+    # 分段解题：outcome=paused = 本段到点已关题、上下文保留，等队尾续跑
+    paused = [t for t in tasks.values() if t.get("outcome") == "paused"]
 
     lines: list[str] = []
     # --- 头部（固定 6 行）---
@@ -280,7 +282,8 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     else:
         lines.append(clip(f"平台: (离线) 本地通关 {len(done)} | 记录 {len(tasks)} 题"))
     lines.append(clip(f"本地: ▶{len(running)} 在跑 ✔{len(done)} 通过 ✘{len(failed)} 失败"
-                      f" | dir: {runs_dir}"))
+                      + (f" ∥{len(paused)} 暂停" if paused else "")
+                      + f" | dir: {runs_dir}"))
     lines.append("-" * cols)
 
     def _utc_ts(s: str) -> float | None:
@@ -306,6 +309,15 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
             or (view["last_output"] or view["last_thinking"] or "")
         if act:
             lines.append(clip(f"    ↳ {act}"))
+
+    # --- PAUSED 聚合（分段解题：本段到点已关题，等队尾续跑）---
+    if paused and len(lines) < rows - 5:
+        pause_bits = [_task_brief(t) for t in
+                      sorted(paused, key=lambda x: x.get("closed_at") or "", reverse=True)]
+        pause_line = "∥ PAUSED(待续跑): " + " ".join(pause_bits[:8])
+        if len(pause_bits) > 8:
+            pause_line += f" (+{len(pause_bits) - 8})"
+        lines.append(clip(pause_line))
 
     # --- FAIL 聚合（每行多题，紧凑）---
     if failed and len(lines) < rows - 4:
