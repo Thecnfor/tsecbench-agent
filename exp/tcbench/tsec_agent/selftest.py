@@ -271,6 +271,46 @@ def main() -> int:
     assert len(t02_starts) >= 3, f"t-02 should pause+resume, starts={len(t02_starts)}"
     assert any(r.get("resume") for r in t02_starts), "resume task_start missing"
 
+    # ---- 工具参数序列化容错（形状取自上一轮真实跑分里的损坏样本）----
+    import json as _json
+    from shell_tool import parse_tool_arguments
+    Q, NL = chr(34), chr(10)
+    TAGO = chr(60) + "parameter name=" + Q   # XML 开标签（避免在源码里写字面量）
+
+    # 1) action 混入 XML 参数片段（run + command 在里面），其余参数要保留
+    xml_action = "run" + Q + ">" + NL + TAGO + "command" + Q + ">" + \
+        "cd /work/tasks/x; ffuf -u http://t/FUZZ -w big.txt"
+    args, fix = parse_tool_arguments(_json.dumps({"action": xml_action, "timeout_sec": 60}))
+    assert args and args["action"] == "run", args
+    assert args["command"].startswith("cd /work/tasks/x; ffuf"), args
+    assert args["timeout_sec"] == 60 and fix, (args, fix)
+    # 2) 同类损坏但动作是 wait（job_id 在片段里）
+    xml_wait = "wait" + Q + ">" + NL + TAGO + "job_id" + Q + ">" + "a5daca2b"
+    args, fix = parse_tool_arguments(_json.dumps({"action": xml_wait, "timeout_sec": 120}))
+    assert args and args["action"] == "wait" and args["job_id"] == "a5daca2b", args
+    # 3) action 写成别的工具名，但 command 正常
+    args, fix = parse_tool_arguments(_json.dumps({"action": "shell", "command": "cat /tmp/x"}))
+    assert args["action"] == "run" and args["command"] == "cat /tmp/x" and fix, (args, fix)
+    # 4) action 整段是命令（没有 command 键），wait_ms 要保留
+    args, fix = parse_tool_arguments(_json.dumps({"action": "cd /work; nmap -p- 10.0.0.1",
+                                                  "wait_ms": 8000}))
+    assert args["action"] == "run" and args["command"] == "cd /work; nmap -p- 10.0.0.1"
+    assert args["wait_ms"] == 8000 and fix, (args, fix)
+    # 5) JSON 值没加引号（解析直接失败）
+    bare = "{" + Q + "action" + Q + ": " + Q + "wait" + Q + ", " + Q + "job_id" + Q + \
+        ": 829f40d3, " + Q + "timeout_sec" + Q + ": 90}"
+    args, fix = parse_tool_arguments(bare)
+    assert args["action"] == "wait" and args["job_id"] == "829f40d3", args
+    # 6) 正常参数不应被改动（不产生修复说明）
+    args, fix = parse_tool_arguments(_json.dumps({"action": "run", "command": "echo ok"}))
+    assert args["command"] == "echo ok" and fix is None, (args, fix)
+    # 7) 无任何可恢复参数 → 原样返回，dispatch 给出可操作的报错
+    from shell_tool import dispatch_shell
+    args, fix = parse_tool_arguments(_json.dumps({"action": "shell"}))
+    assert args.get("action") == "shell" and fix is None, (args, fix)
+    err = dispatch_shell(dict(args))
+    assert err.startswith("error: unknown action") and "action" in err, err
+
     shutil.rmtree(recdir, ignore_errors=True)
     print("PASS: controller + per-task context + persistent records end-to-end OK")
     return 0

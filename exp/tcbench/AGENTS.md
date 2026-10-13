@@ -94,7 +94,7 @@
 | --- | --- | --- |
 | `tsec_agent/agent.py` | 控制器主循环：选题 → start → `solve_task` 单题上下文 → 校验 → close；LLM 重试 | 加运行控制逻辑 |
 | `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
-| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill | 调工具行为 |
+| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`parse_tool_arguments` 工具参数容错（坏参数自动修复） | 调工具行为、参数解析 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuild_messages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
 | `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、全局 flag 数） | 面板展示项 |

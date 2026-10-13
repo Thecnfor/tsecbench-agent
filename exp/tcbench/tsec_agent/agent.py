@@ -23,7 +23,8 @@ from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLi
 from config import CFG
 from prompt import (SYSTEM_PROMPT, TASK_TEMPLATE, CLOSING_SUMMARY_PROMPT,
                     RESUME_NOTE, GIVEUP_NOTE)
-from shell_tool import SHELL_TOOL_SCHEMA, dispatch_shell, set_task_cwd, get_task_cwd
+from shell_tool import (SHELL_TOOL_SCHEMA, dispatch_shell, parse_tool_arguments,
+                        set_task_cwd, get_task_cwd)
 from records import init_records, rec
 import bench
 from bench import PlatformError, TaskFinishedError
@@ -362,17 +363,28 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
             return "done", msg.content or "", turns_used, messages
 
         for tc in tool_calls_raw:
-            args = {}
+            args: dict = {}
+            raw_args = tc.function.arguments or "{}"
             t_tool_start = time.time()
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                result = f"error: invalid JSON arguments: {tc.function.arguments!r}"
-            else:
-                if tc.function.name == "shell":
-                    result = dispatch_shell(args)
+            if tc.function.name == "shell":
+                parsed, fix = parse_tool_arguments(raw_args)
+                if parsed is None:
+                    result = f"error: {fix or 'invalid tool arguments'}"
                 else:
-                    result = f"error: unknown tool {tc.function.name!r}"
+                    args = parsed
+                    if fix:
+                        # 模型把参数序列化坏了（action 混入 XML 片段/整段命令/JSON 漏引号）：
+                        # 直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
+                        log(f"[{code}] tool args repaired: {fix}")
+                        rec().event("tool_arg_repaired", {"code": code,
+                                                          "tool_call_id": tc.id,
+                                                          "fix": fix,
+                                                          "raw": raw_args[:400]})
+                        result = f"[参数已自动修复：{fix}] " + dispatch_shell(args)
+                    else:
+                        result = dispatch_shell(args)
+            else:
+                result = f"error: unknown tool {tc.function.name!r}"
             t_tool_end = time.time()
             # 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联）
             # started_at/ended_at = 工具执行起止（供甘特图）

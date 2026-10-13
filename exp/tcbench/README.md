@@ -81,6 +81,10 @@
 
 - **VPN 只在容器内**：宿主机不需要 openvpn、不需要 root 改路由；断线/重连都不影响宿主机。
 - **网络隔离**：容器 `NET_ADMIN + tun` 仅作用于自身 netns；宿主机路由表、DNS 均不被修改。
+- **工具参数容错**：模型偶发把 shell 工具参数序列化坏（`action` 混入 XML 参数片段或整段命令、
+  JSON 值漏引号）→ `shell_tool.parse_tool_arguments` 直接修复后照常执行，结果带
+  `[参数已自动修复：…]` 前缀、原样参数记在 `events.jsonl` 的 `tool_arg_repaired`
+  里——不再整轮作废（上一轮 c-03 因此白扔 14 轮）。
 
 ### 分段解题（每题独立上下文 + 暂停/续跑）
 
