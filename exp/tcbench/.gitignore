@@ -1,6 +1,8 @@
 # 凭证与本地配置，不入库
 .env
 *.env
+*.ovpn
+
 
 # 运行产物（bench 记录含 token 目录名，必须排除；旧记录用 docker/archive_runs.sh 归档到项目外）
 docker/work/
