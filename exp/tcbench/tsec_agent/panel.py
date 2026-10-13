@@ -17,11 +17,17 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import sys
 import time
 import urllib.request
+
+# 注意：记录里的时间字符串（started_at/closed_at/ts）由容器写入，容器无时区 = **UTC**；
+# 面板运行在宿主机（本地时区），解析必须用 calendar.timegm（按 UTC 解释），
+# 否则 time.mktime 按本地时间解析会让"已跑时长"虚高一个时区差（如 +8h）。
+
 
 REFRESH_DEFAULT = 5
 
@@ -80,8 +86,33 @@ def load_tasks(runs_dir: str) -> dict[str, dict]:
         elif r.get("phase") == "task_close":
             t.update(closed_at=r.get("closed_at"), outcome=r.get("outcome"),
                      flags=r.get("flags"), duration=r.get("duration_sec"),
-                     summary=(r.get("summary") or "")[:400], running=False)
+                     summary=(r.get("summary") or "")[:200], running=False)
     return tasks
+
+
+def _task_brief(t: dict) -> str:
+    """PASS/FAIL 的单行紧凑摘要：code flags 耗时。"""
+    dur = _fmt_dur(t.get("duration") or 0)
+    flags = t.get("flags", "?")
+    if t.get("outcome") == "pass":
+        return f"{t['code']}({flags} {dur})"
+    return f"{t['code']}({flags} {dur}{' 重试' if (t.get('attempt') or 1) > 1 else ''})"
+
+
+def _wrap_bits(bits: list[str], width: int) -> list[str]:
+    """把多个紧凑摘要拼成若干行（每行不超 width）。"""
+    lines, cur = [], ""
+    for b in bits:
+        cand = f"{cur} {b}" if cur else b
+        if len(cand) > width:
+            if cur:
+                lines.append(cur)
+            cur = b
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 def load_meta(runs_dir: str) -> dict:
@@ -208,79 +239,111 @@ def _one_line(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def render(runs_dir: str, base_url: str) -> str:
+def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str:
+    """一屏自适应渲染：所有输出裁剪到 rows×cols 内，绝不导致终端滚动。
+
+    布局（自上而下，空间不够按此顺序被裁剪）：
+      头部（固定6行）→ RUNNING 详情（每题≤2行）→ FAIL 一行（聚合，每行多题）
+      → PASS 一行（聚合，每行多题）→ 最近事件（尾部固定）
+    """
+    import shutil
+    term = shutil.get_terminal_size(fallback=(cols, rows))
+    cols = min(cols, max(40, term.columns - 1))
+    # rows 预算尊重真实终端（下限仅 8 行兜底）；最终会硬裁到此值，绝不滚动
+    rows = max(8, min(rows, term.lines - 1))
+
     now = time.strftime("%H:%M:%S")
     meta = load_meta(runs_dir)
     tasks = load_tasks(runs_dir)
     events = load_recent_events(runs_dir)
     plat = fetch_platform(runs_dir, base_url)
 
+    def clip(s: str) -> str:
+        s = (s or "").replace("\n", " ").replace("\r", " ")
+        return s if len(s) <= cols else s[: cols - 1] + "…"
+
     run_info = (meta.get("runs") or [{}])[-1]
     token_hint = os.path.basename(runs_dir.rstrip("/"))[:8]
-    lines: list[str] = []
-    lines.append("=" * 100)
-    head = (f"TSec Panel  bench={token_hint}…  {meta.get('mode', '?')}/{meta.get('model', '?')}"
-            f"  run@{run_info.get('started_at', '?')}  now {now}")
-    lines.append(head)
-
-    if plat:
-        lines.append(f"平台: 通关 {plat['completed']}/{plat['total']} 题"
-                     f" | flags {plat['flags']}/{plat['max_flags']}"
-                     f" | 总分 {plat['score']}")
-    else:
-        # 离线回退：本地记录统计
-        done = [t for t in tasks.values() if t.get("outcome") == "pass"]
-        lines.append(f"平台: (离线) 本地通关 {len(done)} 题 | "
-                     f"记录任务 {len(tasks)} | data: {runs_dir}")
 
     running = [t for t in tasks.values() if t.get("running")]
-    lines.append(f"并行中: {len(running)} 题 | 记录目录: {runs_dir}")
-    lines.append("-" * 100)
+    done = [t for t in tasks.values() if t.get("outcome") == "pass"]
+    failed = [t for t in tasks.values() if t.get("outcome") == "fail"]
 
-    # 运行中题目优先展示，其后按启动时间倒序放最近完成的
-    order = sorted(tasks.values(),
-                   key=lambda t: (not t.get("running", False),
-                                  t.get("closed_at") or t.get("started_at") or ""),
-                   reverse=False)
-    shown = 0
-    for t in order:
-        if shown >= 14:
-            lines.append(f"… 还有 {len(order) - shown} 题省略")
+    lines: list[str] = []
+    # --- 头部（固定 6 行）---
+    lines.append("=" * cols)
+    lines.append(clip(f"bench={token_hint}… {meta.get('mode', '?')}/{meta.get('model', '?')}"
+                      f"  run@{run_info.get('started_at', '?')}  now {now}"))
+    if plat:
+        lines.append(clip(f"平台: 通关 {plat['completed']}/{plat['total']} | flags "
+                          f"{plat['flags']}/{plat['max_flags']} | 总分 {plat['score']}"))
+    else:
+        lines.append(clip(f"平台: (离线) 本地通关 {len(done)} | 记录 {len(tasks)} 题"))
+    lines.append(clip(f"本地: ▶{len(running)} 在跑 ✔{len(done)} 通过 ✘{len(failed)} 失败"
+                      f" | dir: {runs_dir}"))
+    lines.append("-" * cols)
+
+    def _utc_ts(s: str) -> float | None:
+        """记录里的 UTC 时间字符串 → epoch（解析失败返回 None）。"""
+        try:
+            return float(calendar.timegm(time.strptime(s, "%Y-%m-%d %H:%M:%S")))
+        except (ValueError, TypeError):
+            return None
+
+    # --- RUNNING 详情（每题最多2行：状态 + 最近动作）---
+    for t in running:
+        if len(lines) >= rows - 2:
             break
-        code = t["code"]
-        if t.get("running"):
-            started = t.get("started_at", "")
-            dur = ""
-            try:
-                st = time.mktime(time.strptime(started, "%Y-%m-%d %H:%M:%S"))
-                dur = f" 已跑 {_fmt_dur(max(0.0, time.time() - st))}"
-            except (ValueError, TypeError):
-                pass
-            status = f"▶ RUNNING{dur}  attempt={t.get('attempt', '?')}  target={t.get('target', '?')}"
-        elif t.get("outcome") == "pass":
-            status = f"✔ PASS  flags {t.get('flags', '?')}  耗时 {_fmt_dur(t.get('duration') or 0)}"
-        else:
-            status = f"✘ FAIL  flags {t.get('flags', '?')}  耗时 {_fmt_dur(t.get('duration') or 0)}"
-        lines.append(f"[{code}] {status}")
-        if t.get("running") or t.get("outcome") == "pass":
-            view = task_live_view(runs_dir, code)
-            if view["running_cmds"]:
-                for c in view["running_cmds"]:
-                    lines.append(f"      ⚙ shell: {_one_line(c, 88)}")
-            if view["last_output"]:
-                lines.append(f"      ▸ 模型: {_one_line(view['last_output'], 88)}")
-            elif view["last_thinking"]:
-                lines.append(f"      ⤿ 思考: {_one_line(view['last_thinking'], 88)}")
-        shown += 1
+        dur = ""
+        st = _utc_ts(t.get("started_at", ""))
+        if st is not None:
+            dur = f" {_fmt_dur(max(0.0, time.time() - st))}"
+        lines.append(clip(f"[{t['code']}] ▶{dur} att={t.get('attempt', '?')} "
+                          f"{t.get('target', '?')}"))
+        view = task_live_view(runs_dir, t["code"])
+        act = (view["running_cmds"] or [None])[0] \
+            or (view["last_cmd"] or None) \
+            or (view["last_output"] or view["last_thinking"] or "")
+        if act:
+            lines.append(clip(f"    ↳ {act}"))
 
-    lines.append("-" * 100)
-    if events:
-        lines.append("最近事件:")
-        for e in events:
+    # --- FAIL 聚合（每行多题，紧凑）---
+    if failed and len(lines) < rows - 4:
+        fail_bits = [_task_brief(t) for t in
+                     sorted(failed, key=lambda x: x.get("closed_at") or "", reverse=True)]
+        fail_line = "✘ FAIL: " + " ".join(fail_bits[:8])
+        if len(fail_bits) > 8:
+            fail_line += f" (+{len(fail_bits) - 8})"
+        lines.append(clip(fail_line))
+
+    # --- PASS 聚合（每行多题，紧凑，倒序最近优先）---
+    if done and len(lines) < rows - 3:
+        pass_bits = [_task_brief(t) for t in
+                     sorted(done, key=lambda x: x.get("closed_at") or "", reverse=True)]
+        head = "✔ PASS: "
+        cur = head
+        shown = 0
+        for b in pass_bits:
+            if len(cur) + len(b) + 1 > cols or shown >= 16:
+                break
+            cur = f"{cur} {b}" if cur != head else head + b
+            shown += 1
+        if len(pass_bits) > shown:
+            cur += f" (+{len(pass_bits) - shown})"
+        lines.append(clip(cur))
+
+    # --- 最近事件（尾部 3 条）---
+    if events and len(lines) < rows - 4:
+        lines.append("-" * cols)
+        for e in events[:3]:
             payload = {k: v for k, v in e.items() if k not in ("ts", "type")}
-            lines.append(f"  {e.get('ts', '')}  {e.get('type', '')}  "
-                         f"{_one_line(json.dumps(payload, ensure_ascii=False), 78)}")
-    lines.append("=" * 100)
+            lines.append(clip(f"  {e.get('ts', '')} {e.get('type', '')} "
+                              f"{json.dumps(payload, ensure_ascii=False)}"))
+
+    # --- 最终保险：硬裁到 rows，防止任何情况下的滚动 ---
+    if len(lines) > rows:
+        lines = lines[: rows - 1]
+        lines.append(clip("…(更多内容已裁剪，完整数据见记录目录)"))
     return "\n".join(lines)
 
 
