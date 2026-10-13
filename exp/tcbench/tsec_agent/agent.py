@@ -263,6 +263,41 @@ def _is_context_overflow(e: BaseException) -> bool:
     ))
 
 
+def _with_fix_note(res, fix: str):
+    """给修复后的工具结果加一行说明；结果是图片 parts 时改写首个 text 段。"""
+    note = f"[参数已自动修复：{fix}] "
+    if isinstance(res, list):
+        for part in res:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = note + part["text"]
+                return res
+        return [{"type": "text", "text": note.rstrip()}] + list(res)
+    return note + str(res)
+
+
+def _strip_images(messages: list) -> int:
+    """把消息内容里的图片 part 剥掉（网关不支持图像时降级），返回移除的图片数。"""
+    removed = 0
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        keep = []
+        had = False
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                removed += 1
+                had = True
+                continue
+            keep.append(part)
+        if had:
+            keep.insert(0, {"type": "text",
+                            "text": "[网关不支持图像输入：本条图片已移除，请改用上一条文本里的"
+                                    "OCR/元数据，或用 shell 分析原文件]"})
+            m["content"] = keep
+    return removed
+
+
 def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
                *, messages: list | None = None,
                start_turn: int = 0) -> tuple[str, str, int, list]:
@@ -318,14 +353,30 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
             return "deadline", last_content, turns_used, messages
         turn += 1
         t_llm_start = time.time()
+        resp = None
         try:
             resp = call_llm(client, messages)
         except Exception as e:
-            log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
-            conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}",
-                       started_at=t_llm_start)
-            status = "context_overflow" if _is_context_overflow(e) else "llm_error"
-            return status, last_content, turns_used, messages
+            # 多模态降级：网关拒收图片 → 剥掉 image part 改发纯文本，本会话后续不再附图
+            dropped = _strip_images(messages) if CFG.vision_ok is not False else 0
+            if dropped:
+                CFG.vision_ok = False
+                log(f"[{code}] gateway rejected image input ({type(e).__name__}: {e}); "
+                    f"dropped {dropped} image(s), retrying text-only")
+                conv.write("note", turn=f"{code}:{turn}",
+                           content=f"网关拒图，降级为文本模式：{type(e).__name__}: {e}")
+                rec().event("vision_degraded", {"code": code, "dropped": dropped,
+                                                "error": f"{type(e).__name__}: {e}"[:400]})
+                try:
+                    resp = call_llm(client, messages)
+                except Exception as e2:
+                    e = e2
+            if resp is None:
+                log(f"[{code}] fatal LLM error: {type(e).__name__}: {e}")
+                conv.write("error", turn=f"{code}:{turn}", error=f"{type(e).__name__}: {e}",
+                           started_at=t_llm_start)
+                status = "context_overflow" if _is_context_overflow(e) else "llm_error"
+                return status, last_content, turns_used, messages
         turns_used += 1
         t_llm_end = time.time()
 
@@ -381,7 +432,7 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
                                                           "tool_call_id": tc.id,
                                                           "fix": fix,
                                                           "raw": raw_args[:400]})
-                        result = f"[参数已自动修复：{fix}] " + dispatch_shell(args)
+                        result = _with_fix_note(dispatch_shell(args), fix)
                     else:
                         result = dispatch_shell(args)
             else:
@@ -392,7 +443,12 @@ def solve_task(client: OpenAI, code: str, task_card: str, budget: int, conv,
             conv.write("tool", turn=tlabel, tool_call_id=tc.id, tool=tc.function.name,
                        arguments=args, result=result,
                        started_at=t_tool_start, ended_at=t_tool_end)
-            log(f"tool#{tc.id[-6:]} {tc.function.name} -> {result.splitlines()[0][:160] if result else ''}")
+            # 结果可能是 str，也可能是多模态 parts 列表（action=view）
+            _first = (result if isinstance(result, str) else
+                      next((p.get("text", "") for p in result
+                            if isinstance(p, dict) and p.get("type") == "text"), ""))
+            log(f"tool#{tc.id[-6:]} {tc.function.name} -> "
+                f"{_first.splitlines()[0][:160] if _first else ''}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     log(f"[{code}] segment turn budget ({budget}) reached "

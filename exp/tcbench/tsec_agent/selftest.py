@@ -307,6 +307,47 @@ def main() -> int:
     _st.set_task_cwd("")
     print("  ok: shell 新参数（边沿等待/分页/落盘/上限/省略 action）")
 
+    # ---- 多模态：action=view 返回图片 parts / 文本降级 / 错误分支 ----
+    import base64 as _b64
+    from shell_tool import dispatch_shell as _ds
+    _imgdir = tempfile.mkdtemp(prefix="selftest_view_")
+    _st.set_task_cwd(_imgdir)
+    # 1x1 PNG（真实文件，尺寸解析应得 1x1）
+    open(os.path.join(_imgdir, "x.png"), "wb").write(_b64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="))
+    _img = _ds({"action": "view", "path": "x.png"})
+    assert isinstance(_img, list), type(_img)
+    assert [p2["type"] for p2 in _img] == ["text", "image_url"], _img
+    assert "1x1" in _img[0]["text"], _img[0]["text"]
+    assert _img[1]["image_url"]["url"].startswith("data:image/png;base64,"), "data URL 缺失"
+    assert _img[1]["image_url"]["detail"] == "low"
+    # 网关拒图/显式关闭 → 文本模式（含 OCR 兜底提示）
+    _old_vision = _CFG.vision
+    _CFG.vision = "off"
+    _txt = _ds({"action": "view", "path": "x.png"})
+    assert isinstance(_txt, str) and "文本模式" in _txt, _txt[:200]
+    _CFG.vision = _old_vision
+    # 错误分支：文件不存在 / 格式不支持
+    assert _ds({"action": "view", "path": "nope.png"}).startswith("error:")
+    assert _ds({"action": "view", "path": "/etc/hostname"}).startswith("error:")
+    # 修复说明前缀合入图片 parts 的首个 text 段（不破坏结构）
+    _m = agent._with_fix_note(_img, "测试修复")
+    assert _m[0]["text"].startswith("[参数已自动修复") and _m[1]["type"] == "image_url"
+    _st.set_task_cwd("")
+    # 重建上下文时图片 parts 原样还原（不能被转成 JSON 字符串）
+    _jl = os.path.join(_imgdir, "conv.jsonl")
+    with open(_jl, "w", encoding="utf-8") as _f:
+        _f.write(json.dumps({"kind": "system", "content": "S"}, ensure_ascii=False) + "\n")
+        _f.write(json.dumps({"kind": "assistant", "output": "",
+                             "tool_calls": [{"id": "c1", "name": "shell", "arguments": "{}"}]},
+                            ensure_ascii=False) + "\n")
+        _f.write(json.dumps({"kind": "tool", "tool_call_id": "c1", "result": _img},
+                            ensure_ascii=False) + "\n")
+    _rebuilt = records.rebuild_messages(_jl)
+    assert isinstance(_rebuilt[-1]["content"], list), type(_rebuilt[-1]["content"])
+    assert _rebuilt[-1]["content"][1]["type"] == "image_url", "图片 part 重建丢失"
+    print("  ok: 多模态 view（图片 parts / 文本降级 / 错误分支 / 重建保真）")
+
     # ---- 工具参数序列化容错（形状取自上一轮真实跑分里的损坏样本）----
     import json as _json
     from shell_tool import parse_tool_arguments

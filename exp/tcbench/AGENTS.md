@@ -38,6 +38,10 @@
    - 上限：同时在跑 `AGENT_SHELL_MAX_JOBS`（8，满了拒绝新 `run` 并提示先收）；
      硬上限 `AGENT_SHELL_HARD_SEC`（1800s，到点整组 kill，0=永不杀）——**不做 300s 软提醒**。
    - 进程必须 `start_new_session`（独立进程组），kill 时整组杀，超时由 watcher 线程兜底。
+   - **多模态**：`action=view` 把图片以 `image_url` part 作为**工具结果**返回（tool 消息
+     的 content 可以是 parts 列表）；网关拒图时 `_strip_images` 剥掉图片重试一次并把
+     `CFG.vision_ok` 置 False，本会话后续 view 走文本模式（OCR+元数据）。对话重建时
+     列表型 result 原样还原，**不能 json.dumps 成字符串**。
 3. **模型网关双模式**：local=官方 `https://api.deepseek.com/v1`（公网，key 在 `.env`），
    hosted=平台内网转写网关 `http://api.deepseek.com.tsecbench.gw/v1`（**依赖 VPN 内网 DNS，只在容器连上 VPN 后可解析**）。
    默认 `AGENT_MODE=auto` 自动探测切换，见架构不变量前的「运行模式」小节。
@@ -99,7 +103,7 @@
 | --- | --- | --- |
 | `tsec_agent/agent.py` | 控制器主循环：选题 → start → `solve_task` 单题上下文 → 校验 → close；LLM 重试 | 加运行控制逻辑 |
 | `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
-| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parse_tool_arguments` 工具参数容错（坏参数自动修复） | 调工具行为、参数解析 |
+| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parse_tool_arguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
 | `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuild_messages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
 | `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、全局 flag 数） | 面板展示项 |

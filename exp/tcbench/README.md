@@ -82,6 +82,9 @@
 
 - **VPN 只在容器内**：宿主机不需要 openvpn、不需要 root 改路由；断线/重连都不影响宿主机。
 - **网络隔离**：容器 `NET_ADMIN + tun` 仅作用于自身 netns；宿主机路由表、DNS 均不被修改。
+- **多模态读图**：`{"action":"view","path":"..."}` 把图片本体作为工具结果返回给模型
+  （截图/验证码/隐写图直接看懂；文件头解析尺寸、超限自动压缩、网关拒图自动降级为
+  OCR+元数据文本，见 `AGENT_VISION`）。
 - **工具参数容错**：模型偶发把 shell 工具参数序列化坏（`action` 混入 XML 参数片段或整段命令、
   JSON 值漏引号）→ `shell_tool.parse_tool_arguments` 直接修复后照常执行，结果带
   `[参数已自动修复：…]` 前缀、原样参数记在 `events.jsonl` 的 `tool_arg_repaired`
@@ -164,6 +167,8 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
 | `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
+| `AGENT_VISION` | 多模态读图 `auto`/`on`/`off`（auto=网关拒图时本会话降级为文本+OCR） | `auto` |
+| `AGENT_VISION_MAX_KB` | `action=view` 单图 data URL 上限，超出先自动压缩 | `4096` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
 | `VPN_WAIT_SEC` | VPN 预检最长等待（hosted 强制） | `90` |
 

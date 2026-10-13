@@ -138,6 +138,13 @@ class Config:
     # 同时在跑的后台 job 上限（满了拒绝新 run，提示先收/wait/kill）
     shell_max_jobs: int = int(_env("AGENT_SHELL_MAX_JOBS", "8"))
 
+    # --- 多模态（shell action=view 读图）---
+    # auto=先按图片发，网关 400 拒图时本会话降级为文本（OCR/元数据）；on=只发不降级提示；off=从不附图
+    vision: str = _env("AGENT_VISION", "auto").lower()
+    vision_max_kb: int = int(_env("AGENT_VISION_MAX_KB", "4096"))  # data URL 上限，超出先压图
+    # 运行时状态：网关是否接受图像输入（None=未知，agent 探测到拒图后置 False）
+    vision_ok: bool | None = None
+
     # 追加到 shell 子进程环境的变量
     extra_env: dict = field(default_factory=lambda: {
         "BENCHMARK_TOKEN": _env("BENCHMARK_TOKEN", ""),

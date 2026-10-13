@@ -143,7 +143,9 @@ def rebuild_messages(path: str) -> list:
                 continue  # 孤儿结果（对应 assistant 缺失或已被裁掉）
             pending.discard(tid)
             result = r.get("result")
-            if not isinstance(result, str):
+            if isinstance(result, list):
+                pass  # 多模态：图片 parts 原样还原（不能转成 JSON 字符串发给模型）
+            elif not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False, default=str)
             msgs.append({"role": "tool", "tool_call_id": tid, "content": result})
 

@@ -130,6 +130,98 @@ class Job:
             return 0
 
 
+def _image_size(data: bytes):
+    """从文件头解析图片尺寸（PNG/JPEG/GIF/WebP/BMP），零依赖。返回 (w, h) 或 (None, None)。"""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+            return (int.from_bytes(data[16:20], "big"),
+                    int.from_bytes(data[20:24], "big"))
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(data[6:8], "little"),
+                    int.from_bytes(data[8:10], "little"))
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            if data[12:16] == b"VP8X":
+                return (1 + int.from_bytes(data[24:27], "little"),
+                        1 + int.from_bytes(data[27:30], "little"))
+            if data[12:16] == b"VP8 ":
+                return (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                        int.from_bytes(data[28:30], "little") & 0x3FFF)
+            if data[12:16] == b"VP8L":
+                b0, b1, b2, b3 = data[21:25]
+                return (1 + (((b1 & 0x3F) << 8) | b0),
+                        1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6)))
+        if data[:2] == b"BM" and len(data) >= 26:
+            return (int.from_bytes(data[18:22], "little"),
+                    abs(int.from_bytes(data[22:26], "little")))
+        if data[:2] == b"\xff\xd8":  # JPEG：扫段找 SOF
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                seglen = int.from_bytes(data[i + 2:i + 4], "big")
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    return (int.from_bytes(data[i + 7:i + 9], "big"),
+                            int.from_bytes(data[i + 5:i + 7], "big"))
+                i += 2 + seglen
+    except Exception:
+        pass
+    return None, None
+
+
+def _shrink(path_in: str, cap_bytes: int):
+    """超过大小上限时压图：agent venv 没有 PIL，但系统 python3 有 python3-pil。
+
+    返回压缩后（JPEG）的临时文件路径，失败返回 None。
+    """
+    script = (
+        "import sys, os\n"
+        "from PIL import Image\n"
+        "src, dst, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])\n"
+        "im = Image.open(src)\n"
+        "im.thumbnail((1536, 1536))\n"
+        "if im.mode not in ('RGB', 'L'):\n"
+        "    im = im.convert('RGB')\n"
+        "q = 85\n"
+        "while True:\n"
+        "    im.save(dst, 'JPEG', quality=q, optimize=True)\n"
+        "    if os.path.getsize(dst) <= cap or q <= 30:\n"
+        "        break\n"
+        "    q -= 15\n"
+    )
+    fd, dst = tempfile.mkstemp(prefix="view_", suffix=".jpg")
+    os.close(fd)
+    try:
+        r = subprocess.run(["python3", "-c", script, path_in, dst, str(cap_bytes)],
+                           capture_output=True, timeout=25)
+        if r.returncode == 0 and os.path.getsize(dst) <= cap_bytes:
+            return dst
+    except Exception:
+        pass
+    try:
+        os.unlink(dst)
+    except OSError:
+        pass
+    return None
+
+
+def _ocr(path: str) -> str:
+    """文本模式（网关不支持图像）时的兜底：tesseract 英文 OCR。"""
+    try:
+        r = subprocess.run(["tesseract", path, "stdout", "-l", "eng"],
+                           capture_output=True, timeout=25, text=True)
+        txt = (r.stdout or "").strip()
+        if txt:
+            return txt[:4000]
+    except Exception:
+        pass
+    return ""
+
+
 class ShellManager:
     def __init__(self):
         self._jobs: dict[str, Job] = {}
@@ -320,6 +412,59 @@ class ShellManager:
         return payload + (f"\nnote: 已终止；完整输出已落盘 {job.out_path}"
                           f"（可 run \"tail -n 200 {job.out_path}\" 继续读）")
 
+    # ---- 动作：读图（多模态，把图片本体交给模型看） ----
+    def view(self, path: str, detail: str | None = None):
+        """返回 [text, image_url] 两段；网关不支持图像时自动降级为纯文本（OCR+元数据）。"""
+        detail = detail if detail in ("low", "high") else "low"
+        p = path if os.path.isabs(path) else os.path.join(get_task_cwd() or self._cwd, path)
+        if not os.path.isfile(p):
+            return f"error: 图片不存在或不是普通文件: {p}"
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in _IMAGE_EXT:
+            return ("error: 不支持的图片格式 " + (ext or "(无扩展名)") + "；支持 "
+                    + ", ".join(sorted(_IMAGE_EXT)) + "。先用 file 确认类型。")
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return f"error: 读取图片失败: {e}"
+        if not data:
+            return f"error: 空文件: {p}"
+        w, h = _image_size(data)
+        dims = f"{w}x{h}" if w else "尺寸未知"
+        mime = _IMAGE_EXT[ext]
+        cap = max(64, CFG.vision_max_kb) * 1024
+        note = ""
+        if len(data) > cap:
+            shrunk = _shrink(p, cap)
+            if not shrunk:
+                return (f"error: {p} 有 {len(data) // 1024}KB，超过上限 "
+                        f"{CFG.vision_max_kb}KB 且压缩失败。请先自行缩小/裁剪图片再 view。")
+            p = shrunk
+            with open(shrunk, "rb") as f:
+                data = f.read()
+            mime = "image/jpeg"
+            w, h = _image_size(data)
+            dims = f"{w}x{h}" if w else dims
+            note = f"（原图超限，已自动压缩到 ≤{CFG.vision_max_kb}KB）"
+        header = f"[image] {p}  {dims}  {len(data)}B  {mime}  detail={detail} {note}"
+        if CFG.vision == "off" or CFG.vision_ok is False:
+            ocr = _ocr(p)
+            return (
+                header + "\n当前为文本模式（AGENT_VISION=off 或网关已拒图），没有图片本体："
+                + (f"\nOCR(tesseract eng):\n{ocr}\n" if ocr else "\nOCR 无输出。\n")
+                + "请改用 shell 侧分析：file/xxd/strings/exiftool、tesseract -l eng、"
+                  "系统 python3 的 PIL（尺寸/直方图/像素采样），或先裁剪关键区域。"
+            )
+        import base64
+        url = "data:" + mime + ";base64," + base64.b64encode(data).decode("ascii")
+        return [
+            {"type": "text",
+             "text": header + "\n下面是图片本体，直接看图作答；需要更细可传 detail=high，"
+                              "或先用 shell 裁剪/缩放。"},
+            {"type": "image_url", "image_url": {"url": url, "detail": detail}},
+        ]
+
     def _get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
@@ -390,8 +535,12 @@ SHELL_TOOL_SCHEMA = {
             "the output survives kills and you can tail it. Jobs are killed at the hard "
             "limit (default 1800s); kill sooner if stuck — output stays on disk. Max 8 "
             "concurrent jobs (new run is rejected until you wait/kill). "
+            "Multimodal: to look at an image (screenshot, chart, captcha, photo) call "
+            "action=view with path — the picture itself is returned to you, so you can "
+            "read/understand it directly; if the gateway rejects images it degrades to "
+            "text (OCR + metadata) automatically. "
             "Actions: run (default), wait, wait_any (block until ANY of several jobs "
-            "makes progress), status, kill, list. "
+            "makes progress), status, kill, list, view. "
             "Environment already contains BENCHMARK_TOKEN and BENCHMARK_BASE_URL."
         ),
         "parameters": {
@@ -399,12 +548,22 @@ SHELL_TOOL_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "wait", "wait_any", "status", "kill", "list"],
+                    "enum": ["run", "wait", "wait_any", "status", "kill", "list", "view"],
                     "description": "optional (default run); wait=block for progress; "
                                    "wait_any=block until any of job_ids progresses; "
-                                   "status=non-blocking peek; kill=stop; list=recent jobs",
+                                   "status=non-blocking peek; kill=stop; list=recent jobs; "
+                                   "view=show an image to yourself (multimodal)",
                 },
                 "command": {"type": "string", "description": "shell command (action=run)"},
+                "path": {
+                    "type": "string",
+                    "description": "image file path (action=view), absolute or relative to cwd",
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["low", "high"],
+                    "description": "action=view: image detail level (default low)",
+                },
                 "job_id": {"type": "string", "description": "job id (wait/status/kill)"},
                 "job_ids": {
                     "type": "array",
@@ -458,7 +617,12 @@ SHELL_TOOL_SCHEMA = {
 #   3) action 写成别的工具名：shell（command 正常）
 #   4) JSON 值没加引号：job_id: 829f40d3 -> JSON 解析直接失败
 # 每条都烧掉整整一轮，且模型收到报错后往往再花几轮自查——所以在工具层直接修复。
-KNOWN_ACTIONS = ("run", "wait", "status", "kill", "list")
+KNOWN_ACTIONS = ("run", "wait", "wait_any", "status", "kill", "list", "view")
+_IMAGE_EXT = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".ico": "image/x-icon", ".tif": "image/tiff", ".tiff": "image/tiff",
+}
 _PARAM_RE = re.compile(
     r'<parameter\s+name="(\w+)">\s*(.*?)(?:(?=</parameter>)|(?=\s*<parameter\s)|\Z)', re.S)
 _LEAD_RE = re.compile(r'^\s*(run|wait|status|kill|list)\b')
@@ -651,6 +815,11 @@ def dispatch_shell(tool_args: dict) -> str:
             if not job_id:
                 return "error: `job_id` is required for action=kill"
             return SHELL.kill(job_id, lines=_int(tool_args.get("lines")))
+        if action in ("view", "image"):
+            target = tool_args.get("path") or tool_args.get("file") or tool_args.get("command")
+            if not target:
+                return "error: `path` is required for action=view"
+            return SHELL.view(str(target), detail=tool_args.get("detail"))
         if action == "list":
             return SHELL.list()
         return (f"error: unknown action {action!r}; 请用 "

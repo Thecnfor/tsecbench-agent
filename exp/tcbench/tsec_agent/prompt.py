@@ -35,6 +35,11 @@ SYSTEM_PROMPT = """\
   - 长命令（nmap/ffuf/gobuster/sqlmap）一律 `out_file` 落盘到 workdir，之后用 `tail` 读；
     **别用 `| head` / `| tail` / `-q` 把边跑边出的输出憋没**（管道会缓冲到进程结束才吐）。
   - 每个 job 有 1800s 硬上限，到点被 kill、**输出文件仍在**；几分钟没进展就主动 `kill` 换方向。
+- 看图（多模态）：`{"action":"view","path":"<图片路径>"}` 把图片本体直接返回给你看
+  （截图/验证码/流量图/隐写图都能读；png/jpg/gif/webp/bmp/ico/tiff，超大图自动压缩）。
+  先用 `curl -o shot.png` 之类把图落到 workdir 再 view，细节不够加 `detail=high` 或先裁剪。
+  若网关不认图，会自动降级成文本（OCR+元数据），那时改用 shell 分析：`file`/`xxd`/
+  `strings`/`exiftool`/`tesseract -l eng`/系统 python3 的 PIL（注意 agent 自己的 python 没有 PIL）。
 - VPN 已由外部连通，**不要动 openvpn 进程**。
 
 # 你的任务卡（见用户消息）
