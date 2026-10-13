@@ -219,7 +219,9 @@ python3 tsec_agent/panel.py --once          # 只渲染一帧（脚本/测试）
 ```
 
 单屏 ANSI 面板展示：
-- 全局：平台通关数/flag 数/总分（平台 API 不可达时**离线回退**本地记录统计）
+- 全局：平台通关数/flag 数/总分（平台 API 不可达时**离线回退**本地记录统计）；
+  **有选题时主数字只统计选中的题**：`平台(选题 9/63): 通关 1/9 | flags 3/20 | 总分 300
+  [全局: …]`——选题模式取 `meta.runs[-1].task_filter`（agent 落盘），旧记录回退读环境/.env
 - 每题：`▶ RUNNING 已跑时长 / attempt / target`、`✔ PASS(flags/耗时)`、`✘ FAIL`
 - 进行中题目实时视角：**进行中的 shell 调用**（assistant 已发 tool_call 但未回结果 = 在跑，
   如 `wait job_id=xx timeout_sec=30`、`run: sqlmap ...`）、最近一次模型输出/思考

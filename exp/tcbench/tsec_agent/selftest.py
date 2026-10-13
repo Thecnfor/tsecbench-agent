@@ -178,6 +178,8 @@ def main() -> int:
     assert meta["mode"] == "local" and meta["model"], "meta mode/model missing"
     assert meta["runs"] and meta["runs"][0].get("started_at"), "runs[].started_at missing"
     assert meta["runs"][0].get("finished_at"), "runs[].finished_at missing"
+    # 选题模式必须落盘（panel 据此把平台题数/flag 数限定到选题范围；空 = 全部题目）
+    assert "task_filter" in meta["runs"][0], "run_start 未落盘 task_filter"
     # tasks.jsonl：生命周期含 task_start(started_at) 与 task_close(closed_at/duration)
     phases = {}
     for line in open(os.path.join(recdir, "tasks.jsonl")):

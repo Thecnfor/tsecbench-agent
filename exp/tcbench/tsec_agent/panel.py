@@ -6,7 +6,9 @@
      - 题目生命周期（启动/关闭/耗时/结果/flags）
      - 每题最近一次模型输出（thinking/output）、进行中的 shell 调用
        （assistant 已发出 tool_call 但尚无对应 tool 结果 = 正在运行）
-  2. 平台 API（token = 目录名）：全局题数/通关数/flag 数/总分；离线时回退到本地记录
+  2. 平台 API（token = 目录名）：题数/通关数/flag 数/总分——有选题（AGENT_TASKS/--task，
+     优先取 meta.runs[-1].task_filter）时主数字只统计选中的题，括号里附全局；
+     离线时回退到本地记录
 
 用法：
   python3 panel.py                     # 自动找最新的 runs/<TOKEN> 目录
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import fnmatch
 import json
 import os
 import sys
@@ -170,8 +173,26 @@ def task_live_view(runs_dir: str, code: str) -> dict:
     return view
 
 
-def fetch_platform(runs_dir: str, base_url: str, timeout: float = 8.0) -> dict | None:
-    """token = 目录名。返回 {total, completed, flags, max_flags, score} 或 None（离线）。"""
+def _plat_stats(items: list[dict], patterns: list[str]) -> dict:
+    """平台题目列表 → 统计；patterns 非空时只统计选中的题（支持 * ? 通配，同 agent 选题）。"""
+    if patterns:
+        items = [c for c in items
+                 if any(fnmatch.fnmatchcase(str(c.get("unique_code", "")), p) for p in patterns)]
+    return {
+        "total": len(items),
+        "completed": sum(1 for c in items if c.get("is_completed")),
+        "flags": sum(c.get("correct_flag_count", 0) for c in items),
+        "max_flags": sum(c.get("flag_count", 0) for c in items),
+        "score": sum(c.get("total_score", 0) for c in items if c.get("is_completed")),
+    }
+
+
+def fetch_platform(runs_dir: str, base_url: str, patterns: list[str] | None = None,
+                   timeout: float = 8.0) -> dict | None:
+    """token = 目录名。返回 {"global": {...}, "sel": {...}|None} 或 None（离线）。
+
+    sel = 选题模式过滤后的统计；patterns 为空 → sel=None（即全量）。
+    """
     token = os.path.basename(runs_dir.rstrip("/"))
     if not token or not base_url:
         return None
@@ -185,29 +206,40 @@ def fetch_platform(runs_dir: str, base_url: str, timeout: float = 8.0) -> dict |
         return None
     if not isinstance(items, list):
         return None
-    completed = [c for c in items if c.get("is_completed")]
     return {
-        "total": len(items),
-        "completed": len(completed),
-        "flags": sum(c.get("correct_flag_count", 0) for c in items),
-        "max_flags": sum(c.get("flag_count", 0) for c in items),
-        "score": sum(c.get("total_score", 0) for c in completed),
+        "global": _plat_stats(items, []),
+        "sel": _plat_stats(items, patterns) if patterns else None,
     }
 
 
-def env_base_url() -> str:
-    if os.environ.get("BENCHMARK_BASE_URL"):
-        return os.environ["BENCHMARK_BASE_URL"]
-    # 向上找项目根 .env
+def env_value(key: str, default: str = "") -> str:
+    """环境变量优先，其次向上找项目根 .env（不打印值，只给调用方用）。"""
+    if os.environ.get(key):
+        return os.environ[key]
     d = os.path.abspath(os.getcwd())
     for _ in range(5):
         p = os.path.join(d, ".env")
         if os.path.isfile(p):
             for line in open(p, encoding="utf-8"):
-                if line.startswith("BENCHMARK_BASE_URL="):
+                if line.startswith(key + "="):
                     return line.split("=", 1)[1].strip()
         d = os.path.dirname(d)
-    return "https://tsecbench.zc.tencent.com"
+    return default
+
+
+def env_base_url() -> str:
+    return env_value("BENCHMARK_BASE_URL") or "https://tsecbench.zc.tencent.com"
+
+
+def task_filter_of(meta: dict) -> list[str]:
+    """本次运行的选题模式：优先 meta.runs[-1].task_filter（agent 落盘），
+    旧记录没有该字段时回退到环境/.env（AGENT_TASK_FILTER > AGENT_TASKS）。"""
+    runs = meta.get("runs") or [{}]
+    sel = runs[-1].get("task_filter") or []
+    if sel:
+        return [str(p) for p in sel]
+    raw = (env_value("AGENT_TASK_FILTER") or env_value("AGENT_TASKS") or "").strip()
+    return [p for p in raw.replace(",", " ").split() if p]
 
 
 def find_latest_runs() -> str | None:
@@ -256,7 +288,8 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     meta = load_meta(runs_dir)
     tasks = load_tasks(runs_dir)
     events = load_recent_events(runs_dir)
-    plat = fetch_platform(runs_dir, base_url)
+    sel_pat = task_filter_of(meta)          # 本次运行的选题模式（空 = 全部）
+    plat = fetch_platform(runs_dir, base_url, patterns=sel_pat)
 
     def clip(s: str) -> str:
         s = (s or "").replace("\n", " ").replace("\r", " ")
@@ -277,10 +310,20 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     lines.append(clip(f"bench={token_hint}… {meta.get('mode', '?')}/{meta.get('model', '?')}"
                       f"  run@{run_info.get('started_at', '?')}  now {now}"))
     if plat:
-        lines.append(clip(f"平台: 通关 {plat['completed']}/{plat['total']} | flags "
-                          f"{plat['flags']}/{plat['max_flags']} | 总分 {plat['score']}"))
+        g = plat["global"]
+        s = plat.get("sel")
+        if s:  # 有选题：主数字按选题范围统计，括号里保留全局
+            lines.append(clip(
+                f"平台(选题 {s['total']}/{g['total']}): 通关 {s['completed']}/{s['total']}"
+                f" | flags {s['flags']}/{s['max_flags']} | 总分 {s['score']}"
+                f"  [全局: 通关 {g['completed']}/{g['total']}"
+                f" flags {g['flags']}/{g['max_flags']} 总分 {g['score']}]"))
+        else:
+            lines.append(clip(f"平台: 通关 {g['completed']}/{g['total']} | flags "
+                              f"{g['flags']}/{g['max_flags']} | 总分 {g['score']}"))
     else:
-        lines.append(clip(f"平台: (离线) 本地通关 {len(done)} | 记录 {len(tasks)} 题"))
+        lines.append(clip(f"平台: (离线) 本地通关 {len(done)} | 记录 {len(tasks)} 题"
+                          + (f" | 选题模式 {','.join(sel_pat)}" if sel_pat else "")))
     lines.append(clip(f"本地: ▶{len(running)} 在跑 ✔{len(done)} 通过 ✘{len(failed)} 失败"
                       + (f" ∥{len(paused)} 暂停" if paused else "")
                       + f" | dir: {runs_dir}"))

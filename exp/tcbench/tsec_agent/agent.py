@@ -500,12 +500,6 @@ def run(client: OpenAI) -> int:
     """
     R = init_records(mode=CFG.mode, model=CFG.model)
     STOP.clear()  # 进程复用场景下重置终态标记
-    R.event("run_start", {"mode": CFG.mode, "model": CFG.model,
-                          "max_turns": CFG.max_turns, "deadline_sec": CFG.deadline_sec})
-    R.run_start(mode=CFG.mode, model=CFG.model, max_turns=CFG.max_turns)
-    log(f"records dir: {R.dir}")
-    start_platform_watcher()
-    task_budget = CFG.task_max_turns
     # 只解部分题目（测试用）：优先级 --task/AGENT_TASK_FILTER > AGENT_TASKS > 配置默认
     raw_sel = (os.environ.get("AGENT_TASK_FILTER", "").strip()
                or os.environ.get("AGENT_TASKS", "").strip() or CFG.tasks)
@@ -514,6 +508,15 @@ def run(client: OpenAI) -> int:
         log(f"task selection: {', '.join(task_filter)}（其余题目跳过）")
     else:
         log("task selection: 全部题目")
+    R.event("run_start", {"mode": CFG.mode, "model": CFG.model,
+                          "max_turns": CFG.max_turns, "deadline_sec": CFG.deadline_sec,
+                          "task_filter": task_filter})
+    # task_filter 落盘：panel 用它把平台统计（题数/flag 数/总分）限定到选题范围
+    R.run_start(mode=CFG.mode, model=CFG.model, max_turns=CFG.max_turns,
+                task_filter=task_filter)
+    log(f"records dir: {R.dir}")
+    start_platform_watcher()
+    task_budget = CFG.task_max_turns
     results: dict[str, str] = {}   # code -> outcome(pass/fail)；暂停题不写（保留续跑）
     attempts: dict[str, int] = {}
     total_turns = 0
