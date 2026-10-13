@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import sys
@@ -449,7 +450,14 @@ def run(client: OpenAI) -> int:
     log(f"records dir: {R.dir}")
     start_platform_watcher()
     task_budget = CFG.task_max_turns
-    task_filter = os.environ.get("AGENT_TASK_FILTER", "").strip()
+    # 只解部分题目（测试用）：优先级 --task/AGENT_TASK_FILTER > AGENT_TASKS > 配置默认
+    raw_sel = (os.environ.get("AGENT_TASK_FILTER", "").strip()
+               or os.environ.get("AGENT_TASKS", "").strip() or CFG.tasks)
+    task_filter = select_tasks(raw_sel)
+    if task_filter:
+        log(f"task selection: {', '.join(task_filter)}（其余题目跳过）")
+    else:
+        log("task selection: 全部题目")
     results: dict[str, str] = {}   # code -> outcome(pass/fail)；暂停题不写（保留续跑）
     attempts: dict[str, int] = {}
     total_turns = 0
@@ -496,6 +504,21 @@ def run(client: OpenAI) -> int:
     return 0
 
 
+def select_tasks(raw: str) -> list[str]:
+    """AGENT_TASKS / AGENT_TASK_FILTER → 模式列表（逗号或空白分隔，支持 * ? 通配）。
+
+    空 → 空列表（= 不过滤，做全部题）。
+    """
+    return [p for p in (raw or "").replace(",", " ").split() if p]
+
+
+def task_selected(code: str, patterns: list) -> bool:
+    """题目编号是否在选择范围内；patterns 为空表示全部选中。"""
+    if not patterns:
+        return True
+    return any(fnmatch.fnmatchcase(code, p) for p in patterns)
+
+
 def _task_workdir(code: str) -> str:
     """每题独立工作目录（线程局部 cwd 的落点），避免并行读写冲突。"""
     base = os.environ.get("TASK_WORKDIR") or (
@@ -520,6 +543,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     lock = threading.Lock()
     running: dict[str, threading.Thread] = {}
     cap = int(os.environ.get("AGENT_MAX_PARALLEL", "5"))
+    checked_selection = False  # 首次快照时核对一次题目选择是否命中（打错字要出声）
 
     # VPN 守卫：auto=模式感知（hosted 强制；local 模式只在 VPN 曾经通时启用，不伤裸机开发），
     # 1/0 显式开关。探测连续失败 N 次 → VPN_DOWN 置位：暂停派发新题（不消耗 attempts），
@@ -738,7 +762,20 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 results.setdefault(code, "pass")
         items = snapshot() or items
 
-        # 候选：未通关、不在跑、未超真失败上限、通过过滤
+        # 题目选择校验：只跑部分题时，打错字不吭声很难查 → 首次快照核对一次
+        if task_filter and not checked_selection:
+            checked_selection = True
+            matched = sorted(c["unique_code"] for c in items
+                             if task_selected(c["unique_code"], task_filter))
+            if matched:
+                log(f"task selection matched {len(matched)}: {', '.join(matched)}")
+            else:
+                log(f"WARNING: task selection matched nothing: {task_filter} "
+                    f"(platform has {len(items)} tasks)")
+                rec().event("task_selection_empty",
+                            {"patterns": task_filter, "total": len(items)})
+
+        # 候选：未通关、不在跑、未超真失败上限、在题目选择范围内
         def eligible(c: dict) -> bool:
             if c["is_completed"]:
                 return False
@@ -749,7 +786,7 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                     return False
                 if failures.get(c["unique_code"], 0) >= max(CFG.max_failures, 1):
                     return False
-            return not (task_filter and c["unique_code"] != task_filter)
+            return task_selected(c["unique_code"], task_filter)
 
         def _key(c: dict) -> tuple:
             return (0 if c["container_status"] == "available" else 1,
@@ -929,8 +966,9 @@ def main() -> int:
     ap.add_argument("--smoke", action="store_true", help="gateway/shell/VPN connectivity check only")
     ap.add_argument("--mode", choices=["auto", "local", "hosted"], default=None,
                     help="override AGENT_MODE (auto-detect by default)")
-    ap.add_argument("--task", default=None, metavar="CODE",
-                    help="只解指定题目（调试用），如 --task e1-01")
+    ap.add_argument("--task", default=None, metavar="CODE[,CODE...]",
+                    help="只解指定题目（调试用）：逗号分隔、支持 * ? 通配，"
+                         "如 --task e1-01 / --task b-0*,c-02")
     args = ap.parse_args()
 
     if args.mode:

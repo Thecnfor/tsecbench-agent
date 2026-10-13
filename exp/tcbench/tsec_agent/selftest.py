@@ -271,6 +271,15 @@ def main() -> int:
     assert len(t02_starts) >= 3, f"t-02 should pause+resume, starts={len(t02_starts)}"
     assert any(r.get("resume") for r in t02_starts), "resume task_start missing"
 
+    # ---- 题目选择（AGENT_TASKS / --task）：只解部分题做测试用 ----
+    assert agent.select_tasks("") == []
+    assert agent.select_tasks("b-01,b-02  c-03") == ["b-01", "b-02", "c-03"]
+    assert agent.task_selected("b-01", []), "空选择应等于全部"
+    assert agent.task_selected("c-03", ["b-01", "c-0*"]), "通配未命中"
+    assert agent.task_selected("e1-05", ["e1-05"]), "精确匹配失败"
+    assert not agent.task_selected("d-01", ["b-01", "c-0*"]), "越界题目不该被选中"
+    print("  ok: 题目选择解析与通配（AGENT_TASKS/--task）")
+
     # ---- shell 新参数：边沿等待 / 分页 / 落盘 / wait_any / job 上限 ----
     import shell_tool as _st
     from config import CFG as _CFG

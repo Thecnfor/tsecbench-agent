@@ -119,6 +119,9 @@ class Config:
     pause_max: int = int(_env("AGENT_PAUSE_MAX", "0"))     # 每题最多暂停续跑次数，0=不限
     giveup_max: int = int(_env("AGENT_GIVEUP_MAX", "3"))   # 连续"未通关就收尾"上限，0=不限
     max_failures: int = int(_env("AGENT_MAX_FAILURES", "2"))  # 真失败放弃上限（≥1，0 按 1）
+    # 只解部分题目（测试用）：逗号/空白分隔的题目编号，支持 * ? 通配；空=全部。
+    # 例：AGENT_TASKS="b-01,c-0*"；命令行 --task / AGENT_TASK_FILTER 优先级更高。
+    tasks: str = _env("AGENT_TASKS", "")
     deadline_sec: float = float(_env("AGENT_DEADLINE_SEC", "0"))
     request_timeout: float = float(_env("AGENT_REQUEST_TIMEOUT", "300"))
     api_max_retries: int = int(_env("AGENT_API_RETRIES", "5"))
