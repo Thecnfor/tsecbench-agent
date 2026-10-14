@@ -24,6 +24,8 @@ testpaths = ["orchestrator/tests", "mock/tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py314"
+# exp/ 是迁入的历史实验仓库（tcbench 等，独立 .gitignore/风格），不适用本仓库的 lint 契约
+extend-exclude = ["exp"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
