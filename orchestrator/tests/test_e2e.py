@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -322,3 +323,40 @@ def test_duplicates_not_double_counted(env_factory, tmp_path):
     )
     summary = run(base, solver3, tmp_path, make_config(), env={"PATH": str(Path(PY).parent)})
     assert summary["awarded"] == 200
+
+
+# ---- 12. 活锁回归：开局残留 active 容器占满平台上限 ----
+def _raw(base: str, method: str, path: str, *, code: str = "") -> dict:
+    """绕过编排器直连 mock API（为回归测试播种残留现场）。"""
+    url = f"{base}{path}" + (f"?unique_code={code}" if code else "")
+    req = urllib.request.Request(url, method=method, headers={"BENCHMARK_TOKEN": TOKEN})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def test_reconcile_close_unblocks_active_limit(env_factory, tmp_path):
+    """round2 实测活锁：上进程残留 3 个 active（=平台上限）时，若开局不关，
+    start 持续 409 StartFull、eligible 又非空 → 2s 轮询空转到终局零解。
+    开局对账必须先关残留，释放槽位后全部题恢复可排。"""
+    specs = [ChallengeSpec(f"c{i}", flags=["FLAG{free}"]) for i in range(4)]
+    base, state, solver = env_factory(specs)
+    for i in range(3):  # 播种 3 个残留（占满 mock CONCURRENCY_LIMIT=3）
+        _raw(base, "POST", "/openapi/v1/challenges/start", code=f"c{i}")
+    _raw(base, "GET", "/openapi/v1/challenges")  # 推进 pending → available
+    assert state.active_count() == 3
+
+    journal_path = tmp_path / "journal.jsonl"
+    summary = run(
+        base,
+        solver,
+        tmp_path,
+        make_config(total_s=8, reserve=2),
+        env=fake_env("FLAG{free}"),
+        journal_path=journal_path,
+    )
+    events = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
+    closed = sorted(e["unique_code"] for e in events if e["event"] == "reconcile_close")
+    assert closed == ["c0", "c1", "c2"]  # 残留被开局清场（修复前为空）
+    assert summary["completed"] >= 3  # 不再空转到终局（修复前为 0）
+    for entry in state.live.values():
+        assert entry["container_status"] == "stopped"

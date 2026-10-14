@@ -65,11 +65,20 @@ def build_agent_dir(smain, agent_dir: Path) -> None:
 
 
 def main() -> int:
-    if not os.environ.get("SOLVER_TASK"):
+    raw_task = os.environ.get("SOLVER_TASK", "")
+    if not raw_task:
         print("[pi-adapter] FATAL: SOLVER_TASK not set", file=sys.stderr)
         return 2
+    # 编排器传的可能是相对路径（其 cwd ≠ solver cwd）——这里以绝对化兜底
+    task_path = Path(raw_task).resolve()
+    os.environ["SOLVER_TASK"] = str(task_path)
     smain = load_solver_main()
     smain.setup_orch_mode()  # 组装 TASK_PROMPT / TARGET_INFO / 时间片
+    print(
+        f"[pi-adapter] task={task_path} targets={smain.TARGET_INFO!r} "
+        f"prompt_len={len(smain.TASK_PROMPT)}",
+        flush=True,
+    )
 
     deadline_epoch = os.environ.get("SOLVER_DEADLINE_EPOCH")
     budget_s = smain.MAX_MINUTES * 60
@@ -116,22 +125,37 @@ def main() -> int:
             errors="replace",
             start_new_session=True,
         )
+        # 流式读：逐行打印（轨迹全量进 stdout.log）+ 实时扫 flag 落盘 ——
+        # 时间片被杀时已产出的候选仍在 out/flags/（§5.2 收割契约）
+        seen: set[str] = set()
+        tail: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            tail.append(line.rstrip())
+            if len(tail) > 40:
+                tail.pop(0)
+            for flag in smain.find_flags(line, include_generic=True):
+                if flag not in seen:
+                    seen.add(flag)
+                    smain.report_candidate(flag)
+            if time.time() - started > budget_s + 60:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                print(f"[pi-adapter] killed at budget {int(budget_s)}s", flush=True)
+                break
         try:
-            out, _ = proc.communicate(timeout=budget_s + 30)
+            proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
-            out, _ = proc.communicate()
-            print(f"[pi-adapter] killed at budget {int(budget_s)}s", flush=True)
+            proc.wait()
 
-    if out:
-        print(out, flush=True)
-    for flag in smain.find_flags(out or "", include_generic=True):
-        smain.report_candidate(flag)
     smain.write_result("solved" if smain._reported else "failed")
     print(
         f"[pi-adapter] finished exit={proc.returncode} elapsed={int(time.time() - started)}s "
-        f"candidates={sorted(smain._reported)}",
+        f"candidates={sorted(smain._reported)} "
+        f"tail={' | '.join(t for t in tail if t)[-600:]}",
         flush=True,
     )
     return 0
