@@ -56,7 +56,9 @@ curl -s -X POST -H "BENCHMARK_TOKEN: $BENCHMARK_TOKEN" -H "Content-Type: applica
   -d '{"unique_code":"<编号>","flag":"<flag值>"}' "$BENCHMARK_BASE_URL/openapi/v1/challenges/submit"
 - 响应 `correct:true` = 该 flag 正确；`correct_flag_count == total_flag_count` 即通关。
 - `409 duplicate`：已提交过，跳过不重试。
-- flag 常见形式：flag{...}/ctf{...}，常见位置：/flag、/root/flag、webroot、数据库、环境变量、
+- flag 常见形式：`flag{...}` / `FLAG{...}` / `ctf{...}`花括号内可能有UUID或leetspeak等等。
+  所以**识别、搜索、比较 flag 一律用大小写不敏感**（如 `s.casefold()`，或对 `flag`/`FLAG`/
+  `Flag`/`ctf`/`CTF` 各形态都匹配）常见位置：/flag、/root/flag、webroot、数据库、环境变量、
   页面源码、git 泄露、管理员后台。多个 flag 常藏在不同权限/路径下（如普通用户+管理员各一个）。
 - 每拿到一个 flag 立即提交；提交全部成功后本题结束。
 - **flag 只能是目标系统里原样读出来的字符串**（文件内容、接口回显、数据库行、进程输出）。
