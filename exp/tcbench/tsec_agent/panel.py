@@ -78,19 +78,127 @@ def _read_jsonl_all(path: str) -> list[dict]:
 
 
 def load_tasks(runs_dir: str) -> dict[str, dict]:
-    """tasks.jsonl → {code: {phase, started_at, closed_at, outcome, flags, duration, attempt, target}}"""
+    """tasks.jsonl → {code: {started_at, closed_at, outcome, flags, duration(各段之和),
+    segments(段数), attempt, target, running}}"""
     tasks: dict[str, dict] = {}
     for r in _read_jsonl_all(os.path.join(runs_dir, "tasks.jsonl")):
         code = r.get("code", "?")
-        t = tasks.setdefault(code, {"code": code})
+        t = tasks.setdefault(code, {"code": code, "duration": 0.0, "segments": 0})
         if r.get("phase") == "task_start":
             t.update(started_at=r.get("started_at"), target=r.get("target"),
                      attempt=r.get("attempt"), running=True)
+            t["segments"] = int(t.get("segments") or 0) + 1
         elif r.get("phase") == "task_close":
             t.update(closed_at=r.get("closed_at"), outcome=r.get("outcome"),
-                     flags=r.get("flags"), duration=r.get("duration_sec"),
+                     flags=r.get("flags"),
                      summary=(r.get("summary") or "")[:200], running=False)
+            # 分段解题：暂停/续跑会产生多段 close，耗时必须累加而不是覆盖
+            t["duration"] = float(t.get("duration") or 0) + float(r.get("duration_sec") or 0)
     return tasks
+
+
+def _utc_epoch(s) -> float | None:
+    """记录里的时间字符串（UTC，容器无时区）→ epoch 秒；解析失败返回 None。"""
+    try:
+        return float(calendar.timegm(time.strptime(s, "%Y-%m-%d %H:%M:%S")))
+    except (ValueError, TypeError):
+        return None
+
+
+_BASE_CACHE: dict = {}
+
+
+def load_baseline(runs_dir: str) -> dict[str, float]:
+    """从 docker/archives/*.tar.gz 读**历史每题耗时** → {code: 秒}（预测对比的基线）。
+
+    - 同名题以后打包的归档为准（文件名带时间戳，字典序即时间序）；
+    - 只算已 close 的段（归档里未闭合的尾段无 duration，不计入基线）；
+    - tar.gz 有几十 MB，逐帧重读会卡 → 按"文件指纹"缓存，只解一次。
+    """
+    import tarfile
+    root = os.path.abspath(runs_dir.rstrip("/"))
+    # archives 是 **runs/ 的兄弟目录**（真实布局 docker/archives）；同时也接受
+    # "runs_dir 的兄弟目录"这种扁平布局（自测/临时目录），按顺序取第一个有归档的。
+    cands = [os.path.join(os.path.dirname(os.path.dirname(root)), "archives"),
+             os.path.join(os.path.dirname(root), "archives")]
+    adir = next((d for d in cands
+                 if os.path.isdir(d) and any(n.endswith(".tar.gz") for n in os.listdir(d))), None)
+    if not adir:
+        return {}
+    files = sorted((os.path.join(adir, n) for n in os.listdir(adir) if n.endswith(".tar.gz")),
+                   key=os.path.basename)
+    try:
+        key = tuple((p, os.path.getmtime(p), os.path.getsize(p)) for p in files)
+    except OSError:
+        return {}
+    hit = _BASE_CACHE.get("base")
+    if hit and hit[0] == key:
+        return hit[1]
+    base: dict[str, float] = {}
+    for p in files:
+        try:
+            with tarfile.open(p, "r:gz") as tf:
+                m = next((x for x in tf.getmembers() if x.name.endswith("tasks.jsonl")), None)
+                if m is None or tf.extractfile(m) is None:
+                    continue
+                dur: dict[str, float] = {}
+                for line in tf.extractfile(m):
+                    try:
+                        r = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if r.get("phase") == "task_close":
+                        c = r.get("code", "?")
+                        dur[c] = dur.get(c, 0.0) + float(r.get("duration_sec") or 0)
+                base.update(dur)          # 后写的归档覆盖先写的（更新的基线优先）
+        except Exception:
+            continue
+    _BASE_CACHE["base"] = (key, base)
+    return base
+
+
+def predict_vs_baseline(tasks: dict, base: dict[str, float], patterns: list[str],
+                        now: float) -> dict | None:
+    """实时预测本题集总耗时，与历史归档对比。
+
+    规则：默认每题与历史**等长**；提前完成直接扣掉省下的时间；还在跑则预测取
+    `max(历史, 已耗时)`——超出部分随每次刷新实时累加。
+
+    返回 {total_pred, total_base, items:[{code, state, pred, base, actual, delta}]}，
+    state ∈ done(通关) / fail / run(在跑或等待续跑) / todo(未开始)；无基线时返回 None。
+    """
+    import fnmatch
+    codes = set(tasks)
+    for c in base:
+        # 显式选中的题即使还没开始也按基线计入（"未开始"预测）；
+        # 没设选题时不补历史码——下个题集的题号可能完全不同，补进来会虚增总预测。
+        if patterns and any(fnmatch.fnmatchcase(c, p) for p in patterns):
+            codes.add(c)
+    items = []
+    for c in sorted(codes):
+        b = base.get(c)
+        if b is None:                                # 历史没有的新题：无从对比，不计入
+            continue
+        t = tasks.get(c) or {}
+        actual = float(t.get("duration") or 0)
+        if t.get("running") or t.get("outcome") == "paused":
+            st = _utc_epoch(t.get("started_at") or "")
+            if st is not None:
+                actual += max(0.0, now - st)         # 当前段已跑时长，刷新即增长
+            pred, state = max(b, actual), "run"
+        elif t.get("outcome") == "pass":
+            pred, state = actual, "done"
+        elif t.get("outcome") == "fail":
+            pred, state = actual, "fail"
+        else:
+            pred, state = b, "todo"
+        items.append({"code": c, "state": state, "pred": pred, "base": b,
+                      "actual": actual, "delta": pred - b})
+    if not items:
+        return None
+    return {"total_pred": sum(i["pred"] for i in items),
+            "total_base": sum(i["base"] for i in items),
+            "items": items}
 
 
 def _task_brief(t: dict) -> str:
@@ -266,6 +374,11 @@ def _fmt_dur(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _fmt_delta(seconds: float) -> str:
+    """带符号时长差：提前（少花）为 `-`，超出为 `+`。"""
+    return ("-" if seconds < 0 else "+") + _fmt_dur(abs(seconds))
+
+
 def _one_line(text: str, width: int) -> str:
     text = (text or "").replace("\n", " ").replace("\r", " ").strip()
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -275,7 +388,8 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     """一屏自适应渲染：所有输出裁剪到 rows×cols 内，绝不导致终端滚动。
 
     布局（自上而下，空间不够按此顺序被裁剪）：
-      头部（固定6行）→ RUNNING 详情（每题≤2行）→ FAIL 一行（聚合，每行多题）
+      头部（固定6行，有历史基线时多 2 行：预测总对比 + 逐题变化）→ RUNNING 详情（每题≤2行）
+      → FAIL 一行（聚合，每行多题）
       → PASS 一行（聚合，每行多题）→ 最近事件（尾部固定）
     """
     import shutil
@@ -285,6 +399,7 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     rows = max(8, min(rows, term.lines - 1))
 
     now = time.strftime("%H:%M:%S")
+    now_ts = time.time()                      # 预测用：在跑题目的"已耗时"实时增长
     meta = load_meta(runs_dir)
     tasks = load_tasks(runs_dir)
     events = load_recent_events(runs_dir)
@@ -305,7 +420,7 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     paused = [t for t in tasks.values() if t.get("outcome") == "paused"]
 
     lines: list[str] = []
-    # --- 头部（固定 6 行）---
+    # --- 头部（固定 6 行 + 预测 2 行）---
     lines.append("=" * cols)
     lines.append(clip(f"bench={token_hint}… {meta.get('mode', '?')}/{meta.get('model', '?')}"
                       f"  run@{run_info.get('started_at', '?')}  now {now}"))
@@ -327,21 +442,37 @@ def render(runs_dir: str, base_url: str, rows: int = 40, cols: int = 120) -> str
     lines.append(clip(f"本地: ▶{len(running)} 在跑 ✔{len(done)} 通过 ✘{len(failed)} 失败"
                       + (f" ∥{len(paused)} 暂停" if paused else "")
                       + f" | dir: {runs_dir}"))
-    lines.append("-" * cols)
 
-    def _utc_ts(s: str) -> float | None:
-        """记录里的 UTC 时间字符串 → epoch（解析失败返回 None）。"""
-        try:
-            return float(calendar.timegm(time.strptime(s, "%Y-%m-%d %H:%M:%S")))
-        except (ValueError, TypeError):
-            return None
+    # --- 实时预测 vs 历史归档（无基线/无匹配时不占行）---
+    # 规则：默认每题与历史等长；提前完成直接扣省下的时间；在跑取 max(历史, 已耗时)，
+    # 超出部分随刷新实时累加。
+    pred = predict_vs_baseline(tasks, load_baseline(runs_dir), sel_pat, now_ts)
+    if pred:
+        d = pred["total_pred"] - pred["total_base"]
+        n_early = sum(1 for i in pred["items"] if i["state"] == "done" and i["delta"] < -1)
+        n_over = sum(1 for i in pred["items"]
+                     if i["delta"] > 1 and i["state"] in ("run", "fail", "done"))
+        n_todo = sum(1 for i in pred["items"] if i["state"] == "todo")
+        lines.append(clip(
+            f"预测: {_fmt_dur(pred['total_pred'])} vs 历史 {_fmt_dur(pred['total_base'])} "
+            f"Δ{_fmt_delta(d)} | ✔提前{n_early} ▲超时{n_over} ⏳未开始{n_todo}"))
+        bits: list[str] = []
+        for i in sorted(pred["items"], key=lambda x: x["delta"]):
+            if i["state"] == "done" and abs(i["delta"]) >= 1:
+                bits.append(f"✔{i['code']} {_fmt_delta(i['delta'])}")
+            elif i["state"] in ("run", "fail") and i["delta"] > 1:
+                bits.append(f"▲{i['code']} +{_fmt_dur(i['delta'])}"
+                            f"({_fmt_dur(i['actual'])}/史{_fmt_dur(i['base'])})")
+        if bits:
+            more = f" (+{len(bits) - 10})" if len(bits) > 10 else ""
+            lines.append(clip("变化: " + " ".join(bits[:10]) + more))
 
-    # --- RUNNING 详情（每题最多2行：状态 + 最近动作）---
+    lines.append("-" * cols)    # --- RUNNING 详情（每题最多2行：状态 + 最近动作）---
     for t in running:
         if len(lines) >= rows - 2:
             break
         dur = ""
-        st = _utc_ts(t.get("started_at", ""))
+        st = _utc_epoch(t.get("started_at", ""))
         if st is not None:
             dur = f" {_fmt_dur(max(0.0, time.time() - st))}"
         lines.append(clip(f"[{t['code']}] ▶{dur} att={t.get('attempt', '?')} "
