@@ -118,7 +118,8 @@ newgrp docker -c "docker logs -f tsec-agent"   # 观察全流程
 
 ```bash
 cd docker
-newgrp docker -c "docker build -t tsec-agent:latest ."
+# 构建上下文 = 项目根（凭证/运行记录由根 .dockerignore 排除；知识库与 entrypoint 进镜像）
+newgrp docker -c "docker build -f Dockerfile -t tsec-agent:latest .."
 
 # 只跑冒烟（验证 VPN / 网关 / shell 工具）
 newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
@@ -256,9 +257,12 @@ agent.py 自身：`0` 正常收尾 / `2` 模型网关不可达 / `3` 达到最�
 
 ## 目录结构
 
-> 镜像体积硬约束：**≤ 3GB**（当前 `tsec-agent:latest` 约 1.21GB）。
-> 构建后用 `newgrp docker -c "docker images tsec-agent"` 验证；
-> 不要引入 seclists 全量字典、metasploit 等大体积组件。
+> 镜像体积硬约束：**≤ 3 GB，口径是 push 上传后的压缩体积**（原始体积不是判据，两者约 4.4×）。
+> 实测（2026-10-14）：`docker images` **原始 6.97 GB**；压缩
+> `docker save tsec-agent:latest | gzip -1 -c | wc -c` = **1.58 GB** ✓
+> 已按要求装入的大件：`metasploit-framework`（原始约 1.7GB，硬依赖 mingw-w64）、
+> `security-knowledge-base`（196MB 离线知识库）、JRE / python2 / ssh / php / gcc / make / node / go / telnet。
+> 仍不要引入：seclists 全量字典、oracle-instantclient、hashcat（无 GPU 用 john）。
 
 ```
 tcbench/
@@ -279,6 +283,10 @@ tcbench/
 │   ├── archive_runs.sh            # 归档记录到 archives/（root 残留用镜像归位属主兜底）
 │   ├── runs/<TOKEN>/              # bench 记录：meta.json、events/tasks.jsonl、openvpn.log、tasks/
 │   └── archives/                  # 归档包 <TOKEN>_<ts>.tar.gz（挂载范围外、gitignore 排除）
+├── security-knowledge-base/        # 离线安全知识库（16 源 / 196MB；gitignore 不入库，进镜像 /opt/）
+│   ├── A-基础与技巧/               # hacktricks、ctf-wiki、payloadsallthethings…（按主题，全文搜）
+│   └── B-漏洞与利用/               # awesome-poc 中文 POC 文章 + nuclei 模板
+│                                   #   （`nuclei-templates/cves.json` = CVE→模板路径 精确索引）
 └── .venv/                         # 宿主机开发用 python 环境（selftest）
 ```
 

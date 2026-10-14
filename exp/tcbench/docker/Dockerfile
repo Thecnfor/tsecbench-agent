@@ -1,11 +1,15 @@
-# 镜像大小硬约束：≤ 3GB（构建后 `docker images tsec-agent` 验证）。
+# 镜像大小硬约束：push 压缩后 ≤ 3GB。**别用 `docker images` 的数字判超标**——它显示的是
+# 原始（未压缩）体积，与 3GB 口径不同（实测比值约 4~5x）。压缩实测：
+#   docker save tsec-agent:latest | gzip -1 -c | wc -c
 # 选包原则：按领域覆盖、同类去重（每类留代表工具）；题目特化资源一律不进镜像。
 #
 # 两阶段构建：阶段1 全量安装+裁剪（裁掉的文件留在中间层）；阶段2 只 COPY 最终
 # 文件系统——否则 seclists 这种"装 1.9G 再删"会把镜像层撑爆。
-# 已知连带依赖教训（勿再引入）：
+# 已知连带依赖教训（勿再"无意间"引入）：
 #   commix → unicorn-magic → metasploit(632M) + oracle-instantclient(206M) + mingw(490M)
 #   hashcat → pocl-opencl-icd(127M)（容器无 GPU，hashcat 无意义，用 john 代替）
+#   注：metasploit 现在是**有意安装**（见文件尾的独立层），但别再靠 commix 这类间接带进来，
+#   也不要为了它去装 postgresql-server（msf 无库可用，DB 功能受限即可）。
 
 FROM kalilinux/kali-rolling AS builder
 
@@ -69,6 +73,35 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 RUN apt-get update && apt-get install -y --no-install-recommends iptables \
     && rm -rf /var/lib/apt/lists/*
 
+# ── 运行时/编译环境（两轮复盘实测缺的通用能力，非题目特化）──────────────
+#   default-jre-headless : 跑 ysoserial / jar / JDWP 客户端宿主（只装 JRE 不装 JDK，省 ~350M）
+#   python2              : telnetlib 等被 3.13 移除的标准库 + exploitdb 里 py2 老 PoC
+#   openssh-client       : 修 "sshpass 装了但 ssh 客户端没有" 的实测 bug
+#   inetutils-telnet     : 标准 telnet 客户端（自动 IAC 选项协商，别再裸 socket 手写）
+#   php-cli / phpggc 类 : PHP 序列化、phar 载荷、php://filter 链需本地跑 PHP
+#   make / gcc           : 编译 PoC、本地复现实测（曾出现 gcc: command not found）
+#   nodejs               : JS 沙箱/前端类 PoC 需真跑 JS
+#   golang-go            : Go 二进制逆向与工具（GoReSym/gore 类）
+# 独立层放最后：不打爆前面各层（seclists 裁剪/pip/venv）的构建缓存。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        default-jre-headless \
+        python2 \
+        openssh-client inetutils-telnet \
+        php-cli \
+        make gcc \
+        nodejs \
+        golang-go \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Metasploit Framework（按要求装；独立层：体积大，避免拖累其他层缓存）────
+# 注意：Kali 的 metasploit-framework **硬依赖 mingw-w64 交叉工具链**（Windows payload 生成），
+# 实测 --no-install-recommends 仍解出 26 包 / 约 1.7GB 原始体积（压缩后约 +380MB）。
+# 体积口径见文件头：判超标看压缩后，别看 `docker images` 的原始数字。
+# msf 无数据库也能用（只 loot/services 等 DB 相关功能受限）——镜像不装 postgresql-server。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        metasploit-framework \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── 最终阶段：只拷贝成品文件系统（builder 中删除的文件不带进来）────────
 FROM kalilinux/kali-rolling
 
@@ -85,7 +118,18 @@ WORKDIR /agent
 
 # 入口：容器内连 VPN（只作用于容器网络命名空间，不碰宿主机网络）→
 # 等待预检通过 → 处理内网 DNS → 执行 agent
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# 构建上下文 = **项目根**（在 docker/ 下执行 `docker build ..`，凭证/记录由根 .dockerignore 排除）
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# ── 离线安全知识库（196MB：CVE POC 文章 + nuclei 模板 + hacktricks 等 16 源）──
+#   放最后：更新知识库只重建这一层（venv/工具层缓存不受影响）。
+#   agent 用传统 Linux 搜索查它，检索路径与"别整库 grep"的规则写在 system prompt。
+COPY security-knowledge-base /opt/security-knowledge-base
+
+# ── agent 代码（hosted 交付镜像必须自带：官方平台没有 run.sh 去挂载 /agent）──
+#   本地开发不受影响：run.sh 仍 `-v tsec_agent:/agent` 覆盖此层，改代码即时生效。
+COPY tsec_agent /agent
+RUN rm -f /agent/agent.log /agent/trace.* && rm -rf /agent/__pycache__ /agent/tasks 2>/dev/null || true
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

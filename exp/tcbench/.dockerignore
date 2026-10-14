@@ -1,0 +1,21 @@
+# 构建上下文 = 项目根（`docker build -f Dockerfile ... ..`，在 docker/ 下执行）。
+# 只把三样东西送给 daemon：docker/entrypoint.sh、tsec_agent/（agent 代码，进镜像 /agent）、
+# security-knowledge-base/（进镜像 /opt/）。
+# 其余一律排除——凭证/VPN配置/运行记录/归档/虚拟环境既不进镜像层，也不进构建上下文。
+.git
+.venv
+.env
+*.env
+*.ovpn
+**/*.tar.gz
+tasks
+other
+docker/runs
+docker/archives
+docker/work
+tsec_agent/tasks
+**/agent.log
+**/trace.*
+**/__pycache__
+**/*.pyc
+**/.DS_Store

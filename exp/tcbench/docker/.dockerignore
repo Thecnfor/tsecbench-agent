@@ -1,6 +1,0 @@
-# 只把 entrypoint.sh 送进 build context；记录/归档/凭证一律不进（也不进镜像层）
-work/
-runs/
-archives/
-*.env
-*.ovpn

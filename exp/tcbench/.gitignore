@@ -17,3 +17,6 @@ __pycache__/
 .venv/
 tasks
 agent.log
+
+
+security-knowledge-base

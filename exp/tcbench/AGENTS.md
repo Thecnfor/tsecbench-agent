@@ -114,9 +114,11 @@
 | `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局） | 面板展示项 |
 | `tsec_agent/config.py` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
 | `tsec_agent/selftest.py` | 离线端到端自测（fake 模型驱动工具循环） | 改动主循环后必须跑 |
-| `docker/Dockerfile` | Kali + 渗透工具 + openvpn + agent venv | 加工具/依赖（**镜像 ≤3GB 硬约束**） |
+| `docker/Dockerfile` | Kali + 渗透工具 + openvpn + agent venv + 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
 | `docker/entrypoint.sh` | 容器入口：VPN → 预检 → DNS → 冒烟 → 跑分 | 接入流程变化 |
 | `docker/run.sh` | 一键启动（选最新 vpn 配置、挂卷、环境变量） | 启动参数变化 |
+| `docker/archive_runs.sh` | 归档记录到 `docker/archives/`（容器 root 残留用镜像归位属主兜底） | 归档行为变化 |
+| `security-knowledge-base/` | 离线安全知识库（16 源：CVE POC 文章 + nuclei 模板 + hacktricks 等，196MB）；进镜像 `/opt/security-knowledge-base`，**gitignore 排除不入库** | 更新知识库 / 检索规则（写在 prompt） |
 | `README.md` | 面向人类的完整文档 | 任何对外可见的变化 |
 
 ## 常用操作
@@ -125,8 +127,8 @@
 # 离线自测（改完代码先跑这个，不需要 VPN/网关）
 cd tsec_agent && ../.venv/bin/python3 selftest.py
 
-# 构建镜像
-cd docker && newgrp docker -c "docker build -t tsec-agent:latest ."
+# 构建镜像（上下文 = 项目根，`-f Dockerfile` 指向本目录的 Dockerfile；根 .dockerignore 排除凭证/记录）
+cd docker && newgrp docker -c "docker build -f Dockerfile -t tsec-agent:latest .."
 
 # 启动 + 观察
 cd docker && ./run.sh
@@ -168,7 +170,12 @@ POST {BASE}/openapi/v1/challenges/close?unique_code=X  释放名额（通关/放
 - [ ] `agent.py --smoke` 通过（本地模式不强求 VPN；hosted 模式必须全绿）
 - [ ] 凭证只出现在 `.env`（已 gitignore），**没有硬编码进代码/文档/镜像层**
 - [ ] 改了 Dockerfile/entrypoint → 重新 build + `--smoke` 验证
-- [ ] **镜像体积 ≤3GB**：`docker images tsec-agent` 检查（当前 1.27GB；大体积包如 seclists 全量字典、metasploit 不要装）
+- [ ] **镜像体积 ≤3GB——口径是 push 上传后的压缩体积**，不是 `docker images` 的原始数字：
+  `docker save tsec-agent:latest | gzip -1 -c | wc -c` 实测。
+  **当前（2026-10-14）：原始 6.97GB / 压缩 1.58GB**（比值约 4.4×）。
+  已按要求装入：`metasploit-framework`（原始约 +1.7GB，含 mingw 硬依赖）、
+  `security-knowledge-base`（196MB）、JRE/python2/ssh/php/gcc/make/node/go/telnet；
+  `seclists` 全量字典、`oracle-instantclient`、`hashcat` 仍不要装
 - [ ] **限网运行**：容器只允许 AI API + 靶场 VPN 出站，公网全 ban。
   新依赖必须**预装进镜像**（apt/pip/字典），不要依赖运行时联网安装；
   新的外联需求先加到 Dockerfile 再改提示词
