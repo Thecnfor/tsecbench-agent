@@ -468,6 +468,12 @@ CLOSING ────────────────────────
 - Phase 1 中 `notes.md` 显示已找到入口但未拿到 flag 的题次之；
 - 完全没有头绪的题降权或直接 ABANDON。
 
+**开局对账清场**（首次 list 成功后）
+上一进程崩溃残留的 active 容器若占满平台全局 active 上限（3），`start` 会持续 `409 StartFull`，
+而残留题又被 eligible 排除 → 2s 轮询空转到终局零解（round2 实测活锁）。因此首次对账立即
+close 全部 `active_since_reconcile` 残留（本进程此刻必无在跑题），journal 记 `reconcile_close`；
+被关的题下一轮对账见 `stopped` 即恢复可排。运行中启动的容器仍由收尾保护兜底。
+
 **收尾保护**（最后 `RESERVE`，默认 5~10 分钟）
 - 停止启动新题；
 - 杀掉所有在跑的 solver，收割其已产出的候选；

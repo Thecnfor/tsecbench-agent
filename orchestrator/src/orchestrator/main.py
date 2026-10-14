@@ -274,6 +274,7 @@ async def run_agent(
     }
 
     tasks: set[asyncio.Task] = set()
+    reconciled = False
     try:
         while not ctx.stopped and time.time() - ctx.t0 < config.total_time_limit_s:
             rows = await _safe_list(ctx)
@@ -283,6 +284,17 @@ async def run_agent(
             for code, count in recovered.items():
                 if code in ctx.registry.records:
                     ctx.registry.records[code].hints_taken = count
+            if not reconciled:
+                # 开局对账即关残留（round2 活锁教训）：上进程留下的 active 容器若
+                # 占满平台全局 active 上限，start 持续 409 StartFull、eligible 又
+                # 非空 → 2s 轮询空转到终局零解。此刻本进程必无在跑题，关掉立即
+                # 释放槽位；被关的题下一轮 sync 见 stopped 即恢复 eligible。
+                reconciled = True
+                for rec in ctx.registry.records.values():
+                    if rec.active_since_reconcile:
+                        await _safe_close(ctx, rec)
+                        rec.state = "QUEUED"
+                        ctx.journal.append("reconcile_close", unique_code=rec.unique_code)
             plan = plan_phase(
                 elapsed_s=time.time() - ctx.t0,
                 total_s=config.total_time_limit_s,
