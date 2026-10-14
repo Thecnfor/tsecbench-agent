@@ -254,7 +254,7 @@ async def run_agent(
         api_max_qps=qps,
         hint_cost_threshold=0.1,
     )
-    workspace = workspace or Path("./workspaces")
+    workspace = (workspace or Path("./workspaces")).resolve()
     journal = Journal(journal_path or (workspace / "journal.jsonl"))
     client = PlatformClient(base_url.rstrip("/"), token, qps=qps)
     ctx = RunContext(
