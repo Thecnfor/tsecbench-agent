@@ -623,6 +623,30 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
     failures: dict[str, int] = {}
     resume_meta: dict[str, dict] = {}
 
+    def _slot_waiters(items: list | None, self_code: str) -> bool:
+        """是否**还有别的题在等这个并发名额**（新题或待续跑的题）。
+
+        段到点的取舍：有人等 → 照旧关题让位（随后可 start 续跑，代价是靶机重启）；
+        没人等 → worker 在**原容器、原上下文**里继续跑，避免只剩几题时的无谓重启
+        （重启会让靶机状态重置、flag 变值、内网地址漂移）。
+        快照拿不到时保守返回 True，维持原行为。
+        """
+        if not items:
+            return True
+        for c in items:
+            cc = c.get("unique_code")
+            if cc == self_code or c.get("is_completed"):
+                continue
+            if not task_selected(cc, task_filter):
+                continue
+            with lock:
+                if cc in running or results.get(cc) == "pass":
+                    continue
+                if failures.get(cc, 0) >= max(CFG.max_failures, 1):
+                    continue
+            return True
+        return False
+
     def worker(task: dict, addr: str, attempt: int, resume: bool = False) -> None:
         code = task["unique_code"]
         set_task_cwd(_task_workdir(code))
@@ -667,18 +691,33 @@ def _run_parallel(client, task_budget, task_filter, results, attempts, snapshot)
                 else:
                     log(f"[{code}] resume context unavailable; starting fresh segment")
 
-            status, last, used, messages = solve_task(
-                client, code, card, budget, conv, messages=messages, start_turn=start_turn)
+            while True:
+                status, last, used, messages = solve_task(
+                    client, code, card, budget, conv, messages=messages, start_turn=start_turn)
 
-            # 校验平台状态（快照失败重试，避免误判）
-            for _try in range(3):
-                items_now = snapshot()
-                if items_now is not None:
-                    state = bench.challenge_state(items_now, code)
-                    if state is not None:
-                        break
-                time.sleep(4)
-            completed = bool(state and state["is_completed"])
+                # 校验平台状态（快照失败重试，避免误判）
+                for _try in range(3):
+                    items_now = snapshot()
+                    if items_now is not None:
+                        state = bench.challenge_state(items_now, code)
+                        if state is not None:
+                            break
+                    time.sleep(4)
+                completed = bool(state and state["is_completed"])
+
+                # 段到点但**没人等这个名额**（无新题、也无待续跑的题）→ 不关题不重启：
+                # 原容器、原上下文直接续一段，省掉靶机重置（状态/flag 值/内网地址都会变）。
+                if status == "paused" and not completed and not _slot_waiters(items_now, code):
+                    start_turn += used
+                    budget = task_budget
+                    if rem := remaining_sec():
+                        budget = max(10, min(task_budget, int(rem // 6)))
+                    rec().event("segment_continue", {"code": code, "turns": start_turn,
+                                                      "target": addr})
+                    log(f"[{code}] turn budget hit but nobody waits for this slot → "
+                        f"continue in place ({start_turn} turns so far, no close/restart)")
+                    continue
+                break
 
             # 通关后：同一上下文直接追加复盘请求，总结像普通消息一样落 conversation.jsonl
             if completed and messages is not None:
