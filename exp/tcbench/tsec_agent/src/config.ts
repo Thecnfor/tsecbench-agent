@@ -128,7 +128,20 @@ export interface Config {
   benchmark_base_url: string;
   vpn_health_url: string;
   max_turns: number;
+  // 分段解题的【安全网】闸：段主闸是墙钟时间（segment_*_sec），轮数只防极端空转（0=关闭）。
+  // 为什么不用轮数当主闸：实测段墙钟 p50=4.7min、p90=28.9min、max=158min——同样 60 轮
+  // 墙钟差 30 倍，因为耗时由工具等待（nmap/爆破的 wait_sec）主导，与轮数无关。
   task_max_turns: number;
+  // 段墙钟预算（主闸）：短题 600s / 长题 1800s（归档实测短段 p50=3.2min、长段 p50=19min p90=45min，
+  // 档位落在 p75~p90，检查点不至于太碎增加重启成本，也不至于太粗失控）。
+  segment_short_sec: number;
+  segment_long_sec: number;
+  // 通关后 AI 复盘的时间上限（秒）：容器此时已关闭、槽位已释放，总结脱槽跑不占并发名额；
+  // 超时丢弃总结照常记 pass——总结失败绝不能拖累通关，也不能让 agent 无限烧 token。
+  summary_timeout_sec: number;
+  // 暂停题续跑 aging（秒）：排队超过此时长的暂停题提权，防止 fresh 无限插队
+  //（实测曾有题暂停后等 118 分钟才续跑）。
+  resume_aging_sec: number;
   pause_max: number;
   giveup_max: number;
   max_failures: number;
@@ -166,8 +179,12 @@ export const CFG: Config = {
 
   // --- 运行控制 ---
   max_turns: num("AGENT_MAX_TURNS", "400"),
-  // 分段解题：每段轮次到点 → 关闭题目释放名额、保留上下文，排到队尾稍后续跑。
-  task_max_turns: num("AGENT_TASK_MAX_TURNS", "60"),
+  // 分段解题：段主闸是墙钟时间（见下），轮数只是安全网（0=关闭）。
+  task_max_turns: num("AGENT_TASK_MAX_TURNS", "120"),
+  segment_short_sec: num("AGENT_TASK_SEGMENT_SHORT_SEC", "600"),
+  segment_long_sec: num("AGENT_TASK_SEGMENT_LONG_SEC", "1800"),
+  summary_timeout_sec: num("AGENT_SUMMARY_TIMEOUT_SEC", "300"),
+  resume_aging_sec: num("AGENT_RESUME_AGING_SEC", "600"),
   pause_max: num("AGENT_PAUSE_MAX", "0"), // 每题最多暂停续跑次数，0=不限
   giveup_max: num("AGENT_GIVEUP_MAX", "3"), // 连续"未通关就收尾"上限，0=不限
   max_failures: num("AGENT_MAX_FAILURES", "2"), // 真失败放弃上限（≥1，0 按 1）

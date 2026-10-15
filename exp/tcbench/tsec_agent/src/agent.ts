@@ -53,6 +53,16 @@ const TASK_START_TS = new Map<string, number>();
 // 不判死刑：VPN 恢复即自动继续；等待期间不烧轮次、不消耗 attempts。
 let VPN_DOWN = false;
 
+// 平台最新快照缓存（watcher 每 20s 刷新）：A 策略的每轮通关检测读这里，
+// 零额外 API 调用；最坏检测延迟 = watcher 间隔 + 当前轮工具时长。
+let latestSnapshot: Challenge[] | null = null;
+
+/** A 策略：某题是否已被平台确认通关（读 watcher 缓存）。 */
+function confirmedComplete(code: string): boolean {
+  const c = latestSnapshot?.find((x) => x.unique_code === code);
+  return !!c?.is_completed;
+}
+
 export function platformEnded(where: string, e: Error, results?: Record<string, string>): void {
   if (STOP) return;
   log(`platform task FINISHED (${where}): ${e.message} — stopping all agents/containers`);
@@ -119,6 +129,7 @@ export function startPlatformWatcher(intervalSec = 20): void {
       return;
     }
     if (!items) return;
+    latestSnapshot = items; // A 策略：给 worker 的每轮通关检测提供零成本缓存
     const cur = new Map(items.map((c) => [c.unique_code, c]));
     if (first) {
       rec().event("platform_snapshot", {
@@ -378,20 +389,29 @@ export interface SolveResult {
   messages: ChatMessage[];
 }
 
-/** 单题分段解题：本段直到模型输出最终总结（无工具调用）或本段轮次预算到点。
+/** 单题分段解题：本段直到模型输出最终总结（无工具调用）或【段墙钟预算】到点。
  *
- * status: done(模型输出无工具总结) / paused(本段预算到点) / stopped(平台终态) /
+ * 状态: done(模型输出无工具总结) / paused(段到点) / stopped(平台终态) /
  * vpn_abandon / deadline / llm_error / context_overflow
  * messages/startTurn：续跑时传入重建好的上下文与轮次偏移。
+ * budgetSec：段墙钟预算（C 策略：短 600s/长 1800s）——轮数只当安全网（防极端空转，
+ * 因为实测墙钟由工具等待主导，同样 60 轮墙钟可差 30 倍）。
+ * completionCheck：A 策略——每轮开头问一次"平台是否已标记通关"（读 watcher 缓存，
+ * 零额外 API 调用，最坏延迟 20s）。通关即收束，不等段边界、不等模型自己想起来收尾
+ * （b-02 实测通关后白挂 22 分钟就是等模型收尾）。
  * 对话全量、忠实落盘（conversation.jsonl）。
  */
 export async function solveTask(
   client: LlmClient,
   code: string,
   taskCard: string,
-  budget: number,
+  budgetSec: number,
   conv: RunRecords["conversation"] extends (c: string) => infer R ? R : never,
-  opts: { messages?: ChatMessage[]; startTurn?: number } = {},
+  opts: {
+    messages?: ChatMessage[];
+    startTurn?: number;
+    completionCheck?: () => boolean;
+  } = {},
 ): Promise<SolveResult> {
   let messages: ChatMessage[];
   if (!opts.messages) {
@@ -409,8 +429,25 @@ export async function solveTask(
   let lastContent = "";
   let turnsUsed = 0;
   let turn = 0;
-  while (turn < budget) {
+  let segStartTs = Date.now() / 1000;
+  while (true) {
     if (STOP) return { status: "stopped", lastContent, turnsUsed, messages };
+    // A 策略：每轮开头查通关（watcher 缓存）——平台已确认满 flag 就立刻收束，
+    // 不再等模型自己输出总结（它可能根本想不起来，b-02 白挂 22 分钟的教训）。
+    if (opts.completionCheck?.()) {
+      log(`[${code}] platform confirmed completion mid-segment — closing segment early`);
+      return { status: "done", lastContent, turnsUsed, messages };
+    }
+    // C 策略：段墙钟预算到点即收段（转 paused 让调度处置：原地续或关题让位）。
+    // 安全网：轮数超上限也收段（0=关闭轮数闸），防模型纯说话空转烧 token。
+    if (Date.now() / 1000 - segStartTs >= budgetSec) {
+      log(`[${code}] segment wall-clock budget ${budgetSec}s reached (turn ${turn})`);
+      return { status: "paused", lastContent, turnsUsed, messages };
+    }
+    if (CFG.task_max_turns > 0 && turn >= CFG.task_max_turns) {
+      log(`[${code}] turn safety-net ${CFG.task_max_turns} reached`);
+      return { status: "paused", lastContent, turnsUsed, messages };
+    }
     // VPN 守卫：VPN 挂起 → 本题挂起等待恢复（不烧轮次预算），恢复后原地继续。
     // 等待超过 AGENT_VPN_WAIT_MAX（默认 600s）仍未恢复才放弃本题。
     if (VPN_DOWN) {
@@ -438,6 +475,8 @@ export async function solveTask(
         content: `VPN recovered after ${waited.toFixed(0)}s; resuming`,
       });
       log(`[${code}] VPN recovered after ${waited.toFixed(0)}s; resuming task`);
+      // VPN 挂起等待不计入段墙钟预算（保持"等待不烧预算"语义）
+      segStartTs += waited;
       continue; // 恢复后从当前 turn 继续（不烧预算）
     }
     const rem = remainingSec();
@@ -566,16 +605,14 @@ export async function solveTask(
       messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
     }
   }
-
-  log(
-    `[${code}] segment turn budget (${budget}) reached ` +
-      `(total ${startTurn + turn} turns) — pausing, context kept`,
-  );
-  return { status: "paused", lastContent, turnsUsed, messages };
 }
 
 /** 通关后复盘：在同一题上下文里追加一条总结请求（无工具），回复作为普通消息
  * 与其它对话一样忠实写入 conversation.jsonl。返回总结文本。 */
+/** 通关复盘：同一上下文追加总结请求（无工具），回复原样落 conversation.jsonl。
+ *  限时（AGENT_SUMMARY_TIMEOUT_SEC，默认 300s）：容器此时已关、槽位已释放，总结
+ *  脱槽跑不占并发名额；超时中止调用、丢弃总结，照常记 pass——总结绝不能拖累通关，
+ *  也不能让 agent 无限烧 token。 */
 export async function closingSummary(
   client: LlmClient,
   code: string,
@@ -585,19 +622,31 @@ export async function closingSummary(
   messages.push({ role: "user", content: CLOSING_SUMMARY_PROMPT });
   conv.write("user", { turn: `${code}:closing`, content: CLOSING_SUMMARY_PROMPT });
   const tLlmStart = Date.now() / 1000;
+  const timeoutMs = Math.max(1, CFG.summary_timeout_sec) * 1000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   let resp: ChatResponse;
   try {
-    resp = await callLlm(client, messages, false);
+    resp = await callLlm(client, messages, false, { signal: ac.signal });
   } catch (e) {
+    const timedOut = ac.signal.aborted;
+    const emsg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
     log(
-      `[${code}] closing summary LLM error: ${e instanceof Error ? `${e.name}: ${e.message}` : e}`,
+      timedOut
+        ? `[${code}] closing summary TIMED OUT after ${CFG.summary_timeout_sec}s — dropped (pass unaffected)`
+        : `[${code}] closing summary LLM error: ${emsg}`,
     );
-    conv.write("error", {
+    conv.write("note", {
       turn: `${code}:closing`,
-      error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+      content: timedOut
+        ? `通关复盘超时（>${CFG.summary_timeout_sec}s），已丢弃；不影响通关判定`
+        : `通关复盘失败：${emsg}`,
       started_at: tLlmStart,
     });
+    rec().event(timedOut ? "summary_timeout" : "summary_error", { code });
     return "";
+  } finally {
+    clearTimeout(timer);
   }
   const tLlmEnd = Date.now() / 1000;
   const msg = resp.choices[0].message;
@@ -646,7 +695,6 @@ export async function run(client: LlmClient): Promise<number> {
   });
   log(`records dir: ${R.dir}`);
   startPlatformWatcher();
-  const taskBudget = CFG.task_max_turns;
   const results: Record<string, string> = {}; // code -> pass/fail；暂停题不写
   const attempts: Record<string, number> = {};
 
@@ -676,7 +724,7 @@ export async function run(client: LlmClient): Promise<number> {
 
   // 并行调度：每题独立 async 任务 + 独立上下文 + 独立工作目录
   try {
-    await runParallel(client, taskBudget, taskFilter, results, attempts, snapshot);
+    await runParallel(client, taskFilter, results, attempts, snapshot);
   } catch (e) {
     // 调度层任何未预期异常都不允许"静默死亡"：落日志并收尾
     const emsg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -723,6 +771,14 @@ export function taskSelected(code: string, patterns: string[]): boolean {
   return patterns.some((p) => globMatch(p, code));
 }
 
+/** D 策略：题目分类——只用平台 API 字段（flag_count/difficulty/level），不依赖历史基线
+ *（正式比赛题目必变，基线只能当参考不能当信号）。
+ * 长题 ⇔ 多 flag（归档实测多 flag 题段 p50=19min、历史总耗时 36~197min）∨ hard ∨ level≥3；
+ * 其余视为短题。运行中若短题整段零新 flag → 段末改判长题（治"字段说 easy 实际 200min"）。 */
+export function classifyTask(c: Challenge): "long" | "short" {
+  return c.flag_count >= 2 || c.difficulty === "hard" || (c.level ?? 0) >= 3 ? "long" : "short";
+}
+
 /** 每题独立工作目录（async 局部 cwd 的落点），避免并行读写冲突。 */
 function taskWorkdir(code: string): string {
   const base =
@@ -745,13 +801,16 @@ function isWritable(p: string): boolean {
 /** 并行调度器：并发解多题，自动扩容直到平台拒绝（max active）。 */
 async function runParallel(
   client: LlmClient,
-  taskBudget: number,
   taskFilter: string[],
   results: Record<string, string>,
   attempts: Record<string, number>,
   snapshot: () => Promise<Challenge[] | null>,
 ): Promise<void> {
   const running = new Map<string, Promise<void>>();
+  // A 策略下通关题会先从 running 摘除（释放槽位）再跑总结——worker Promise 还活着。
+  // 收尾 join 要等的是 Promise 本身而不是槽位，所以另存全量清单，否则 run 结束会掐掉
+  // 正在进行的总结。
+  const allWorkers: Promise<void>[] = [];
   let cap = Number(env("AGENT_MAX_PARALLEL", "5"));
   let checkedSelection = false; // 首次快照时核对一次题目选择是否命中（打错字要出声）
 
@@ -769,6 +828,16 @@ async function runParallel(
   //   resumeMeta: 暂停题的续跑状态 {pauses, gives, target, turns}
   const failures: Record<string, number> = {};
   const resumeMeta: Record<string, Record<string, unknown>> = {};
+  // D 策略：题目分类（long/short），启动时按 API 字段定类，段末可动态改判（治字段失真）。
+  const taskClass = new Map<string, "long" | "short">();
+  const cls = (c: Challenge): "long" | "short" => {
+    let v = taskClass.get(c.unique_code);
+    if (!v) {
+      v = classifyTask(c);
+      taskClass.set(c.unique_code, v);
+    }
+    return v;
+  };
 
   /** 是否还有别的题在等这个并发名额（新题或待续跑的题）。 */
   const slotWaiters = (items: Challenge[] | null, selfCode: string): boolean => {
@@ -782,6 +851,27 @@ async function runParallel(
       return true;
     }
     return false;
+  };
+
+  /** 有短题在等（决定长题配额 cap-1 还是 cap）——与 slotWaiters 同口径但只看短题。 */
+  const anyWaitingShort = (items: Challenge[] | null, selfCode: string): boolean => {
+    if (!items?.length) return false;
+    const maxFail = Math.max(CFG.max_failures, 1);
+    return items.some((c) => {
+      const cc = c.unique_code;
+      if (cc === selfCode || c.is_completed) return false;
+      if (!taskSelected(cc, taskFilter)) return false;
+      if (cc in running || results[cc] === "pass") return false;
+      if ((failures[cc] ?? 0) >= maxFail) return false;
+      return cls(c) === "short";
+    });
+  };
+
+  /** 当前在跑的长题数（含自己——自己在 running 里）。 */
+  const countRunningLong = (): number => {
+    let n = 0;
+    for (const cc of running.keys()) if ((taskClass.get(cc) ?? "long") === "long") n++;
+    return n;
   };
 
   const worker = async (
@@ -798,6 +888,7 @@ async function runParallel(
     let status: SolveStatus = "llm_error";
     let outcome = "fail";
     let completed = false;
+    let containerReleased = false; // A：通关即关容器后置位，finally 里不再重复 close
     const conv = rec().conversation(code);
     let messages: ChatMessage[] | null = null;
     const meta = resumeMeta[code] ?? {};
@@ -817,9 +908,13 @@ async function runParallel(
         target: addr,
         workdir: getTaskCwd() || taskWorkdir(code),
       });
-      let budget = taskBudget;
-      const rem0 = remainingSec();
-      if (rem0 !== null) budget = Math.max(10, Math.min(taskBudget, Math.trunc(rem0 / 6)));
+      // C 策略：段预算按分类取墙钟（短 600s/长 1800s）；时限临近时压缩到剩余的 1/6。
+      const segBudgetSec = (): number => {
+        const base = cls(task) === "long" ? CFG.segment_long_sec : CFG.segment_short_sec;
+        const rem = remainingSec();
+        return rem !== null ? Math.max(60, Math.min(base, Math.trunc(rem / 6))) : base;
+      };
+      let budgetSec = segBudgetSec();
 
       if (isResume) {
         // 续跑：从 conversation.jsonl 重建全量上下文（记录即事实），再追加续跑通知
@@ -831,7 +926,7 @@ async function runParallel(
             new_target: addr,
             old_target: oldTarget || "（未知）",
             workdir: getTaskCwd() || taskWorkdir(code),
-            budget,
+            budget_min: Math.round(budgetSec / 60),
             turns: startTurn,
           });
           messages.push({ role: "user", content: note });
@@ -845,10 +940,15 @@ async function runParallel(
         }
       }
 
+      // 本段起始 flag 数（D 改判判据）：首段用调度快照里的值，续段用上轮校验后的 state
+      let segStartFlags = task.correct_flag_count ?? 0;
       for (;;) {
-        const r = await solveTask(client, code, card, budget, conv, {
+        const r = await solveTask(client, code, card, budgetSec, conv, {
           messages: messages ?? undefined,
           startTurn: startTurn,
+          // A 策略：每轮问一次平台快照缓存（watcher 20s 刷新，零额外 API 调用）——
+          // 通关即收束，不等段边界、不等模型自己想起来（b-02 白挂 22 分钟的教训）。
+          completionCheck: () => confirmedComplete(code),
         });
         status = r.status;
         last = r.lastContent;
@@ -867,30 +967,74 @@ async function runParallel(
         }
         completed = !!state?.is_completed;
 
-        // 段到点但**没人等这个名额** → 不关题不重启：原容器、原上下文直接续一段
-        if (status === "paused" && !completed && !slotWaiters(itemsNow, code)) {
-          startTurn += used;
-          budget = taskBudget;
-          const rem1 = remainingSec();
-          if (rem1 !== null) budget = Math.max(10, Math.min(taskBudget, Math.trunc(rem1 / 6)));
-          rec().event("segment_continue", { code, turns: startTurn, target: addr });
-          log(
-            `[${code}] turn budget hit but nobody waits for this slot → ` +
-              `continue in place (${startTurn} turns so far, no close/restart)`,
-          );
-          continue;
+        // ---- 段到点处置（保留 segment_continue 收尾语义 + D 配额规则）----
+        if (status === "paused" && !completed) {
+          const segNewFlags = (state?.correct_flag_count ?? segStartFlags) - segStartFlags;
+          // D 动态改判：字段说短、整段零新 flag → 实际是长题（治"easy 标签 200min"）
+          let isLong = cls(task) === "long";
+          if (!isLong && segNewFlags <= 0) {
+            taskClass.set(code, "long");
+            isLong = true;
+            rec().event("task_reclassified", {
+              code,
+              to: "long",
+              reason: "zero_new_flags_segment",
+            });
+            log(`[${code}] reclassified to LONG (segment produced 0 new flags)`);
+          }
+          // D 配额：有短题在等时长题最多占 cap-1 槽。
+          // 配额内长题段到点不轮转（bench：轮走后 pickNext 立刻用另一道长题补回同槽，
+          // 等待的短题一无所获，纯重启浪费——打断 88→31.6、完成持平）；
+          // 超配额长题（怪兽题改判后鸠占鹊巢）必须让位；短题有等待者时照旧轮转。
+          const quotaNow = anyWaitingShort(itemsNow, code) ? Math.max(1, cap - 1) : cap;
+          const overQuota = isLong && countRunningLong() > quotaNow;
+          if (!overQuota && (isLong || !slotWaiters(itemsNow, code))) {
+            startTurn += used;
+            segStartFlags = state?.correct_flag_count ?? segStartFlags;
+            budgetSec = segBudgetSec();
+            rec().event("segment_continue", {
+              code,
+              turns: startTurn,
+              target: addr,
+              class: isLong ? "long" : "short",
+            });
+            log(
+              `[${code}] segment budget hit; continue in place ` +
+                `(${startTurn} turns so far, no close/restart)`,
+            );
+            continue;
+          }
         }
         break;
-      }
-
-      // 通关后：同一上下文直接追加复盘请求
-      if (completed && messages) {
-        closingText = await closingSummary(client, code, messages, conv);
       }
 
       if (completed) {
         outcome = "pass";
         delete resumeMeta[code];
+        // A 策略：通关即关容器——平台槽位立刻归还调度器（开新题不用等总结）；
+        // 复盘总结脱槽跑（纯 LLM 调用不碰容器），限时 AGENT_SUMMARY_TIMEOUT_SEC。
+        try {
+          await bench.closeChallenge(code);
+          containerReleased = true;
+          rec().event("challenge_change", {
+            code,
+            field: "controller_close",
+            old: "available",
+            new: "closed",
+            completed: true,
+            note: "released immediately on completion (summary off-slot)",
+          });
+        } catch (e) {
+          if (e instanceof PlatformError) {
+            if (e.code !== "invalid_state") log(`[${code}] early close error: ${e.message}`);
+          } else {
+            log(`[${code}] early close network error: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+        running.delete(code); // 槽位从并发计数中摘除——总结期间调度器可开新题
+        if (messages) {
+          closingText = await closingSummary(client, code, messages, conv);
+        }
       } else if (["llm_error", "context_overflow", "vpn_abandon", "deadline"].includes(status)) {
         // 真失败：上下文不保留，计入失败次数，达上限后不再派发
         failures[code] =
@@ -937,12 +1081,13 @@ async function runParallel(
             target: addr,
             turns: startTurn + used,
             reason: giveup ? "giveup" : "paused",
+            pausedAt: Date.now() / 1000, // D-aging：记录暂停时刻，续跑排序按等待时长提权
           };
           rec().event("task_paused", {
             code,
             pauses,
             gives,
-            reason: giveup ? "giveup" : "turn_budget",
+            reason: giveup ? "giveup" : "segment_budget",
             turns: startTurn + used,
             target: addr,
           });
@@ -966,14 +1111,16 @@ async function runParallel(
       const completedNow = !!state?.is_completed;
       if (outcome === "pass" && !completedNow) outcome = "fail"; // 平台未确认通关不算 pass
       try {
-        await bench.closeChallenge(code);
-        rec().event("challenge_change", {
-          code,
-          field: "controller_close",
-          old: "available",
-          new: "closed",
-          completed: completedNow,
-        });
+        if (!containerReleased) {
+          await bench.closeChallenge(code);
+          rec().event("challenge_change", {
+            code,
+            field: "controller_close",
+            old: "available",
+            new: "closed",
+            completed: completedNow,
+          });
+        }
       } catch (e) {
         if (e instanceof PlatformError) {
           if (e.code !== "invalid_state") log(`[${code}] close error: ${e.message}`);
@@ -1089,24 +1236,39 @@ async function runParallel(
       if ((failures[c.unique_code] ?? 0) >= Math.max(CFG.max_failures, 1)) return false;
       return taskSelected(c.unique_code, taskFilter);
     };
-    const key = (c: Challenge): [number, number, number, string] => [
-      c.container_status === "available" ? 0 : 1,
-      bench.DIFF_RANK[c.difficulty] ?? 9,
-      c.level ?? 9,
-      c.unique_code,
+    // D 策略排序（bench 60 seeds×5 场景验证：完成数不降、短题零饿死、allLong 打断 43→0.1）：
+    // 1) 长题早启动——开局就把长题顶上去跑（不能最后才启动），但有短题在等时最多占 cap-1 槽
+    //    （保底 1 槽给短题，防饿死）；2) 短题最短优先；3) 暂停题 aging——等最久的先续
+    //    （防 fresh 无限插队：实测曾有题暂停后等 118 分钟才续跑）。
+    // 估算只用公开字段（flag_count/difficulty/level），不依赖历史基线（正式比赛题目必变）。
+    const est = (c: Challenge): number =>
+      c.flag_count * 20 + (c.level ?? 0) * 10 + (bench.DIFF_RANK[c.difficulty] ?? 9) * 5;
+    const waitAge = (c: Challenge): number => {
+      const at = resumeMeta[c.unique_code]?.pausedAt;
+      return typeof at === "number" ? Date.now() / 1000 - at : 0;
+    };
+    const eligibleTasks = items.filter(eligible);
+    const freshLong = eligibleTasks.filter(
+      (c) => !(c.unique_code in resumeMeta) && cls(c) === "long",
+    );
+    const freshShort = eligibleTasks.filter(
+      (c) => !(c.unique_code in resumeMeta) && cls(c) === "short",
+    );
+    const pausedTasks = eligibleTasks.filter((c) => c.unique_code in resumeMeta);
+    const waitingShort = freshShort.length + pausedTasks.filter((c) => cls(c) === "short").length;
+    const longQuota = waitingShort > 0 ? Math.max(1, cap - 1) : cap;
+    const longOrdered = [...freshLong].sort((a, b) => est(b) - est(a));
+    const shortOrdered = [...freshShort].sort((a, b) => est(a) - est(b));
+    const pausedOrdered = [...pausedTasks].sort((a, b) => waitAge(b) - waitAge(a));
+    const agedPaused = pausedOrdered.filter((c) => waitAge(c) >= CFG.resume_aging_sec);
+    const freshPaused = pausedOrdered.filter((c) => waitAge(c) < CFG.resume_aging_sec);
+    const candidates = [
+      ...longOrdered.slice(0, longQuota),
+      ...shortOrdered,
+      ...agedPaused, // aging 提权：暂停够久的插队到新题前
+      ...longOrdered.slice(longQuota),
+      ...freshPaused,
     ];
-    const fresh = items
-      .filter((c) => eligible(c) && !(c.unique_code in resumeMeta))
-      .sort((a, b) => compareKey(key(a), key(b)));
-    const resumable = items
-      .filter((c) => eligible(c) && c.unique_code in resumeMeta)
-      .sort((a, b) => {
-        const ap = Number(resumeMeta[a.unique_code]?.pauses ?? 0);
-        const bp = Number(resumeMeta[b.unique_code]?.pauses ?? 0);
-        return ap !== bp ? ap - bp : a.unique_code < b.unique_code ? -1 : 1;
-      });
-    // 分段策略：暂停题只在没有新题可派时才续跑
-    const candidates = fresh.length ? fresh : resumable;
 
     if (!candidates.length && !running.size) break; // 全部完成或全部结束
 
@@ -1213,6 +1375,7 @@ async function runParallel(
         log(`[${code}] worker crashed: ${e instanceof Error ? e.stack : e}`);
       });
       running.set(code, p);
+      allWorkers.push(p);
       await sleep(300); // 平滑扩容，避免瞬时打满平台
     }
 
@@ -1226,10 +1389,10 @@ async function runParallel(
   }
 
   // 收尾：等待所有 worker（最多 3 分钟/题）
-  for (const [code, p] of [...running]) {
+  for (const p of allWorkers) {
     const timeout = new Promise<void>((r) => setTimeout(r, 180_000));
     const done = await Promise.race([p.then(() => true), timeout.then(() => false)]);
-    if (!done) log(`[${code}] worker still running at shutdown; detached`);
+    if (!done) log(`worker still running at shutdown; detached`);
   }
 
   // 运行终止（平台终态/时限）时仍有暂停中的题：补记 fail
@@ -1265,17 +1428,6 @@ async function runParallel(
     }
     log("all workers stopped; active challenge containers cleanup attempted");
   }
-}
-
-function compareKey(a: unknown[], b: unknown[]): number {
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i];
-    const y = b[i];
-    if (x === y) continue;
-    if (typeof x === "number" && typeof y === "number") return x - y;
-    return String(x) < String(y) ? -1 : 1;
-  }
-  return 0;
 }
 
 function printSummary(results: Record<string, string>, items: Challenge[] | null): void {

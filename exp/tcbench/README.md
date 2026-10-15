@@ -131,15 +131,26 @@
   `[参数已自动修复：…]` 前缀、原样参数记在 `events.jsonl` 的 `tool_arg_repaired`
   里——不再整轮作废（上一轮 c-03 因此白扔 14 轮）。
 
-### 分段解题（每题独立上下文 + 暂停/续跑）
+### 分段解题（每题独立上下文 + 暂停/续跑 + A/C/D 调度）
 
-- 每题每次 **`AGENT_TASK_MAX_TURNS`（默认 60）轮为一段**：到点**不判死**，而是
-  **关闭题目释放名额**（`task_close{outcome:"paused"}`）→ 上下文原样保留（`resume_meta`，
-  可从 `conversation.jsonl` 重建）→ 排到队尾，**等没有新题可派时再 `start` 续跑**。
-- **但没人等名额时就不关**：段到点那一刻若**没有别的题在等这个并发名额**
-  （无新题、也无待续跑的题——典型是"只剩最后几题且都在跑"），就**不关题、不重启**，
-  同一容器、同一上下文直接续一段（记录 `segment_continue` 事件）；
-  只有确实有人等名额时才走上面"关题让位 → 稍后续跑重启"的流程。
+- **段预算以墙钟为主**（`AGENT_TASK_SEGMENT_SHORT_SEC`=600s / `LONG_SEC`=1800s，按题目
+  字段分类取值）：到点**不判死**，而是**关闭题目释放名额**（`task_close{outcome:"paused"}`）
+  → 上下文原样保留（`resumeMeta`，可从 `conversation.jsonl` 重建）→ 之后 `start` 续跑。
+  轮数 `AGENT_TASK_MAX_TURNS`（默认 120，0=关）只是安全网——实测段墙钟 p50=4.7min、
+  p90=28.9min、max=158min，同样 60 轮墙钟差 30 倍（耗时由工具等待主导），轮数当主闸不合适。
+- **通关即关容器（A）**：每轮开头查 watcher 快照缓存（20s 刷新，零额外 API），平台确认
+  满 flag 立刻收束 → **立即关容器释放槽位**（不等模型自己收尾——实测通关后白挂 22 分钟）
+  → 复盘总结脱槽跑（不占并发名额），限时 `AGENT_SUMMARY_TIMEOUT_SEC`（默认 300s），
+  超时丢弃总结照常 pass。
+- **段到点处置**：段末零新 flag 的短题**动态改判长题**（治字段失真）；有短题在等时长题配额
+  = `cap-1`（保底 1 槽给短题）；**配额内长题不轮转**（bench：轮走后只会被另一道长题补回
+  同槽，短题一无所获，纯重启浪费——打断 88→31.6 完成持平）；超配额长题必须让位；
+  短题有等待者时照旧关题轮转。**无人等名额时不关题直接续一段**（`segment_continue`，
+  短题适用，省掉靶机重置代价）。
+- **调度排序（D）**：长题早启动（开局就顶上去跑，估算降序）、短题最短优先、暂停题 aging
+  （等 `AGENT_RESUME_AGING_SEC`=600s 提权，防 fresh 无限插队——实测曾有题暂停后等 118 分钟）。
+  分类只用 API 字段（flag_count/difficulty/level），**不依赖历史基线**（正式比赛题目必变）。
+  策略由 `sim/` 离散事件模拟器 bench 验证（多场景×多策略×百种子，含防饿死性质测试）。
 - 续跑会**重启靶机**（拿到新 target），并在上下文末尾追加一条续跑通知：
   告知「靶机已重启、靶机内状态重置、workdir 文件仍在、已提交的 flag 不丢、从上次进度继续」。
 - **只有三种情况才终止本题**：① 上下文超出模型窗口（`context_length_exceeded`，
@@ -206,7 +217,11 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `VPN_PROBE_INTERVAL` | VPN 探测间隔秒 | `20` |
 | `AGENT_VPN_WAIT_MAX` | VPN 挂起时 worker 最长等待秒（超时弃题） | `600` |
 | `AGENT_MAX_TURNS` | 最大 LLM 轮次 | `400` |
-| `AGENT_TASK_MAX_TURNS` | 每段轮次预算（到点暂停、保留上下文，见「分段解题」） | `60` |
+| `AGENT_TASK_SEGMENT_SHORT_SEC` | 短题段墙钟预算（主闸；到点暂停、保留上下文） | `600` |
+| `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag/hard/level≥3） | `1800` |
+| `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸） | `120` |
+| `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | `300` |
+| `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值秒（防 fresh 无限插队） | `600` |
 | `AGENT_TASKS` | 只解部分题目（测试用）：逗号/空白分隔，支持 `*`/`?` 通配，空=全部；`--task`/`AGENT_TASK_FILTER` 优先 | 空 |
 | `AGENT_PAUSE_MAX` | 每题最多暂停续跑次数（`0`=不限，一直续跑直到通关） | `0` |
 | `AGENT_GIVEUP_MAX` | 连续「未通关就输出总结」的段数上限（`0`=不限；达上限判 fail） | `3` |

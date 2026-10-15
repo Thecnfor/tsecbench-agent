@@ -60,9 +60,12 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `prompt.ts` | 单题 system prompt、任务卡模板、续跑/拉回/复盘通知 |
 | `panel/` | `data.ts` 记录读取与统计（含历史归档基线预测）；`server.ts` Node 面板服务；`web/` React 面板 |
 | `types.ts` | 共享类型契约 |
+| `sim/` | 调度策略离散事件模拟器（纯内存）：`tasks.ts` 场景生成（真实配比/easy慢题/全短/全长/fuzz）、`engine.ts` 世界推进、`policies.ts` 策略消融、`run.ts` bench——**A/C/D 策略选择的依据**，回归时可再跑 |
 
 测试在 `test/`（vitest，`test/setup.ts` 隔离宿主 `.env` 泄漏）；`e2e.test.ts` 是
-`selftest.py` 的等价移植（假模型 + 内存平台，全离线跑通「分段解题 + 记录断言」）。
+`selftest.py` 的等价移植（假模型 + 内存平台，全离线跑通「分段解题 + 记录断言」）；
+`scheduling.test.ts` 是 A/C/D 调度改造的契约测试；`sim.test.ts` 是模拟器 bench
+（含"100 种子短题零饿死"性质断言，`pnpm bench` 单独跑）。
 
 ## 环境变量（均有内置默认值）
 
@@ -73,7 +76,11 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `DEEPSEEK_BASE_URL` | 本地模型网关（官方） | `https://api.deepseek.com/v1` |
 | `DEEPSEEK_API_KEY` | 网关鉴权 | — |
 | `AGENT_MODE` | `auto`（默认）/`local`/`hosted` | `auto` |
-| `AGENT_TASK_MAX_TURNS` | 每段轮次（到点暂停保留上下文） | 60 |
+| `AGENT_TASK_SEGMENT_SHORT_SEC` | 短题段墙钟预算（主闸；到点暂停保留上下文） | 600 |
+| `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
+| `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸，轮数防极端空转） | 120 |
+| `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | 300 |
+| `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |
 | `VPN_GUARD` | VPN 运行时守卫：`auto`（hosted 开/local 关）/1/0 | `auto` |

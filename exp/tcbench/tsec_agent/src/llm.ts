@@ -261,6 +261,7 @@ export async function callLlm(
   client: LlmClient,
   messages: ChatMessage[],
   useTools = true,
+  extra: { signal?: AbortSignal } = {},
 ): Promise<ChatResponse> {
   let delayMs = 2000;
   let attempt = 0;
@@ -279,8 +280,11 @@ export async function callLlm(
         opts.tools = [SHELL_TOOL_SCHEMA];
         opts.tool_choice = "auto";
       }
+      if (extra.signal) opts.signal = extra.signal; // 限时调用（通关总结）的中止信号
       return await active.create(opts);
     } catch (e) {
+      // 外部中止（总结超时）：立即失败不重试——限时语义必须干净
+      if (extra.signal?.aborted) throw e;
       // 与 Python call_llm 一致：只对 API/网络类错误重试（openai APIError 家族）；
       // 其他异常（断言、编程错误）原样抛出，由 worker 落 task_error——绝不静默死循环。
       if (!(e instanceof LlmHttpError)) throw e;
