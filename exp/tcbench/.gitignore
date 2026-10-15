@@ -1,0 +1,22 @@
+# 凭证与本地配置，不入库
+.env
+*.env
+*.ovpn
+
+
+# 运行产物（bench 记录含 token 目录名，必须排除；旧记录用 docker/archive_runs.sh 归档到 docker/archives/）
+docker/work/
+docker/runs/
+docker/archives/
+tsec_agent/agent.log
+tsec_agent/trace.*
+agent.tar.gz
+*.tar.gz
+__pycache__/
+*.pyc
+.venv/
+tasks
+agent.log
+
+
+security-knowledge-base

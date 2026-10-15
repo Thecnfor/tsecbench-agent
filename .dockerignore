@@ -4,6 +4,9 @@ refs/
 ing/
 docs/
 tmp
+# exp/ 是迁入的实验目录（tcbench 全量迁入，含 1.7GB agent.tar.gz、.env、
+# *.ovpn 私钥与运行产物），任何情况下都不该进构建上下文。
+exp/
 .git/
 *.ovpn
 .env
