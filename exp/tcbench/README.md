@@ -24,7 +24,7 @@
 | 用途 | 日常开发调试 | 最终交付 / 官方平台跑分 |
 | 模型入口 | 官方 DeepSeek API（公网） | 平台内网转写网关（VPN 内） |
 | 公网访问 | ✅ 可用 | ❌ 不可用，仅平台内网 |
-| 交付形态 | 源码 + `.venv` 直接跑 | **≤3GB 镜像**上传官方平台 |
+| 交付形态 | 源码 + `pnpm build` 直接跑 | **≤3GB 镜像**上传官方平台 |
 | 模型 | `deepseek-flash`（`AGENT_MODEL_LOCAL`） | `deepseek-flash`（`AGENT_MODEL_HOSTED`，与本地同名，无额外后缀） |
 | 网关 | `https://api.deepseek.com/v1` | `http://api.deepseek.com.tsecbench.gw/v1` |
 | VPN 预检 | 冒烟仅警告（靶场渗透仍需连） | **强制**，不过即退出 |
@@ -40,10 +40,10 @@
 - **entrypoint 兜底 hint**：`NET_RESTRICT=auto` 判定公网 AI API 不可达时（= hosted 环境），
   未显式指定 `AGENT_MODE` 就直接导出 `AGENT_MODE=hosted`——防止在平台侧设了
   `DEEPSEEK_API_KEY` 的情况下探测抖动误选 local（实测 exit 12）。
-  显式 `AGENT_MODE=local|hosted` 与命令行 `agent.py --mode` 始终优先。
-- **覆盖**：环境变量 `AGENT_MODE=local|hosted`，或命令行 `agent.py --mode hosted`。
+  显式 `AGENT_MODE=local|hosted` 与命令行 `agent.js --mode` 始终优先。
+- **覆盖**：环境变量 `AGENT_MODE=local|hosted`，或命令行 `agent.js --mode hosted`。
 - **托管模式转写网关（官方机制）**：托管环境中大模型 API 一律走转写网关，
-  地址转换规则 `https://HOST[/path]` → `http://HOST.tsecbench.gw[/path]`（`config.py: to_gateway_url` 自动转换）。
+  地址转换规则 `https://HOST[/path]` → `http://HOST.tsecbench.gw[/path]`（`src/config.ts: toGatewayUrl` 自动转换）。
   转写严格按官方规则收紧（selftest 有断言）：**只转写 `https://`**（显式给的 `http://`
   内网/转写地址原样保留）、**IP 字面量不拼后缀**（`10.0.0.5.tsecbench.gw` 解析不了）、
   已是 `.tsecbench.gw` 的幂等保留；显式 `DEEPSEEK_BASE_URL_HOSTED` 也过同一转换
@@ -53,11 +53,11 @@
   ——401 报文是 DeepSeek 原生格式（`Your api key: ****ench is invalid`）。即托管模式必须使用
   **真实 DeepSeek key**（平台环境变量 `DEEPSEEK_API_KEY` 注入；镜像内无 `.env`），
   上届约定的内置 `tsec-bench` 会被上游 401。
-- **key 候选发现（`agent.discover_gateway_key`）**：冒烟（hosted）与运行中 401 都走同一套
+- **key 候选发现（`src/llm.ts: discoverGatewayKey`）**：冒烟（hosted）与运行中 401 都走同一套
   **候选清单逐个探测**，每个候选一行**掩码**结果日志（只显示尾 4 位，绝不输出完整 key，
   `BENCHMARK_TOKEN` 同样掩码）+ `events.jsonl: gateway_key_probe`。候选按优先级：
-  1. `anonymous` —— **匿名（不带 Authorization 头）**：openai 3.x 构造拒绝空 key，
-     用占位串过构造 + httpx2 事件钩子在请求发出前剥掉 Authorization（wire 级实测确认）；
+  1. `anonymous` —— **匿名（不带 Authorization 头）**：fetch client 直接省略该头
+     （wire 级等价于"无凭据请求"）；
      部分部署网关不透传鉴权、自带平台配额，匿名即可用（实测命中即选中，省自己的 key 额度）；
   2. `env:DEEPSEEK_API_KEY_HOSTED` —— 显式配置的托管 key；
   3. `env:BENCHMARK_TOKEN` —— 平台注入凭据，个别部署网关也认；
@@ -104,9 +104,9 @@
 │    1. 容器内启动 openvpn（连 task_*_vpn_config.ovpn）              │
 │    2. VPN 联通预检 http://10.0.100.58 == status:"ok"（失败退出）   │
 │    3. 从 openvpn push 提取内网 DNS → 解析模型网关域名              │
-│    4. agent.py --smoke 冒烟 → 通过后正式运行 agent.py              │
+│    4. node /agent/dist/agent.js --smoke 冒烟 → 通过后正式运行 agent                  │
 │                                                                   │
-│  agent.py（主循环）                                               │
+│  agent.js（主循环，Node/TS 实现）                                  │
 │    model: deepseek-flash                                             │
 │    gateway: http://api.deepseek.com.tsecbench.gw/v1（OpenAI 兼容）│
 │    tools: 仅 shell（异步 background），无 MCP、无 subagent         │
@@ -127,7 +127,7 @@
   （截图/验证码/隐写图直接看懂；文件头解析尺寸、超限自动压缩、网关拒图自动降级为
   OCR+元数据文本，见 `AGENT_VISION`）。
 - **工具参数容错**：模型偶发把 shell 工具参数序列化坏（`action` 混入 XML 参数片段或整段命令、
-  JSON 值漏引号）→ `shell_tool.parse_tool_arguments` 直接修复后照常执行，结果带
+  JSON 值漏引号）→ `shell_tool.parseToolArguments` 直接修复后照常执行，结果带
   `[参数已自动修复：…]` 前缀、原样参数记在 `events.jsonl` 的 `tool_arg_repaired`
   里——不再整轮作废（上一轮 c-03 因此白扔 14 轮）。
 
@@ -173,7 +173,7 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
   -v \$PWD/../tsec_agent:/agent \
   -v \$PWD/../task_*_vpn_config.ovpn:/config/vpn.ovpn:ro \
   -v \$PWD/work:/work \
-  tsec-agent:latest python3 /opt/agent-venv/bin/python3 /agent/agent.py --smoke"
+  tsec-agent:latest node /agent/dist/agent.js --smoke"
 ```
 
 ### 宿主机一次性准备（已完成）
@@ -221,9 +221,9 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `VPN_WAIT_SEC` | VPN 预检最长等待（hosted 强制） | `90` |
 
 > 切换「内部本地跑分」时只需改 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN`，代码零改动。
-> 手动指定模式：`agent.py --mode local|hosted` 或 `AGENT_MODE=hosted`。
+> 手动指定模式：`agent.js --mode local|hosted` 或 `AGENT_MODE=hosted`。
 
-## bench 记录持久化（records.py，替代旧 trace 双文件）
+## bench 记录持久化（src/records.ts，替代旧 trace 双文件）
 
 ```
 docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 token 重启则 append）
@@ -239,7 +239,7 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
      │    每条含 ts/seq/turn/tool_call_id + **成对起止时间戳（供甘特图）**：
      │    started_at/ended_at（epoch 秒·毫秒精度）+ duration_ms（自动算）——
      │    assistant=本次 LLM 调用起止、tool=工具执行起止、user/note=写入同刻；
-     │    **同时是分段解题续跑时重建上下文的唯一来源**（`records.rebuild_messages`）
+     │    **同时是分段解题续跑时重建上下文的唯一来源**（`records.rebuildMessages`）
      │    **通关后同上下文追加复盘总结**
      │    （思路/工具困难/优化建议，assistant 条目带 kind_note:"closing_summary"）
      └── <AI 解题产物>
@@ -258,15 +258,16 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
 - **反作弊**：任务不跨 bench 共享（题目/代号每轮不同）；`.gitignore` 排除 `docker/runs/`。
 - 查看对话：`jq . docker/runs/<TOKEN>/tasks/e1-01/conversation.jsonl`
 
-### 本地观察面板（panel.py）
+### 本地观察面板（React + Node 服务）
 
 ```bash
-python3 tsec_agent/panel.py                 # 自动发现最新 runs/<TOKEN>，5s 刷新
-python3 tsec_agent/panel.py --dir docker/runs/<TOKEN> --interval 3
-python3 tsec_agent/panel.py --once          # 只渲染一帧（脚本/测试）
+cd tsec_agent && pnpm build           # 首次/改完面板代码
+cd tsec_agent && pnpm serve           # 自动发现最新 runs/<TOKEN>，5s 刷新 → http://127.0.0.1:8791
+pnpm serve -- --dir ../docker/runs/<TOKEN> --port 8791 --url https://...
+pnpm dev                             # vite dev server（5173，/api 代理到 8791）
 ```
 
-单屏 ANSI 面板展示：
+浏览器面板（深色单页）展示：
 - 全局：平台通关数/flag 数/总分（平台 API 不可达时**离线回退**本地记录统计）；
   **有选题时主数字只统计选中的题**：`平台(选题 9/63): 通关 1/9 | flags 3/20 | 总分 300
   [全局: …]`——选题模式取 `meta.runs[-1].task_filter`（agent 落盘），旧记录回退读环境/.env
@@ -296,7 +297,7 @@ python3 tsec_agent/panel.py --once          # 只渲染一帧（脚本/测试）
 6. `POST .../challenges/close` — 通关/放弃后**必须**释放名额
 7. 循环直到全部通关或任务超时
 
-错误码处置、分题型渗透方法、输出约定全部在 `tsec_agent/prompt.py` 的系统提示词里。
+错误码处置、分题型渗透方法、输出约定全部在 `tsec_agent/src/prompt.ts` 的系统提示词里。
 **平台返回 `invalid_state + already finished`（评测截止）= 终态**：agent 立即停掉所有
 worker、清理其容器并正常退出（`run_finish: platform_ended`），绝不重试。
 
@@ -309,7 +310,7 @@ worker、清理其容器并正常退出（`run_finish: platform_ended`），绝�
 | 11 | VPN 联通预检失败（VPN检测未通过,请检查靶场VPN网络配置） |
 | 12 | 冒烟测试失败（模型网关 / shell / 预检） |
 
-agent.py 自身：`0` 正常收尾 / `2` 模型网关不可达 / `3` 达到最大轮次。
+agent.js 自身：`0` 正常收尾 / `2` 模型网关不可达 / `4` 控制器异常。
 
 ## 目录结构
 
@@ -325,15 +326,20 @@ tcbench/
 ├── README.md                      # 本文档
 ├── AGENTS.md                      # AI 协作者须知（架构不变量、改代码前必读）
 ├── task_<id>_vpn_config.ovpn      # 每个 bench 任务下发的 VPN 配置（以最新为准）
-├── tsec_agent/                    # agent 代码（挂载进容器）
-│   ├── agent.py                   # 主循环：LLM 调用 → 工具分发 → 结果回填
-│   ├── shell_tool.py              # 异步 shell（job 管理、截断、超时、进程组 kill）
-│   ├── prompt.py                  # 系统提示词（跑分流程/错误处理/渗透指引）
-│   ├── config.py                  # 配置（全部环境变量可覆盖）
-│   ├── selftest.py                # 离线端到端自测（fake 模型驱动工具循环）
+├── tsec_agent/                    # agent 代码（Node/TS；pnpm build 产出 dist/ 进镜像）
+│   ├── src/agent.ts               # 主循环：LLM 调用 → 工具分发 → 结果回填
+│   ├── src/shell.ts               # 异步 shell（job 管理、截断、超时、进程组 kill、读图）
+│   ├── src/shell_tool.ts          # shell 工具 schema / 参数容错 / 动作路由
+│   ├── src/llm.ts                 # OpenAI 兼容 fetch client、重试、key 发现与热切换
+│   ├── src/bench.ts               # 平台 API 客户端
+│   ├── src/prompt.ts              # 系统提示词（跑分流程/错误处理/渗透指引）
+│   ├── src/records.ts             # bench 记录持久化 + 续跑上下文重建
+│   ├── src/config.ts              # 配置（全部环境变量可覆盖）
+│   ├── src/panel/                 # React 面板（web/ 前端 + server.ts + data.ts）
+│   ├── test/                      # vitest 自测（e2e.test.ts 离线端到端）
 │   └── README.md                  # 快速使用说明
 ├── docker/
-│   ├── Dockerfile                 # Kali + 渗透工具 + openvpn + agent venv
+│   ├── Dockerfile                 # Kali + 渗透工具 + openvpn + 纯 JS agent 产物
 │   ├── entrypoint.sh              # VPN → 预检 → DNS → 冒烟 → 跑分
 │   ├── run.sh                     # 一键启动（挂 runs/<TOKEN>:/work，预建宿主机属主的 openvpn.log）
 │   ├── archive_runs.sh            # 归档记录到 archives/（root 残留用镜像归位属主兜底）
@@ -343,15 +349,15 @@ tcbench/
 │   ├── A-基础与技巧/               # hacktricks、ctf-wiki、payloadsallthethings…（按主题，全文搜）
 │   └── B-漏洞与利用/               # awesome-poc 中文 POC 文章 + nuclei 模板
 │                                   #   （`nuclei-templates/cves.json` = CVE→模板路径 精确索引）
-└── .venv/                         # 宿主机开发用 python 环境（selftest）
+└── tsec_agent/node_modules/        # pnpm 依赖（gitignore 不入库；镜像不带，运行时零第三方依赖）
 ```
 
 ## 测试
 
 ```bash
 cd tsec_agent
-../.venv/bin/python3 selftest.py        # 离线自测（不需要 VPN / 网关），必须 PASS
-../.venv/bin/python3 agent.py --smoke   # 需要 VPN 已连 + 网关可达
+pnpm install && pnpm test         # 离线自测（50 个 vitest 用例，不需要 VPN / 网关），必须全绿
+node dist/agent.js --smoke        # 需要 VPN 已连 + 网关可达（先 pnpm build）
 ```
 
 ## 故障排查

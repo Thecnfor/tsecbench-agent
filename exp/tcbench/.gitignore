@@ -10,6 +10,10 @@ docker/runs/
 docker/archives/
 tsec_agent/agent.log
 tsec_agent/trace.*
+# TS 工具链：依赖与构建产物不入库（dist 由 pnpm build 现场产出）
+tsec_agent/node_modules/
+tsec_agent/dist/
+tsec_agent/tasks
 agent.tar.gz
 *.tar.gz
 __pycache__/

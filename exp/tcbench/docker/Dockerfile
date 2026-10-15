@@ -110,10 +110,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 COPY --from=builder / /
 
-# agent 运行依赖（独立 venv，避免系统 python externally-managed）
-RUN python3 -m venv /opt/agent-venv \
-    && /opt/agent-venv/bin/pip install --no-cache-dir openai requests
-
+# agent 运行时 = 纯 Node（零第三方依赖的 JS 产物，见 tsec_agent/ 的 pnpm build）；
+# 不再需要 Python venv（原 openai SDK 由原生 fetch 替代）。
 WORKDIR /agent
 
 # /work：hosted 托管形态没有 run.sh 挂载，记录目录与 openvpn 日志必须在镜像内预建
@@ -132,7 +130,16 @@ COPY security-knowledge-base /opt/security-knowledge-base
 
 # ── agent 代码（hosted 交付镜像必须自带：官方平台没有 run.sh 去挂载 /agent）──
 #   本地开发不受影响：run.sh 仍 `-v tsec_agent:/agent` 覆盖此层，改代码即时生效。
+#   构建前必须在 tsec_agent/ 下 `pnpm install && pnpm build`（产出 dist/agent.js、
+#   dist/panel-server.js、dist/panel/）——镜像内只有纯 JS 产物，不带 node_modules。
 COPY tsec_agent /agent
-RUN rm -f /agent/agent.log /agent/trace.* && rm -rf /agent/__pycache__ /agent/tasks 2>/dev/null || true
+RUN rm -f /agent/agent.log /agent/trace.* \
+    && rm -rf /agent/tasks /agent/node_modules \
+        /agent/src /agent/test /agent/__pycache__ 2>/dev/null || true \
+    && rm -f /agent/tsconfig.json /agent/vite.config.ts /agent/vite.node.config.ts \
+        /agent/vitest.config.ts /agent/pnpm-workspace.yaml /agent/index.html \
+        /agent/biome.json /agent/biome.jsonc /agent/pnpm-lock.yaml \
+        /agent/package.json 2>/dev/null || true
+RUN node --check /agent/dist/agent.js && node --check /agent/dist/panel-server.js
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

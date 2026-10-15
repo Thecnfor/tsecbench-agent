@@ -19,3 +19,8 @@ tsec_agent/tasks
 **/__pycache__
 **/*.pyc
 **/.DS_Store
+# TS 工具链产物：依赖与缓存不进镜像（镜像只带 pnpm build 的纯 JS 产物 dist/）。
+# 注意 tsec_agent/dist/ **必须留在构建上下文里**（docker save 交付的就是它）——别加排除规则。
+tsec_agent/node_modules
+tsec_agent/.pnpm-store
+**/pnpm-debug.log*

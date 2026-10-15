@@ -185,10 +185,17 @@ else
 fi
 
 # --- 5. 执行传入命令（默认：先冒烟自测，通过后正式跑分） ---
+# agent 是 Node/TS 实现（tsec_agent/ 下 pnpm build 产出 dist/）：容器内只跑纯 JS 产物，
+# 不带 node_modules（运行时零第三方依赖）。dist 缺失时明确报错，不静默回落。
+AGENT_BIN=/agent/dist/agent.js
 if [ $# -eq 0 ]; then
-    if /opt/agent-venv/bin/python3 /agent/agent.py --smoke; then
+    if [ ! -f "$AGENT_BIN" ]; then
+        log "FATAL: $AGENT_BIN not found — 在宿主机 tsec_agent/ 下执行 pnpm install && pnpm build 后重新构建镜像"
+        exit 13
+    fi
+    if node "$AGENT_BIN" --smoke; then
         log "smoke test passed, starting full run"
-        set -- /opt/agent-venv/bin/python3 /agent/agent.py
+        set -- node "$AGENT_BIN"
     else
         log "FATAL: smoke test failed (model gateway / shell / VPN precheck)"
         exit 12

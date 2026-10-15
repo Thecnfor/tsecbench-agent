@@ -6,6 +6,8 @@
 
 腾讯 TSec Benchmark 平台的**自动跑分 agent**：LLM 驱动、只带一个**异步 shell 工具**，
 跑在 **Docker（Kali）** 容器里，端到端完成「VPN 接入 → 拉题 → 渗透 → 提交 flag → close 释放」。
+**实现语言：Node 26 + TypeScript**（pnpm + vite + vitest；面板 React + Node 服务）——
+运行时零第三方依赖（LLM 调用用原生 fetch），镜像只带 `pnpm build` 的纯 JS 产物。
 
 **任务背景（重要）**：
 - 平台要求**每个 bench 在 10 分钟内接入**，节奏上要「快启动、快出分、快释放」。
@@ -42,10 +44,10 @@
   `.tsecbench.gw` 结尾（托管转写形态）→ 0 网络直判 hosted（本地原始 `https://` 不误触发）；
   ② 探测 local `/models` 可达（需本地 key）→ local，否则探测 hosted（两次机会）→ hosted；
   ③ 都失败时**无本地 key → hosted**（镜像内无 `.env`）、有 key → local 由冒烟报错。
-  实现见 `config.py: detect_mode()`；命令行 `agent.py --mode local|hosted` 可覆盖。
+  实现见 `src/config.ts: detectMode()`；命令行 `agent.js --mode local|hosted` 可覆盖。
   **entrypoint 兜底**：`NET_RESTRICT=auto` 判公网 AI API 不可达且未显式指定模式时，
   直接导出 `AGENT_MODE=hosted`（防止平台侧设了 DEEPSEEK_API_KEY 后探测抖动误选 local）。
-  **转写规则**（`to_gateway_url`，selftest 断言）：只转写 `https://`，http/IP 字面量原样，
+  **转写规则**（`toGatewayUrl`，selftest 断言）：只转写 `https://`，http/IP 字面量原样，
   `.tsecbench.gw` 幂等；显式 `DEEPSEEK_BASE_URL_HOSTED` 过同一转换。
 - 凭证只放项目根 **`.env`**（`.gitignore` 排除，**严禁提交**）；优先级：真实环境变量 > `.env` > 内置默认。
 - **注入分工**：hosted 托管模式下 `BENCHMARK_TOKEN`/`BENCHMARK_BASE_URL` 由**官方平台自动注入容器**
@@ -62,11 +64,11 @@
      `out_file` 直接落盘到 workdir（被杀不丢，可 `tail`）。
    - 上限：同时在跑 `AGENT_SHELL_MAX_JOBS`（8，满了拒绝新 `run` 并提示先收）；
      硬上限 `AGENT_SHELL_HARD_SEC`（1800s，到点整组 kill，0=永不杀）——**不做 300s 软提醒**。
-   - 进程必须 `start_new_session`（独立进程组），kill 时整组杀，超时由 watcher 线程兜底。
+   - 进程必须独立进程组（Node：`spawn detached:true`；Python 版是 `start_new_session`），kill 时整组杀，超时由 watcher 兜底。
    - **多模态**：`action=view` 把图片以 `image_url` part 作为**工具结果**返回（tool 消息
-     的 content 可以是 parts 列表）；网关拒图时 `_strip_images` 剥掉图片重试一次并把
+     的 content 可以是 parts 列表）；网关拒图时 `stripImages` 剥掉图片重试一次并把
      `CFG.vision_ok` 置 False，本会话后续 view 走文本模式（OCR+元数据）。对话重建时
-     列表型 result 原样还原，**不能 json.dumps 成字符串**。
+     列表型 result 原样还原，**不能 JSON.stringify 成字符串**。
 3. **模型网关双模式**：local=官方 `https://api.deepseek.com/v1`（公网，key 在 `.env`），
    hosted=平台内网转写网关 `http://api.deepseek.com.tsecbench.gw/v1`（**依赖 VPN 内网 DNS，只在容器连上 VPN 后可解析**）。
    默认 `AGENT_MODE=auto` 自动探测切换，见架构不变量前的「运行模式」小节。
@@ -76,12 +78,12 @@
    否则 entrypoint exit 11、agent 直接报「VPN检测未通过,请检查靶场VPN网络配置」并停止。
    不允许用平台地址代替该预检。
 6. **错误处置在提示词里**：`invalid_state`/`duplicate`/`task_not_found` 等平台错误码的处理规则
-   写在 `prompt.py`，与平台规则一一对应，改动前对照 README「平台流程」章节。
-7. **上下文按题隔离（方案 A）+ 分段解题**：平台编排（选题/start/close/名额）由 `agent.py` 控制器 +
-   `bench.py` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solve_task`）。
+   写在 `prompt.ts`，与平台规则一一对应，改动前对照 README「平台流程」章节。
+7. **上下文按题隔离（方案 A）+ 分段解题**：平台编排（选题/start/close/名额）由 `src/agent.ts` 控制器 +
+   `src/bench.ts` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solveTask`）。
    **不要改回单一大上下文**。
    - **每段 `AGENT_TASK_MAX_TURNS`（默认 60）轮到点不判死**：`task_close{outcome:"paused"}`
-     关题释放名额 → 上下文保留（`resume_meta`；需要时由 `records.rebuild_messages` 从
+     关题释放名额 → 上下文保留（`resumeMeta`；需要时由 `records.rebuildMessages` 从
      conversation.jsonl 重建）→ 没有新题可派时才 `start` 续跑（重启靶机），
      续跑在上下文末尾追加 `prompt.RESUME_NOTE`（新 target / 靶机内状态已重置 / workdir 保留 /
      已提交 flag 不丢 / 从上次进度继续）。
@@ -95,7 +97,7 @@
      `AGENT_MAX_FAILURES`（默认 2）次；其余情况一律续跑到通关或平台终态。
      真失败/启动失败计入 `failures` 字典；`attempts` 只用于 attempt 编号与启动失败计数。
    - 暂停、续跑**不消耗**失败次数。
-8. **bench 记录与隔离（records.py）**：
+8. **bench 记录与隔离（src/records.ts）**：
    - 记录目录唯一键 = **token**（`docker/runs/<TOKEN>/`，无时间戳；同 token 重启 append）；
    - **隔离靠挂载边界**：`run.sh` 只挂当前 token 目录为 `/work`——容器内只见当前 bench，
      其他 bench 不在挂载内；**不做 shell 拦截**；旧 bench 由 `docker/archive_runs.sh`
@@ -114,13 +116,13 @@
    - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt,resume}` /
      `task_close{closed_at,duration_sec,outcome,flags}`（`outcome` ∈ `pass`/`fail`/`paused`）；
    - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求
-     （`prompt.py: CLOSING_SUMMARY_PROMPT`：解题思路 / 工具使用困难 / 工具集优化建议），
+     （`src/prompt.ts: CLOSING_SUMMARY_PROMPT`：解题思路 / 工具使用困难 / 工具集优化建议），
      由 deepseek 输出；复盘作为**普通 user/assistant 消息**原样写入同一 conversation.jsonl
      （带 `kind_note: "closing_summary"` 标记，`task_close.summary` 同步存全文），
      未通关的题不复盘；复盘完丢弃 messages（销毁该题 agent 上下文）；
-   - **平台终态立即停止**：`bench.py` 把 `invalid_state + "finished"` 分类为
-     `TaskFinishedError`（评测截止终态）→ `agent.py: platform_ended()` 置全局 `STOP` 事件：
-     调度器/worker（solve_task 每轮检测）/watcher/call_llm 重试全部收敛退出，
+   - **平台终态立即停止**：`src/bench.ts` 把 `invalid_state + "finished"` 分类为
+     `TaskFinishedError`（评测截止终态）→ `src/agent.ts: platformEnded()` 置全局 `STOP` 标志：
+     调度器/worker（solveTask 每轮检测）/watcher/callLlm 重试全部收敛退出，
      join 所有 worker 后尽力 close 其靶场容器，写 `run_finish{reason:"platform_ended"}`
      正常退出（exit 0，容器随之停止）。**禁止把终态当普通网络错误无限重试**；
    - **VPN 运行时守卫**（`VPN_GUARD`，auto=hosted 开/local 关，或 1/0 显式）：调度器周期
@@ -136,15 +138,16 @@
 
 | 路径 | 职责 | 什么时候改 |
 | --- | --- | --- |
-| `tsec_agent/agent.py` | 控制器主循环：选题 → start → `solve_task` 单题上下文 → 校验 → close；LLM 重试 | 加运行控制逻辑 |
-| `tsec_agent/bench.py` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
-| `tsec_agent/shell_tool.py` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parse_tool_arguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
-| `tsec_agent/prompt.py` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
-| `tsec_agent/records.py` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuild_messages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
-| `tsec_agent/panel.py` | 本地观察面板（只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
-| `tsec_agent/config.py` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
-| `tsec_agent/selftest.py` | 离线端到端自测（fake 模型驱动工具循环） | 改动主循环后必须跑 |
-| `docker/Dockerfile` | Kali + 渗透工具 + openvpn + agent venv + 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
+| `tsec_agent/src/agent.ts` | 控制器主循环：选题 → start → `solveTask` 单题上下文 → 校验 → close；LLM 重试、并行调度、`--smoke` | 加运行控制逻辑 |
+| `tsec_agent/src/bench.ts` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
+| `tsec_agent/src/shell.ts` + `shell_tool.ts` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parseToolArguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
+| `tsec_agent/src/llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换 | 网关协议/鉴权变化 |
+| `tsec_agent/src/prompt.ts` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
+| `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuildMessages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
+| `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
+| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
+| `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
+| `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
 | `docker/entrypoint.sh` | 容器入口：VPN → 预检 → DNS → 冒烟 → 跑分 | 接入流程变化 |
 | `docker/run.sh` | 一键启动（选最新 vpn 配置、挂卷、环境变量） | 启动参数变化 |
 | `docker/archive_runs.sh` | 归档记录到 `docker/archives/`（容器 root 残留用镜像归位属主兜底） | 归档行为变化 |
@@ -154,11 +157,29 @@
 ## 常用操作
 
 ```bash
-# 离线自测（改完代码先跑这个，不需要 VPN/网关）
-cd tsec_agent && ../.venv/bin/python3 selftest.py
+# 离线自测（改完代码先跑这个，不需要 VPN/网关；50 个 vitest 用例）
+cd tsec_agent && pnpm install && pnpm test
+
+# 一次性检查：类型检查 + biome lint + 全部测试（提交前自查）
+cd tsec_agent && pnpm check
+
+# 格式化（biome；配置在 biome.jsonc，lineWidth 100 对齐仓库 ruff 口径）
+cd tsec_agent && pnpm fmt       # 自动修复
+cd tsec_agent && pnpm lint      # 只检查
+
+# 类型检查 + 构建 agent 与面板（镜像里只带 dist/ 产物，构建镜像前必须先跑——
+# 镜像构建阶段会 `node --check dist/agent.js` 硬验证，dist 缺失直接构建失败）
+cd tsec_agent && pnpm typecheck && pnpm build
+
+# 观察面板（React；读最新 runs/<TOKEN>，浏览器打开 127.0.0.1:8791）
+cd tsec_agent && pnpm serve
 
 # 构建镜像（上下文 = 项目根，`-f Dockerfile` 指向本目录的 Dockerfile；根 .dockerignore 排除凭证/记录）
 cd docker && newgrp docker -c "docker build -f Dockerfile -t tsec-agent:latest .."
+
+# 导出交付镜像（平台托管模式：docker save 的内容 = 镜像内 /agent/dist 纯 JS 产物，
+# 构建前务必先 pnpm build，否则 save 出去的是旧 dist）
+cd docker && newgrp docker -c "docker save tsec-agent:latest | gzip -1 -c > tsec-agent.tar.gz"
 
 # 启动 + 观察
 cd docker && ./run.sh
@@ -195,9 +216,10 @@ POST {BASE}/openapi/v1/challenges/close?unique_code=X  释放名额（通关/放
 
 ## 改动检查清单
 
-- [ ] `selftest.py` 通过（离线，不依赖外部服务）
-- [ ] `python3 -m py_compile` 通过
-- [ ] `agent.py --smoke` 通过（本地模式不强求 VPN；hosted 模式必须全绿）
+- [ ] `pnpm check` 通过（`tsc --noEmit` + `biome check` + `pnpm test`，离线不依赖外部服务；含 `e2e.test.ts` 端到端）
+- [ ] 改了代码 → **`pnpm build` 后再 build 镜像**（镜像只 COPY `tsec_agent/`，`dist/` 是 gitignore 的构建产物；
+      Dockerfile 里 `node --check /agent/dist/agent.js` 会硬验证，dist 缺失构建直接失败，不会产出坏镜像）
+- [ ] `node dist/agent.js --smoke` 通过（本地模式不强求 VPN；hosted 模式必须全绿）
 - [ ] 凭证只出现在 `.env`（已 gitignore），**没有硬编码进代码/文档/镜像层**
 - [ ] 改了 Dockerfile/entrypoint → 重新 build + `--smoke` 验证
 - [ ] **镜像体积 ≤3GB——口径是 push 上传后的压缩体积**，不是 `docker images` 的原始数字：

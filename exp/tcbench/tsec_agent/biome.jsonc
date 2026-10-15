@@ -1,0 +1,43 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "files": {
+    "includes": ["src/**", "test/**", "*.ts", "*.tsx", "!dist", "!node_modules"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        // 断言在 JSONL 记录层（records/panel）与测试里是常规写法；
+        // 类型安全由 `tsc --noEmit`（strict）把关，biome 负责其余正确性规则。
+        "noNonNullAssertion": "off"
+      },
+      "suspicious": {
+        // 平台 API / conversation.jsonl 的载荷天然松散，逐字段建模收益低；
+        // 关键路径（agent/shell/llm）已用 types.ts 的具体类型。
+        "noExplicitAny": "off"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "trailingCommas": "all",
+      "semicolons": "always"
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}

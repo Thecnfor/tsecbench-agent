@@ -1,0 +1,343 @@
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --blue: #58a6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "PingFang SC", "Noto Sans CJK SC", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+}
+
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 16px 20px 60px;
+}
+
+header {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+  margin-bottom: 16px;
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+h1 {
+  font-size: 20px;
+  margin: 0 0 8px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 20px 0 8px;
+  color: var(--fg);
+}
+
+.count {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.dir {
+  font-size: 12px;
+  margin-top: 6px;
+  word-break: break-all;
+}
+
+.stats {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.stat-value {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.card.task {
+  cursor: pointer;
+}
+
+/* 可点卡片/标题按钮：清掉 button 默认样式，保持块级布局与文字左对齐 */
+button.card.task,
+button.heading-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid var(--border);
+}
+
+button.heading-toggle {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.card.task:hover {
+  border-color: var(--blue);
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.prediction .pred-items {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 13px;
+}
+
+.pred-item.over {
+  color: var(--yellow);
+}
+
+.pred-item.under {
+  color: var(--green);
+}
+
+.good {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.bad {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.live {
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.cmd {
+  color: var(--blue);
+  word-break: break-all;
+}
+
+.flags {
+  margin-left: auto;
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.chip {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 3px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  font-family: inherit;
+}
+
+.chip:hover {
+  border-color: var(--blue);
+}
+
+.chip.pass {
+  border-color: #1f6feb55;
+  color: var(--green);
+}
+
+.chip.fail {
+  border-color: #f8514955;
+  color: var(--red);
+}
+
+.chip.paused {
+  border-color: #d2992255;
+  color: var(--yellow);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 6px 0;
+}
+
+.events {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.event .ts {
+  color: var(--muted);
+}
+
+.err {
+  color: var(--red);
+  background: #f8514915;
+  border: 1px solid #f8514940;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
+/* 详情抽屉 */
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(760px, 95vw);
+  background: var(--card);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 30px #0008;
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+}
+
+.drawer-head {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.drawer-head button {
+  margin-left: auto;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.drawer-body {
+  overflow-y: auto;
+  padding: 10px 16px 40px;
+}
+
+.msg {
+  border-bottom: 1px dashed var(--border);
+  padding: 8px 0;
+}
+
+.msg-head {
+  font-size: 11.5px;
+  color: var(--muted);
+  display: flex;
+  gap: 10px;
+}
+
+.msg-head .kind {
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.kind-system .kind {
+  color: var(--muted);
+}
+
+.kind-user .kind {
+  color: var(--blue);
+}
+
+.kind-assistant .kind {
+  color: var(--green);
+}
+
+.kind-tool .kind {
+  color: var(--yellow);
+}
+
+.kind-note .kind,
+.kind-error .kind {
+  color: var(--red);
+}
+
+.msg pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.msg pre.thinking {
+  color: var(--muted);
+}
+
+.msg pre.output {
+  color: var(--fg);
+}
+
+.msg pre.toolcall {
+  color: var(--blue);
+}
+
+.msg pre.toolresult {
+  color: var(--yellow);
+}
