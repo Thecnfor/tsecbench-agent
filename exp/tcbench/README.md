@@ -25,15 +25,48 @@
 | 模型入口 | 官方 DeepSeek API（公网） | 平台内网转写网关（VPN 内） |
 | 公网访问 | ✅ 可用 | ❌ 不可用，仅平台内网 |
 | 交付形态 | 源码 + `.venv` 直接跑 | **≤3GB 镜像**上传官方平台 |
-| 模型 | `deepseek-flash`（`AGENT_MODEL_LOCAL`） | `deepseek-v4.1-flash-expires-on-0910`（`AGENT_MODEL_HOSTED`） |
+| 模型 | `deepseek-flash`（`AGENT_MODEL_LOCAL`） | `deepseek-flash`（`AGENT_MODEL_HOSTED`，与本地同名，无额外后缀） |
 | 网关 | `https://api.deepseek.com/v1` | `http://api.deepseek.com.tsecbench.gw/v1` |
 | VPN 预检 | 冒烟仅警告（靶场渗透仍需连） | **强制**，不过即退出 |
 
-- **检测逻辑**（默认 `AGENT_MODE=auto`）：探测 local 网关 `/models` 可达 → local；
-  否则探测 hosted 网关 → hosted；都不通回退 local 并由冒烟测试报错。
+- **检测逻辑**（默认 `AGENT_MODE=auto`），三步按序：
+  1. **结构信号（零网络、0.0s）**：平台注入的 `BENCHMARK_BASE_URL` host 以 `.tsecbench.gw`
+     结尾（= 托管注入的转写形态，实测值 `http://tsecbench.zc.tencent.com.tsecbench.gw`）
+     → 直接判 hosted；本地 `.env` 永远是原始 `https://` 形态，不会误触发；
+  2. 探测 local 网关 `/models` 可达（需有本地 key）→ local；否则探测 hosted 网关
+     （两次机会，容忍启动 DNS 抖动）→ hosted；
+  3. 都不通时：**无本地 key → hosted**（托管镜像无 `.env`，local 必然跑不了），
+     有本地 key → local 由冒烟报错。
+- **entrypoint 兜底 hint**：`NET_RESTRICT=auto` 判定公网 AI API 不可达时（= hosted 环境），
+  未显式指定 `AGENT_MODE` 就直接导出 `AGENT_MODE=hosted`——防止在平台侧设了
+  `DEEPSEEK_API_KEY` 的情况下探测抖动误选 local（实测 exit 12）。
+  显式 `AGENT_MODE=local|hosted` 与命令行 `agent.py --mode` 始终优先。
 - **覆盖**：环境变量 `AGENT_MODE=local|hosted`，或命令行 `agent.py --mode hosted`。
 - **托管模式转写网关（官方机制）**：托管环境中大模型 API 一律走转写网关，
   地址转换规则 `https://HOST[/path]` → `http://HOST.tsecbench.gw[/path]`（`config.py: to_gateway_url` 自动转换）。
+  转写严格按官方规则收紧（selftest 有断言）：**只转写 `https://`**（显式给的 `http://`
+  内网/转写地址原样保留）、**IP 字面量不拼后缀**（`10.0.0.5.tsecbench.gw` 解析不了）、
+  已是 `.tsecbench.gw` 的幂等保留；显式 `DEEPSEEK_BASE_URL_HOSTED` 也过同一转换
+  （https 形式自动转写，http/IP 原样）。转写地址同时用于**冒烟与正式调用**（hosted 实测
+  `model gateway OK` 走的就是转写形态）。
+- **托管网关鉴权（实测 2026-10-15）**：本届转写网关把 `Authorization` **透传给上游 DeepSeek**
+  ——401 报文是 DeepSeek 原生格式（`Your api key: ****ench is invalid`）。即托管模式必须使用
+  **真实 DeepSeek key**（平台环境变量 `DEEPSEEK_API_KEY` 注入；镜像内无 `.env`），
+  上届约定的内置 `tsec-bench` 会被上游 401。
+- **key 候选发现（`agent.discover_gateway_key`）**：冒烟（hosted）与运行中 401 都走同一套
+  **候选清单逐个探测**，每个候选一行**掩码**结果日志（只显示尾 4 位，绝不输出完整 key，
+  `BENCHMARK_TOKEN` 同样掩码）+ `events.jsonl: gateway_key_probe`。候选按优先级：
+  1. `anonymous` —— **匿名（不带 Authorization 头）**：openai 3.x 构造拒绝空 key，
+     用占位串过构造 + httpx2 事件钩子在请求发出前剥掉 Authorization（wire 级实测确认）；
+     部分部署网关不透传鉴权、自带平台配额，匿名即可用（实测命中即选中，省自己的 key 额度）；
+  2. `env:DEEPSEEK_API_KEY_HOSTED` —— 显式配置的托管 key；
+  3. `env:BENCHMARK_TOKEN` —— 平台注入凭据，个别部署网关也认；
+  4. `env:DEEPSEEK_API_KEY` —— **真实 key（最后试：用它=烧自己的额度）**；
+  5. `current-config` —— 当前已配置 key（如内置 tsec-bench）兜底。
+  冒烟用 `probe_all=True` 把所有候选探一遍（完整诊断报告）但按优先级选第一个可用；
+  401 热切换停在第一个命中（省请求），且**只热切换一次**防死循环。
+  实测三形态：passthrough 网关逐候选 `rejected(401)` 直到真实 key `OK`；
+  匿名可用网关 `anonymous -> OK` 直接选中；全拒时 `ALL N candidates failed` 明确报错。
   官方白名单供应商（19 家，均可按此规则转换）：
   `api.hunyuan.cloud.tencent.com`、`api.lkeap.cloud.tencent.com`、`tokenhub.tencentmaas.com`、
   `api.deepseek.com`、`dashscope.aliyuncs.com/compatible-mode`、`*.maas.aliyuncs.com`、
@@ -43,12 +76,20 @@
   **换供应商**：只改 `.env` 的 `DEEPSEEK_BASE_URL`（官方地址）+ `AGENT_MODEL`，hosted 地址自动转换。
 - **出站防火墙（docker 层面限网）**：`NET_RESTRICT`（entrypoint，默认 auto：
   探测公网 AI API 可达=local 不限网，不可达=hosted 启用）。启用后容器 netns 内 iptables
-  出站白名单：`lo` 全通、`tun0`（VPN 隧道，覆盖全部转写网关与靶场）全通、VPN 服务器端口
-  （保重连）、平台 API 域名 IP；**其余出站 DROP**（IPv6 一并禁）。只作用于容器网络命名空间。
+  出站白名单：`lo` 全通、`tun0`（VPN 隧道，覆盖全部转写网关与靶场）全通、**DNS
+  （resolv.conf 里的 nameserver，UDP/TCP 53——锁死它等于全容器解析瘫痪，实测教训）**、
+  VPN 服务器端口（保重连）、平台 API 域名 IP、**模型转写网关域名 IP**；**其余出站 DROP**
+  （IPv6 一并禁）。只作用于容器网络命名空间。**两层失败安全（fail-open）**：
+  ① 平台 API 或模型网关域名解析不出 IP 时**不锁网**并打 `FATAL-SAFE`——白名单缺了关键
+  域名还 DROP 全部出站，等于自己造出"容器起得来但题库/模型全不通"；
+  ② **平台不授予 NET_ADMIN**（实测：iptables 报 `Permission denied`）时容器内根本锁不了网
+  → 打一条明确 WARNING 跳过，**绝不打"egress restricted"假成功日志**，限网交由平台网络层。
 - **凭证**：全部写在项目根 `.env`（`.gitignore` 排除、不入库）。
   优先级：真实环境变量 > `.env` > 内置默认。
 - **变量注入分工**：
   - **hosted 托管模式**：`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由**官方平台自动注入容器**，本地不配置、不传；
+    容器无 run.sh、无卷挂载——entrypoint 自建 `/work`，镜像内已含 agent 代码与知识库；
+    若平台经 `VPN_CONFIG` 环境变量下发完整 `.ovpn` 内容，entrypoint 会落盘为 0600 临时文件并照常拨 VPN。
   - **local 本地模式**：`run.sh --env-file .env` 把项目根 `.env` 注入容器（token 只在 `.env` 维护一处）。
 - 两模式代码零差异，只切网关/模型/key——托管模式下系统不能访问公网，
   模型调用走平台内网转写网关；本地模式直接走官方 API。
@@ -66,7 +107,7 @@
 │    4. agent.py --smoke 冒烟 → 通过后正式运行 agent.py              │
 │                                                                   │
 │  agent.py（主循环）                                               │
-│    model: deepseek-v4.1-flash-expires-on-0910                     │
+│    model: deepseek-flash                                             │
 │    gateway: http://api.deepseek.com.tsecbench.gw/v1（OpenAI 兼容）│
 │    tools: 仅 shell（异步 background），无 MCP、无 subagent         │
 │      └─ run: 后台启动返回 job_id（1.5s 快速窗口，可带 wait_sec）     │
@@ -117,6 +158,8 @@ newgrp docker -c "docker logs -f tsec-agent"   # 观察全流程
 
 启动后 entrypoint 自动依次完成：VPN 连接 → 联通预检 → DNS 修复 → 冒烟测试 → 正式跑分。
 任一环节失败容器即退出（exit code 见下表），不会带病跑分。
+冒烟覆盖：模型网关连通、shell 工具、VPN 预检（hosted 强制）、**平台题库可达**
+（hosted 下 `BENCHMARK_TOKEN` 缺失或平台 API 连不上都算失败；拿到业务错误说明网络可达，放行）。
 
 ### 手动调试
 
@@ -156,8 +199,8 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `DEEPSEEK_API_KEY` | 本地模式官方 DeepSeek key | `.env` 中维护 |
 | `AGENT_MODEL_LOCAL` | 本地模式模型 | `deepseek-flash` |
 | `DEEPSEEK_BASE_URL_HOSTED` | **托管模式**内网转写网关 | `http://api.deepseek.com.tsecbench.gw/v1` |
-| `DEEPSEEK_API_KEY_HOSTED` | 托管模式网关鉴权 | `tsec-bench` |
-| `AGENT_MODEL_HOSTED` | 托管模式模型 | `deepseek-v4.1-flash-expires-on-0910` |
+| `DEEPSEEK_API_KEY_HOSTED` | **托管模式**网关鉴权（可不设） | 回落链：显式值 > `DEEPSEEK_API_KEY`（**真实 key，推荐**）> `tsec-bench`（上届约定，本届会被 401） |
+| `AGENT_MODEL_HOSTED` | 托管模式模型 | `deepseek-flash`（与本地同名，无额外后缀） |
 | `AGENT_PROBE_TIMEOUT` | auto 模式探测超时（秒） | `8` |
 | `VPN_GUARD` | 运行时 VPN 守卫 `auto`/`1`/`0`（auto=hosted 开、local 关） | `auto` |
 | `VPN_PROBE_INTERVAL` | VPN 探测间隔秒 | `20` |

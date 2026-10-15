@@ -20,8 +20,33 @@
 - **hosted 托管模式**：最终交付。镜像 **≤3GB** 上传官方平台，**无公网**，
   模型只能走平台内网转写网关（`http://api.deepseek.com.tsecbench.gw/v1`），
   网关域名依赖 VPN 内网 DNS，VPN 预检**强制**（entrypoint exit 11）。
-- **auto（默认）**：探测 local `/models` 可达 → local；否则探测 hosted → hosted；都失败回退 local 由冒烟报错。
+  托管形态**没有 run.sh、没有卷挂载**（交付 = `docker save | gzip` 导出的镜像）：平台只注入
+  `BENCHMARK_TOKEN`/`BENCHMARK_BASE_URL`（注入值可能已是转写形态
+  `http://xxx.tsecbench.gw`；可选 `VPN_CONFIG` 传 .ovpn 全文，entrypoint 落盘 0600 后照常拨）；
+  entrypoint 自建 `/work`，镜像自带 agent 代码。**实测（2026-10-15）平台预检无需容器内拨
+  VPN 即通过（平台网络层已打通），且平台不授予 NET_ADMIN**——锁网（NET_RESTRICT=1）白名单含
+  **DNS**、平台 API、**模型网关** 三类；**iptables 无权限时打一条 WARNING 明确跳过，绝不打
+  "egress restricted" 假成功日志**；关键域名解析不出时 **fail-open 不锁网**（打 FATAL-SAFE）。
+  **模式误判防线**（托管镜像无 .env、无本地 key）：hosted 网关探测 HTTPError 也算可达、
+  探测失败给两次机会、双探测都失败且无本地 key → 兜底判 hosted 由冒烟报错；
+  key 为空时 `make_client` 干净退出码 2，不再抛 openai traceback。
+  **托管网关鉴权（实测）**：本届转写网关**透传 Authorization 给上游 DeepSeek**（401 是
+  DeepSeek 原生报文）→ 托管必须用**真实 DeepSeek key**（平台注入 `DEEPSEEK_API_KEY`）；
+  `HOSTED_API_KEY` 回落链（显式 > DEEPSEEK_API_KEY > tsec-bench）+ **key 候选发现**
+  （`agent.discover_gateway_key`：冒烟/401 共用，候选按优先级
+  **匿名(剥 Authorization 头，httpx2 钩子绕 openai 3.x 空 key 构造限制) → 显式
+  DEEPSEEK_API_KEY_HOSTED → BENCHMARK_TOKEN → 真实 DEEPSEEK_API_KEY(最后，烧自己额度)
+  → current-config 兜底**；每个候选一行掩码日志(只显尾4位)+gateway_key_probe 事件；
+  冒烟 probe_all 全探、热切换停首个命中且只切一次）。
+- **auto（默认）**：三步按序——① **结构信号**：平台注入 `BENCHMARK_BASE_URL` host 以
+  `.tsecbench.gw` 结尾（托管转写形态）→ 0 网络直判 hosted（本地原始 `https://` 不误触发）；
+  ② 探测 local `/models` 可达（需本地 key）→ local，否则探测 hosted（两次机会）→ hosted；
+  ③ 都失败时**无本地 key → hosted**（镜像内无 `.env`）、有 key → local 由冒烟报错。
   实现见 `config.py: detect_mode()`；命令行 `agent.py --mode local|hosted` 可覆盖。
+  **entrypoint 兜底**：`NET_RESTRICT=auto` 判公网 AI API 不可达且未显式指定模式时，
+  直接导出 `AGENT_MODE=hosted`（防止平台侧设了 DEEPSEEK_API_KEY 后探测抖动误选 local）。
+  **转写规则**（`to_gateway_url`，selftest 断言）：只转写 `https://`，http/IP 字面量原样，
+  `.tsecbench.gw` 幂等；显式 `DEEPSEEK_BASE_URL_HOSTED` 过同一转换。
 - 凭证只放项目根 **`.env`**（`.gitignore` 排除，**严禁提交**）；优先级：真实环境变量 > `.env` > 内置默认。
 - **注入分工**：hosted 托管模式下 `BENCHMARK_TOKEN`/`BENCHMARK_BASE_URL` 由**官方平台自动注入容器**
   （本地不配置、不传）；local 本地模式由 `run.sh --env-file .env` 注入——**不要在脚本里硬编码 token**。

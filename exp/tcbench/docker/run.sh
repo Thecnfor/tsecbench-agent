@@ -8,7 +8,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-PROJECT=/home/xsf/Projects/tcbench
+PROJECT="$(cd .. && pwd)"   # 项目根 = docker/ 的上级（不硬编码绝对路径，随目录迁移自动适配）
 ENV_FILE="$PROJECT/.env"
 VPN_CONF="${1:-$(ls -t "$PROJECT"/task_*_vpn_config.ovpn | head -1)}"
 

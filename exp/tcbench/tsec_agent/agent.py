@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TSec Benchmark 自动跑分 agent 主循环。
 
-- 模型：deepseek-v4.1-flash-expires-on-0910（OpenAI 兼容网关）
+- 模型：`deepseek-flash`（OpenAI 兼容网关；local/hosted 同名，hosted 走转写网关）
 - 工具：仅一个 `shell`（异步后台执行），无 MCP、无 subagent。
 - 流程：VPN 预检 → 拉题列表 → 逐题 start/渗透/submit/close → 总结。
 
@@ -78,13 +78,143 @@ def log(msg: str) -> None:
         pass
 
 
+def _client_with_key(key: str, timeout: float | None = None) -> OpenAI:
+    """按 key 构造 client；key=="" 表示匿名（请求不带 Authorization 头）。
+
+    openai SDK（3.x，底层 httpx2）对空 key 的处理：传 "" 会发出 "Bearer " 空串而非
+    不带头——用 httpx2 事件钩子把 Authorization 头整个剥掉，确保真正发出"无凭据"
+    请求（部分转写网关不校验上游 key、自带平台配额）。
+    """
+    kw = dict(base_url=CFG.llm_base_url, timeout=timeout or CFG.request_timeout,
+              max_retries=0)
+    if key:
+        return OpenAI(api_key=key, **kw)
+    import httpx2
+
+    def _strip_auth(request):
+        # openai 3.x 构造时拒绝空 key（Missing credentials）→ 传占位串过构造，
+        # 钩子在请求发出前把 Authorization 头整个剥掉 = wire 上真正无凭据
+        if "Authorization" in request.headers:
+            del request.headers["Authorization"]
+        return request
+
+    # httpx2 的 event_hooks 值必须是列表（httpx 才接受单函数）
+    return OpenAI(api_key="anonymous-placeholder",
+                  http_client=httpx2.Client(event_hooks={"request": [_strip_auth]}), **kw)
+
+
 def make_client() -> OpenAI:
-    return OpenAI(
-        base_url=CFG.llm_base_url,
-        api_key=CFG.llm_api_key,
-        timeout=CFG.request_timeout,
-        max_retries=0,  # 自行控制重试
-    )
+    if not CFG.llm_api_key:
+        if CFG.mode == "hosted":
+            # 托管下 key 可以为空：匿名（无 Authorization）本身就是候选之一，
+            # 由 discover_gateway_key 探测网关是否接受，不再直接退出
+            log("no api key configured; starting with anonymous client (hosted)")
+            return _client_with_key("")
+        # 本地模式无 key：公网 API 必然 401，干净报错退出（退出码 2 = 网关不可达）
+        log(f"FATAL: model gateway credentials missing (mode={CFG.mode}, "
+            f"base_url={CFG.llm_base_url}) — 本地模式需 .env/环境变量 DEEPSEEK_API_KEY；"
+            f"若在托管环境看到此错，说明模式误判为 local，请检查 AGENT_MODE/hosted 网关探测")
+        raise SystemExit(2)
+    return _client_with_key(CFG.llm_api_key)
+
+
+# key 候选发现只完整跑一次；401 热切换也只做一次，避免坏 key 死循环
+_REAUTH_TRIED = False
+_DISCOVERY_DONE = False
+# 全局当前 client：任一线程 401 热切换后，其他线程下一次 call_llm 也用新 client
+#（call_llm 的 client 参数是调用方传入的旧引用，不覆盖它切换就不生效）
+_CURRENT_CLIENT: "OpenAI | None" = None
+
+
+def _key_mask(k: str) -> str:
+    """key 掩码：只显示尾 4 位，绝不输出完整 key（含 BENCHMARK_TOKEN 这类平台凭据）。"""
+    return "****" + k[-4:] if k else "(none)"
+
+
+def _key_candidates(exclude: set[str] | None = None) -> list[tuple[str, str]]:
+    """网关 key 候选清单，按优先级：(标签, key)，key=="" 表示匿名。
+
+    顺序（实测本届转写网关把 Authorization 透传上游 DeepSeek）：
+    1. anonymous —— 匿名探测：部分部署网关自带平台配额、不透传鉴权；
+    2. DEEPSEEK_API_KEY_HOSTED —— 显式配置的托管 key；
+    3. BENCHMARK_TOKEN —— 平台注入的凭据，个别部署网关也认它；
+    4. DEEPSEEK_API_KEY —— 真实 DeepSeek key（**最后**：用它=烧自己的额度）；
+    5. 当前已配置 key（CFG.llm_api_key，如内置 tsec-bench）兜底。
+    标签只带尾 4 位掩码；exclude 用于 401 热切换时跳过刚被拒的 key。
+    """
+    exclude = exclude or set()
+    out: list[tuple[str, str]] = [("anonymous", "")]
+    # seen 只预置 exclude（401 热切换要跳过的 key）；env 槽位按值去重，
+    # 当前 key 若与某 env 值相同则由该槽位覆盖（同一个 key 不探两次），
+    # 否则以 current-config 兜底在最后
+    seen: set[str] = set(exclude)
+    for name in ("DEEPSEEK_API_KEY_HOSTED", "BENCHMARK_TOKEN", "DEEPSEEK_API_KEY"):
+        v = os.environ.get(name, "")
+        if v and v not in seen:
+            seen.add(v)
+            out.append((f"env:{name}({_key_mask(v)})", v))
+    if CFG.llm_api_key and CFG.llm_api_key not in seen:
+        out.append((f"current-config({_key_mask(CFG.llm_api_key)})", CFG.llm_api_key))
+    return out
+
+
+def discover_gateway_key(cause: str = "smoke", exclude: set[str] | None = None,
+                         probe_all: bool = False) -> OpenAI | None:
+    """按候选清单探测网关 key，返回可用 key 的新 client（全败 None）。
+
+    probe_all=False（401 热切换）：命中第一个就停（省请求）；
+    probe_all=True（冒烟诊断）：把所有候选都探一遍，**每个候选一行掩码结果日志**，
+      便于托管日志里一眼看出哪些 key 通/不通；最终仍按候选优先级选第一个可用的。
+    命中即更新 CFG.llm_api_key 并设 _CURRENT_CLIENT，本进程后续调用全走它。
+    """
+    global _DISCOVERY_DONE, _CURRENT_CLIENT
+    cands = _key_candidates(exclude)
+    winner: tuple[str, str] | None = None
+    for label, key in cands:
+        try:
+            probe = _client_with_key(key, timeout=min(CFG.request_timeout, 30))
+            probe.chat.completions.create(
+                model=CFG.model,
+                messages=[{"role": "user", "content": "回复两个字：正常"}],
+                max_tokens=512,  # 推理模型需预留思考 token，太小会 400 造成假阴性
+            )
+            log(f"gateway key probe [{cause}]: {label} -> OK")
+            rec().event("gateway_key_probe", {"cause": cause, "candidate": label,
+                                              "result": "ok"})
+            if winner is None:
+                winner = (label, key)
+                if not probe_all:
+                    break
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            result = f"rejected({status})" if status else f"failed({type(e).__name__})"
+            log(f"gateway key probe [{cause}]: {label} -> {result}")
+            rec().event("gateway_key_probe", {"cause": cause, "candidate": label,
+                                              "result": result})
+    if winner is None:
+        log(f"gateway key probe [{cause}]: ALL {len(cands)} candidates failed — "
+            f"网关拒绝了全部 key/匿名（托管需注入真实 DEEPSEEK_API_KEY）")
+        return None
+    label, key = winner
+    CFG.llm_api_key = key
+    _DISCOVERY_DONE = True
+    _CURRENT_CLIENT = make_client()
+    log(f"gateway key selected [{cause}]: {label} — subsequent calls use it")
+    return _CURRENT_CLIENT
+
+
+def _try_reauth(e: BaseException) -> OpenAI | None:
+    """网关 401（key 被拒）时按候选清单重探测（排除刚失败的 key），命中则热切换。
+
+    实测 2026-10-15：本届转写网关把 Authorization 透传给上游 DeepSeek，内置
+    "tsec-bench" 被上游 401（"Your api key: ****ench is invalid"）。
+    命中即更新 CFG.llm_api_key/_CURRENT_CLIENT，全局生效；只试一次防死循环。
+    """
+    global _REAUTH_TRIED
+    if _REAUTH_TRIED or getattr(e, "status_code", None) != 401:
+        return None
+    _REAUTH_TRIED = True
+    return discover_gateway_key("reauth", exclude={CFG.llm_api_key})
 
 
 def call_llm(client: OpenAI, messages: list, use_tools: bool = True) -> object:
@@ -98,6 +228,9 @@ def call_llm(client: OpenAI, messages: list, use_tools: bool = True) -> object:
     """
     delay = 2.0
     attempt = 0
+    global _CURRENT_CLIENT
+    if _CURRENT_CLIENT is not None:
+        client = _CURRENT_CLIENT  # 其他线程已热切换过 key，本调用跟随
     while True:
         if STOP.is_set():
             raise RuntimeError("stopped: platform ended")
@@ -113,9 +246,18 @@ def call_llm(client: OpenAI, messages: list, use_tools: bool = True) -> object:
                 kwargs["tool_choice"] = "auto"
             return client.chat.completions.create(**kwargs)
         except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
+            # 401 热切换：转写网关透传 key 给上游，内置 key 被拒时按候选 key 试并重试本轮
+            new_client = _try_reauth(e)
+            if new_client is not None:
+                client = _CURRENT_CLIENT = new_client
+                continue
             # 4xx 认证/参数错误（除 429 限流）重试无意义 → 立即失败
             status = getattr(e, "status_code", None)
             if status is not None and 400 <= status < 500 and status != 429:
+                if status == 401 and CFG.mode == "hosted":
+                    log("LLM fatal auth error (401): 转写网关拒绝了所有候选 key——"
+                        "托管模式需在平台环境变量 DEEPSEEK_API_KEY 注入**真实 DeepSeek key**"
+                        "（内置 tsec-bench 是上届约定，本届网关透传上游鉴权，会被 401）")
                 log(f"LLM fatal client error ({status}): {e}")
                 raise
             # 网络类错误：按模式决定
@@ -210,20 +352,49 @@ def start_platform_watcher(interval: float = 20.0) -> None:
 
 
 def smoke_test(client: OpenAI) -> int:
-    """验证：网关连通、模型可用、shell 工具可用、VPN 预检。"""
+    """验证：网关连通、模型可用、shell 工具可用、VPN 预检、平台题库可达。"""
     ok = True
 
-    # 1. 模型网关
-    try:
-        r = client.chat.completions.create(
-            model=CFG.model,
-            messages=[{"role": "user", "content": "回复两个字：正常"}],
-            max_tokens=512,  # 推理模型（deepseek-flash）需预留思考 token
-        )
-        log(f"model gateway OK: {r.choices[0].message.content!r}")
-    except Exception as e:
-        log(f"model gateway FAILED: {type(e).__name__}: {e}")
-        ok = False
+    # 1. 模型网关（hosted：先跑 key 候选发现——匿名/显式/平台token/真实key 逐个探测，
+    #    每个候选一行掩码结果日志；命中者即本会话使用的 key。local：直连官方 API，
+    #    失败时 401 热切换兜底）
+    if CFG.mode == "hosted":
+        nc = discover_gateway_key("smoke", probe_all=True)
+        if nc is not None:
+            client = nc
+            log(f"model gateway OK (key selected; see key probe lines above), "
+                f"active key={_key_mask(CFG.llm_api_key)}")
+        else:
+            log("model gateway FAILED: 网关拒绝了全部 key 候选——托管需在平台环境变量 "
+                "DEEPSEEK_API_KEY 注入**真实 DeepSeek key**（内置 tsec-bench 是上届约定，"
+                "本届转写网关透传上游鉴权；匿名也被拒说明网关强制鉴权）")
+            ok = False
+    else:
+        try:
+            r = client.chat.completions.create(
+                model=CFG.model,
+                messages=[{"role": "user", "content": "回复两个字：正常"}],
+                max_tokens=512,  # 推理模型（deepseek-flash）需预留思考 token
+            )
+            log(f"model gateway OK: {r.choices[0].message.content!r}")
+        except Exception as e:
+            # 401 热切换：按候选清单重探测（排除当前 key）并重试
+            nc = _try_reauth(e)
+            if nc is not None:
+                try:
+                    r = nc.chat.completions.create(
+                        model=CFG.model,
+                        messages=[{"role": "user", "content": "回复两个字：正常"}],
+                        max_tokens=512,
+                    )
+                    log(f"model gateway OK (after key switch): "
+                        f"{r.choices[0].message.content!r}")
+                except Exception as e2:
+                    log(f"model gateway FAILED (after key switch): {type(e2).__name__}: {e2}")
+                    ok = False
+            else:
+                log(f"model gateway FAILED: {type(e).__name__}: {e}")
+                ok = False
 
     # 2. shell 工具
     out = dispatch_shell({"action": "run", "command": "echo shell-ok && uname -m", "wait_ms": 3000})
@@ -248,6 +419,32 @@ def smoke_test(client: OpenAI) -> int:
         # 本地模式：模型走公网，VPN 仅靶场渗透需要；开发调试可未连
         log(f"VPN precheck not OK (local mode, non-fatal for smoke; "
             f"run.sh/entrypoint enforces it before full runs): {out.splitlines()[0] if out else 'empty'}")
+
+    # 4. 平台题库可达性：任何 HTTP 响应（含 4xx 业务错误）都算网络可达；
+    #    只有连接/DNS/超时失败才是"题库没访问"。曾因冒烟不测平台 API，
+    #    hosted 锁网漏放行平台域名时容器看似正常、实则调度器无限重试不出分。
+    if CFG.benchmark_token:
+        try:
+            items = bench.fetch_challenges()
+            log(f"platform API OK: {len(items)} challenges visible")
+        except bench.TaskFinishedError:
+            log("platform API reachable (task already finished)")
+        except bench.PlatformError as e:
+            # 拿到业务错误（token 失效/状态不对）= 网络层可达，冒烟放行，正式运行再按错误码处置
+            log(f"platform API reachable (business error at smoke, non-fatal): {e}")
+        except Exception as e:
+            if CFG.mode == "hosted":
+                log(f"platform API UNREACHABLE (hosted, fatal): {type(e).__name__}: {e}")
+                ok = False
+            else:
+                log(f"platform API unreachable (local mode, non-fatal for smoke): "
+                    f"{type(e).__name__}: {e}")
+    elif CFG.mode == "hosted":
+        log("BENCHMARK_TOKEN empty in hosted mode — platform should inject it; "
+            "题库请求将全部 401/404，检查平台注入")
+        ok = False
+    else:
+        log("BENCHMARK_TOKEN empty (local mode, non-fatal for smoke)")
 
     return 0 if ok else 1
 

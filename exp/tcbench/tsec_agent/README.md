@@ -1,7 +1,7 @@
 # TSec Benchmark Agent
 
 用 Python + OpenAI 兼容 SDK 实现的自动跑分 agent，运行于 **Docker（Kali Linux）** 容器内：
-- 模型：`deepseek-v4.1-flash-expires-on-0910`（网关 `http://api.deepseek.com.tsecbench.gw/v1`）
+- 模型：`deepseek-flash`（网关 `http://api.deepseek.com.tsecbench.gw/v1`）
 - 工具：仅一个 **异步 shell**（后台执行 + job 轮询），无 MCP、无 subagent
 - 容器内预装渗透工具：nmap、masscan、whatweb、sqlmap、gobuster、ffuf、nikto、dirb、hydra、netcat、python3(含 requests) 等
 - VPN 由容器入口脚本在**容器网络命名空间**内连接（对宿主机网络零影响），agent 只做预检
@@ -40,7 +40,7 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `BENCHMARK_BASE_URL` | 平台地址 | `https://tsecbench.zc.tencent.com` |
 | `DEEPSEEK_BASE_URL` | 模型网关 | `http://api.deepseek.com.tsecbench.gw/v1` |
 | `DEEPSEEK_API_KEY` | 网关鉴权 | `tsec-bench` |
-| `AGENT_MODEL` | 模型名 | `deepseek-v4.1-flash-expires-on-0910` |
+| `AGENT_MODEL` | 模型名 | `deepseek-flash` |
 | `AGENT_MAX_TURNS` | 最大 LLM 轮次 | 400 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |

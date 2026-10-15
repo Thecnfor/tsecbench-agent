@@ -116,6 +116,9 @@ RUN python3 -m venv /opt/agent-venv \
 
 WORKDIR /agent
 
+# /work：hosted 托管形态没有 run.sh 挂载，记录目录与 openvpn 日志必须在镜像内预建
+RUN mkdir -p /work
+
 # 入口：容器内连 VPN（只作用于容器网络命名空间，不碰宿主机网络）→
 # 等待预检通过 → 处理内网 DNS → 执行 agent
 # 构建上下文 = **项目根**（在 docker/ 下执行 `docker build ..`，凭证/记录由根 .dockerignore 排除）

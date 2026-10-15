@@ -152,6 +152,12 @@ def main() -> int:
     import tempfile
     from config import CFG
     os.environ.setdefault("AGENT_MODE", "local")
+    # .env 泄漏隔离：config.py 在 import 时加载项目根 .env，其中 AGENT_TASKS/
+    # AGENT_TASK_FILTER 会把自测的假题 t-01/t-02 过滤掉（本地 .env 一设就红）。
+    # 自测必须与宿主 .env 无关，这里强制清空选题相关变量。
+    for _k in ("AGENT_TASKS", "AGENT_TASK_FILTER", "AGENT_TASKS_FILE"):
+        os.environ.pop(_k, None)
+    CFG.tasks = ""
     CFG.resolve()  # 填充 model/base_url（离线自测不真实连接）
 
     # 记录目录隔离到临时目录（模拟 /work）
@@ -389,6 +395,148 @@ def main() -> int:
     assert args.get("action") == "shell" and fix is None, (args, fix)
     err = dispatch_shell(dict(args))
     assert err.startswith("error: unknown action") and "action" in err, err
+
+    # ---- 模式判定与转写（hosted 自动检测的核心，全离线断言）----
+    import config as _cfg
+    # to_gateway_url：官方规则 https→.tsecbench.gw；http/IP/已转写 一律原样
+    assert _cfg.to_gateway_url("https://api.deepseek.com/v1") == \
+        "http://api.deepseek.com.tsecbench.gw/v1", "https 转写失败"
+    assert _cfg.to_gateway_url("https://dashscope.aliyuncs.com/compatible-mode/v1") == \
+        "http://dashscope.aliyuncs.com.tsecbench.gw/compatible-mode/v1", "带路径转写失败"
+    assert _cfg.to_gateway_url("http://api.deepseek.com.tsecbench.gw/v1") == \
+        "http://api.deepseek.com.tsecbench.gw/v1", "已转写应幂等"
+    assert _cfg.to_gateway_url("http://10.0.0.5:8080/v1") == "http://10.0.0.5:8080/v1", \
+        "http 内网地址不能被转写"
+    assert _cfg.to_gateway_url("https://10.0.0.5/v1") == "https://10.0.0.5/v1", \
+        "IP 字面量不能拼 .tsecbench.gw"
+    # 结构信号：托管注入转写形态 → hosted；本地原始形态 → 不触发
+    # hosted 模型名与本地同名（实测：托管也是 flash，上届 v4.1/expires 后缀不再使用）
+    assert "expires-on" not in _cfg.HOSTED_MODEL, \
+        f"hosted 模型名不该带上届 expires-on 后缀: {_cfg.HOSTED_MODEL}"
+    _old_bench = os.environ.get("BENCHMARK_BASE_URL")
+    os.environ["BENCHMARK_BASE_URL"] = "http://tsecbench.zc.tencent.com.tsecbench.gw"
+    assert _cfg._bench_looks_hosted(), "转写形态 bench URL 应触发 hosted 信号"
+    os.environ["BENCHMARK_BASE_URL"] = "https://tsecbench.zc.tencent.com"
+    assert not _cfg._bench_looks_hosted(), "原始形态 bench URL 不该触发 hosted 信号"
+    os.environ["BENCHMARK_BASE_URL"] = "https://10.0.0.5:8443"  # IP+端口也不能误触发
+    assert not _cfg._bench_looks_hosted(), "IP bench URL 不该触发 hosted 信号"
+    if _old_bench is None:
+        os.environ.pop("BENCHMARK_BASE_URL", None)
+    else:
+        os.environ["BENCHMARK_BASE_URL"] = _old_bench
+    # 结构信号在无网络时也能直接判 hosted（AGENT_MODE=auto，探测全部失败也不带偏）
+    _old_mode = os.environ.get("AGENT_MODE")
+    os.environ.pop("AGENT_MODE", None)
+    os.environ["BENCHMARK_BASE_URL"] = "http://tsecbench.zc.tencent.com.tsecbench.gw"
+    assert _cfg.detect_mode() == "hosted", "结构信号应无网络直判 hosted"
+    # 统一还原
+    if _old_mode is None:
+        os.environ.pop("AGENT_MODE", None)
+    else:
+        os.environ["AGENT_MODE"] = _old_mode
+    if _old_bench is None:
+        os.environ.pop("BENCHMARK_BASE_URL", None)
+    else:
+        os.environ["BENCHMARK_BASE_URL"] = _old_bench
+    print("  ok: 模式判定（结构信号/转写规则/IP 与 http 保护）")
+
+    # ---- hosted key 候选发现 + 401 热切换（离线：假 OpenAI，匿名被拒、真 key 放行）----
+    from types import SimpleNamespace as _SN
+    import config
+    assert config.HOSTED_API_KEY, "hosted key 不该为空（回落链：显式 > 本地 key > tsec-bench）"
+    _old_key, _old_mode2 = agent.CFG.llm_api_key, agent.CFG.mode
+    _old_reauth = agent._REAUTH_TRIED
+    _old_disc = agent._DISCOVERY_DONE
+    agent.CFG.mode = "hosted"
+    agent.CFG.llm_api_key = "tsec-bench"
+    agent._REAUTH_TRIED = False
+    agent._DISCOVERY_DONE = False
+    agent._CURRENT_CLIENT = None
+    os.environ["DEEPSEEK_API_KEY"] = "real-key-1234"
+
+    # 候选清单：匿名在前、真实 key 在后、当前 key 兜底；标签只带尾4位掩码
+    cands = agent._key_candidates()
+    assert cands[0] == ("anonymous", ""), cands[0]
+    labels = [c[0] for c in cands]
+    assert any("DEEPSEEK_API_KEY" in l for l in labels), labels
+    # 当前 key（tsec-bench）应出现在清单里；若与某 env 值相同则按值去重并入该槽位
+    assert "tsec-bench" in [k for _, k in cands], f"当前配置应在候选里: {cands}"
+    # 独一无二的当前 key（不与 env 重复时）以 current-config 兜底在最后
+    _cur_only = agent.CFG.llm_api_key
+    agent.CFG.llm_api_key = "unique-current-key-xyz"
+    c3 = agent._key_candidates()
+    assert c3[-1] == ("current-config(****-xyz)", "unique-current-key-xyz"), c3[-1]
+    agent.CFG.llm_api_key = _cur_only
+    assert all("real-key-1234" not in l and "tsec-bench" not in l for l in labels), \
+        f"候选标签泄露完整 key: {labels}"
+    # exclude：401 热切换时跳过刚被拒的 key
+    c2 = agent._key_candidates(exclude={"tsec-bench"})
+    assert all(k != "tsec-bench" for _, k in c2), c2
+    assert agent._key_mask("real-key-1234") == "****1234"
+    assert agent._key_mask("") == "(none)"
+    print("  ok: key 候选清单（匿名优先/掩码/exclude）")
+
+    # 假网关：匿名和 tsec-bench 被 401，BENCHMARK_TOKEN/DEEPSEEK_API_KEY 视 key 放行
+    class _Err(Exception):
+        status_code = 401
+
+    _PROBE_LOG: list[str] = []
+
+    class _FakeCompletions:
+        def __init__(self, accept_key):
+            self.accept_key = accept_key
+
+        def create(self, **kwargs):
+            # 凭构造时的 api_key 判定（匿名走 http_client 钩子路径，api_key 是占位串）
+            if self.accept_key != "real-key-1234":
+                raise _Err("Authentication Fails, Your api key is invalid")
+            return _SN(choices=[_SN(message=_SN(content="正常", role="assistant"))])
+
+    def _fake_openai(base_url=None, api_key=None, timeout=None, max_retries=None,
+                     http_client=None):
+        # 匿名路径 api_key 是占位串（真实 wire 上被 httpx2 钩子剥掉）
+        _PROBE_LOG.append("<anonymous>" if api_key == "anonymous-placeholder"
+                          else (api_key or "<none>"))
+        return _SN(chat=_SN(completions=_FakeCompletions(api_key)))
+
+    _orig_openai = agent.OpenAI
+    agent.OpenAI = _fake_openai
+    try:
+        # probe_all：全部候选都探一遍（匿名/显式/token 被拒，真实 key OK），按优先级选中
+        nc = agent.discover_gateway_key("selftest", probe_all=True)
+        assert nc is not None, "discover 应命中 DEEPSEEK_API_KEY"
+        assert agent.CFG.llm_api_key == "real-key-1234", agent.CFG.llm_api_key
+        assert agent._CURRENT_CLIENT is not None
+        assert "<anonymous>" in _PROBE_LOG, "匿名候选应被探测"
+        # 401 热切换：排除当前 key 后其余全被拒 → None，且保持已验证 key 不变
+        agent._REAUTH_TRIED = False
+        nc2 = agent._try_reauth(_Err())
+        assert nc2 is None, "排除当前 key 后其余候选应全被拒"
+        assert agent.CFG.llm_api_key == "real-key-1234", "失败时不该改 key"
+        # 只热切换一次（防死循环）：_REAUTH_TRIED 置位后直接 None
+        agent._REAUTH_TRIED = True
+        assert agent._try_reauth(_Err()) is None, "_REAUTH_TRIED 置位后不该再探测"
+        # 全候选被拒 → None（不动 CFG）
+        agent.CFG.llm_api_key = "tsec-bench"
+        agent._REAUTH_TRIED = False
+        agent._DISCOVERY_DONE = False
+        agent.OpenAI = lambda **kw: _SN(chat=_SN(completions=_FakeCompletions("never")))
+        assert agent.discover_gateway_key("selftest-allfail") is None, "全候选被拒应 None"
+        assert agent.CFG.llm_api_key == "tsec-bench", "失败时不该改 key"
+        # 非 401 不触发
+        agent._REAUTH_TRIED = False
+        assert agent._try_reauth(Exception("connection reset")) is None
+        assert not agent._REAUTH_TRIED, "非 401 不该置位 _REAUTH_TRIED"
+        # 匿名 client 构造：真发无 Authorization 请求（httpx2 钩子路径不抛即可）
+        anon = agent._client_with_key("")
+        assert anon is not None, "匿名 client 应能构造（openai 3.x/httpx2）"
+    finally:
+        agent.OpenAI = _orig_openai
+        agent.CFG.llm_api_key, agent.CFG.mode = _old_key, _old_mode2
+        agent._REAUTH_TRIED = _old_reauth
+        agent._DISCOVERY_DONE = _old_disc
+        agent._CURRENT_CLIENT = None
+    print("  ok: key 候选发现（匿名探测/probe_all/全拒/非401/热切换）")
 
     shutil.rmtree(recdir, ignore_errors=True)
     print("PASS: controller + per-task context + persistent records end-to-end OK")
