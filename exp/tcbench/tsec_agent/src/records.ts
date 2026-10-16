@@ -152,7 +152,7 @@ export function rebuildMessages(
   return recordsToMessages(filtered);
 }
 
-/** 纯函数：记录列表 → 消息序列（role 映射 + 孤儿过滤 + 尾部配对裁剪）。 */
+/** 纯函数：记录列表 → 消息序列（role 映射 + 孤儿过滤 + 配对校验）。 */
 function recordsToMessages(recs: ConvRecord[]): ChatMessage[] {
   const msgs: ChatMessage[] = [];
   const pending = new Set<string>(); // 已发出、尚未收到结果的 tool_call id
@@ -195,22 +195,9 @@ function recordsToMessages(recs: ConvRecord[]): ChatMessage[] {
     }
   }
 
-  // 尾部一致性：最后一个带 tool_calls 的 assistant，其调用必须全部有结果
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === "assistant" && msgs[i].tool_calls?.length) {
-      const ids = new Set(msgs[i].tool_calls!.map((t) => t.id));
-      const got = new Set(
-        msgs
-          .slice(i + 1)
-          .filter((m) => m.role === "tool")
-          .map((m) => m.tool_call_id),
-      );
-      let ok = true;
-      for (const id of ids) if (!got.has(id)) ok = false;
-      if (!ok) msgs.splice(i);
-      break;
-    }
-  }
+  // 严格配对校验（DeepSeek 400 防御）：见 enforceToolPairing——
+  // arena 实测多写者交错文件的中段孤儿 assistant 漏过尾部裁剪 → 400 abandoned。
+  enforceToolPairing(msgs);
   if (!msgs.length || msgs[0].role !== "system") return [];
   return msgs;
 }
@@ -331,23 +318,36 @@ function recordsToMessagesLoose(recs: ConvRecord[]): ChatMessage[] {
       msgs.push({ role: "tool", tool_call_id: tid, content });
     }
   }
-  // 尾部配对裁剪（同 recordsToMessages）
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === "assistant" && msgs[i].tool_calls?.length) {
-      const ids = new Set(msgs[i].tool_calls!.map((t) => t.id));
-      const got = new Set(
-        msgs
-          .slice(i + 1)
-          .filter((m) => m.role === "tool")
-          .map((m) => m.tool_call_id),
-      );
-      let ok = true;
-      for (const id of ids) if (!got.has(id)) ok = false;
-      if (!ok) msgs.splice(i);
+  // 严格配对校验（同 recordsToMessages，防 400）
+  enforceToolPairing(msgs);
+  return msgs;
+}
+
+/** assistant(tool_calls) 后必须紧跟覆盖全部 id 的 tool 结果，否则从该 assistant 截断。
+ * 多写者交错落盘/半截段重建的防御（arena 实测中段孤儿 → DeepSeek 400）。 */
+function enforceToolPairing(msgs: ChatMessage[]): void {
+  let i = 0;
+  while (i < msgs.length) {
+    const m = msgs[i];
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      const ids = new Set(m.tool_calls.map((t) => t.id));
+      let j = i + 1;
+      while (j < msgs.length && msgs[j].role === "tool" && ids.delete(msgs[j].tool_call_id ?? "")) {
+        j++;
+      }
+      if (ids.size > 0) {
+        msgs.splice(i); // 结果不齐/中间夹了非 tool → 从这里截断
+        break;
+      }
+      i = j;
+      continue;
+    }
+    if (m.role === "tool") {
+      msgs.splice(i); // 孤儿 tool 结果（防御：pending 过滤后不应出现）
       break;
     }
+    i++;
   }
-  return msgs;
 }
 
 /** 当前 bench 的记录门面。 */

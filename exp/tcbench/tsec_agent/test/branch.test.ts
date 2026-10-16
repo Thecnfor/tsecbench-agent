@@ -491,4 +491,40 @@ describe("records 分支重建", () => {
     const msgs = rebuildMessages(file);
     expect(msgs.length).toBe(2); // 半截 assistant 与孤儿 tool 都被裁掉
   });
+
+  it("中段孤儿 assistant（tool_calls 无结果、其后还有别的消息）截断后续（防 400）", () => {
+    // arena 事故形态：多写者交错/半截段重建 → 中段出现"有 tool_calls 无紧跟结果"的
+    // assistant，旧逻辑只裁尾部 → 漏过去发给 DeepSeek → 400 abandoned。
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mid_orphan_"));
+    const file = path.join(dir, "conversation.jsonl");
+    const recs = [
+      { ts: "t", seq: 1, code: "x", kind: "system", content: "sys", branch: 0 },
+      { ts: "t", seq: 2, code: "x", kind: "user", content: "card", branch: 0 },
+      {
+        ts: "t",
+        seq: 3,
+        code: "x",
+        kind: "assistant",
+        branch: 0,
+        tool_calls: [{ id: "cx", name: "shell", arguments: "{}" }], // 结果缺失（中段孤儿）
+      },
+      // 其后还有完整配对的正常轮次（旧逻辑会保留它们，导致 cx 悬空 → 400）
+      {
+        ts: "t",
+        seq: 4,
+        code: "x",
+        kind: "assistant",
+        branch: 0,
+        output: "继续",
+        tool_calls: [{ id: "cy", name: "shell", arguments: "{}" }],
+      },
+      { ts: "t", seq: 5, code: "x", kind: "tool", branch: 0, tool_call_id: "cy", result: "ok" },
+      { ts: "t", seq: 6, code: "x", kind: "assistant", branch: 0, output: "总结" },
+    ];
+    fs.writeFileSync(file, recs.map((r) => JSON.stringify(r)).join("\n"));
+    const msgs = rebuildMessages(file);
+    // 从孤儿 assistant（seq 3）截断：只剩 sys + card
+    expect(msgs.length).toBe(2);
+    expect(msgs.at(-1)?.content).toBe("card");
+  });
 });

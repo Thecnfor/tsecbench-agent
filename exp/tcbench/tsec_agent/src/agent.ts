@@ -1180,7 +1180,7 @@ async function runParallel(
       const cc = c.unique_code;
       if (cc === selfCode || c.is_completed) continue;
       if (!taskSelected(cc, taskFilter)) continue;
-      if (cc in running || results[cc] === "pass") continue;
+      if (running.has(cc) || results[cc] === "pass") continue;
       if ((failures[cc] ?? 0) >= Math.max(CFG.max_failures, 1)) continue;
       return true;
     }
@@ -1195,7 +1195,7 @@ async function runParallel(
       const cc = c.unique_code;
       if (cc === selfCode || c.is_completed) return false;
       if (!taskSelected(cc, taskFilter)) return false;
-      if (cc in running || results[cc] === "pass") return false;
+      if (running.has(cc) || results[cc] === "pass") return false;
       if ((failures[cc] ?? 0) >= maxFail) return false;
       return cls(c) === "short";
     });
@@ -1585,7 +1585,7 @@ async function runParallel(
     // 候选：未通关、不在跑、未超真失败上限、在题目选择范围内
     const eligible = (c: Challenge): boolean => {
       if (c.is_completed) return false;
-      if (c.unique_code in running) return false;
+      if (running.has(c.unique_code)) return false; // Map 去重：必须用 has（in 检查属性，对 Map 恒 false）
       if (results[c.unique_code] === "pass") return false;
       if ((failures[c.unique_code] ?? 0) >= Math.max(CFG.max_failures, 1)) return false;
       return taskSelected(c.unique_code, taskFilter);
