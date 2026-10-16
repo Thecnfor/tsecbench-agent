@@ -516,7 +516,11 @@ export class ShellManager {
       const data = fs.readFileSync(job.outPath);
       if (offset === null || offset === undefined) {
         const want = Math.max(1, Math.min(Math.trunc(lines ?? 200), 2000));
-        const start = Math.max(0, total - Math.max(want * 160, 8192));
+        // 字节窗必须受 shell_max_output 约束（曾硬编码 want*160 → lines=200 时
+        // 32KB 单页绕过截断，arena 实测 32711 字符单条进上下文）；
+        // offset 分页分支本就走 CFG，此处对齐——行语义保留（窗内仍按 lines 取尾）。
+        const win = Math.min(Math.max(want * 160, 8192), CFG.shell_max_output);
+        const start = Math.max(0, total - win);
         const chunk = data.subarray(start);
         const txt = chunk.toString("utf8").split("\n");
         const page = txt.slice(Math.max(0, txt.length - want)).join("\n");
@@ -547,9 +551,14 @@ export class ShellManager {
       state = `running elapsed=${elapsed.toFixed(1)}s (hard limit ${Math.trunc(job.timeout ?? 0)}s)`;
     }
     const [page, nxt, more] = this.readPage(job, offset, lines);
+    // cmd 防撑爆：header 里的命令全文是提示语（原命令在 assistant.tool_calls 有完整记录），
+    // 超长脚本（数百行 for 循环实测 4KB+）会把单条返回顶穿截断预算 → 截 600。
+    const cmd =
+      job.command.length > 600
+        ? `${job.command.slice(0, 600)} …[命令超长已截，全文见 tool_calls]`
+        : job.command;
     const header =
-      `[job ${job.jobId}] ${state} out=${job.size()}B\n` +
-      `log: ${job.outPath}\ncmd: ${job.command}`;
+      `[job ${job.jobId}] ${state} out=${job.size()}B\n` + `log: ${job.outPath}\ncmd: ${cmd}`;
     if (!page) return `${header}\noutput: (empty)`;
     const pos = offset !== null && offset !== undefined ? `from_offset=${offset}` : "tail";
     const tail = `\nnext_offset=${nxt}${more ? ` ${more}` : ""}`;

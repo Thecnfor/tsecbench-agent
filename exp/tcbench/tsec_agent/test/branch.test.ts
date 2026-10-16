@@ -265,7 +265,6 @@ describe("旁观者信号与输入", () => {
       recentCmds: [] as string[],
       segElapsedSec: 0,
       segBudgetSec: 600,
-      coreThisSegment: true,
     };
     expect(evaluateStall(base).count).toBe(0);
     // 只停滞 → 1
@@ -278,17 +277,24 @@ describe("旁观者信号与输入", () => {
     });
     expect(two.count).toBe(2);
     expect(two.repeat).toBe(true);
-    // 预算过半 + 零核心事件 → 第三信号
+    // 预算信号 = 段过半 && 距上次核心事件也超半段（旧「段内零事件」会被首卡作废）
     const three = evaluateStall({
       ...base,
       sinceCoreSec: 301,
       segElapsedSec: 301,
-      coreThisSegment: false,
       recentCmds: ["a", "a", "a"],
     });
     expect(three.count).toBe(3);
-    // 只预算信号（未过停滞阈值、无重复）→ 1
-    expect(evaluateStall({ ...base, segElapsedSec: 301, coreThisSegment: false }).count).toBe(1);
+    // 段过半但半段内刚记过卡（sinceCore=240 < 半段 300）→ 预算不成立，且未过停滞阈值
+    // ——证伪「只段过半就触发」，证明新语义看的是距核心事件的窗口
+    expect(evaluateStall({ ...base, sinceCoreSec: 240, segElapsedSec: 400 }).count).toBe(0);
+    // 段首记过卡（旧语义下预算信号永假的回归）：段过半 + 半段无卡 → 预算成立
+    const afterFirstCard = evaluateStall({
+      ...base,
+      sinceCoreSec: 301,
+      segElapsedSec: 400,
+    });
+    expect(afterFirstCard.budget).toBe(true);
   });
 
   it("buildBystanderInput 组装完整要素", () => {

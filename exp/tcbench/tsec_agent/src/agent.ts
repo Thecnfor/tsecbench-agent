@@ -584,7 +584,6 @@ export async function solveTask(
           recentCmds: b.recentCmds,
           segElapsedSec: t - segStartTs,
           segBudgetSec: budgetSec,
-          coreThisSegment: b.lastCoreTs > segStartTs,
         }).count >= 2,
     );
     if (!stalled.length) return;
@@ -597,7 +596,6 @@ export async function solveTask(
       recentCmds: target.recentCmds,
       segElapsedSec: t - segStartTs,
       segBudgetSec: budgetSec,
-      coreThisSegment: target.lastCoreTs > segStartTs,
     });
     const entries = corelog ? readCorelog(corelog.path) : [];
     const input = buildBystanderInput({
@@ -878,7 +876,8 @@ export async function solveTask(
         const n =
           result +
           `\n[系统提醒·核心日志] 已连续 ${br.roundsSinceCore} 轮无 core_log：` +
-          `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）或已证伪的路径，` +
+          `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）、已证伪的路径、` +
+          `或新开/切换的探索方向（方向卡），` +
           `请立即 core_log 一张证据卡再继续——黑板空白会被判定停滞（分支回收、旁观者无从插手）。`;
         result = n;
         br.nudgesUsed++;

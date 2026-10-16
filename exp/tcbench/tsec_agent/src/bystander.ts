@@ -33,24 +33,25 @@ export interface StallSignals {
   count: number; // 成立数（≥2 触发）
 }
 
-/** 三信号评估（任二成立）。纯函数，可离线单测。 */
+/** 三信号评估（任二成立）。纯函数，可离线单测。
+ * budget 语义（2026-01-16 修正）：段过半 + **距上次核心事件也超半段**——
+ * 旧条件「段内零核心事件」会被段首的一张卡永久作废（arena 实测：08:00 记首卡后
+ * 旁观者整段失明 15+ 分钟，nudge 额度同时耗尽）。 */
 export function evaluateStall(input: {
   sinceCoreSec: number; // 距上次 core_log/flag 的秒数
   stallSec: number; // 阈值（短题/长题分档）
   recentCmds: string[]; // 分支近期命令（已归一化）
   segElapsedSec: number;
   segBudgetSec: number;
-  coreThisSegment: boolean;
 }): StallSignals {
   const stall = input.sinceCoreSec >= input.stallSec;
   const counts = new Map<string, number>();
   for (const c of input.recentCmds) counts.set(c, (counts.get(c) ?? 0) + 1);
   let repeat = false;
   for (const n of counts.values()) if (n >= 3) repeat = true;
+  const half = input.segBudgetSec * 0.5;
   const budget =
-    input.segBudgetSec > 0 &&
-    input.segElapsedSec >= input.segBudgetSec * 0.5 &&
-    !input.coreThisSegment;
+    input.segBudgetSec > 0 && input.segElapsedSec >= half && input.sinceCoreSec >= half;
   const count = [stall, repeat, budget].filter(Boolean).length;
   return { stall, repeat, budget, count };
 }

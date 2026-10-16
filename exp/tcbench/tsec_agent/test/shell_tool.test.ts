@@ -152,3 +152,25 @@ describe("多模态 action=view", () => {
     expect((last.content as any[])[1].type).toBe("image_url");
   });
 });
+
+describe("分页读取受 shell_max_output 约束（arena 旁路 bug 回归）", () => {
+  it("lines 大窗拉取不绕过截断（曾硬编码 want*160 → 单条 32KB 进上下文）", async () => {
+    // 长行大输出（每行 150 字符 × 4000 = 600KB；lines=200 尾读即 ~30KB——
+    // 与 arena 实测 32711 字符单条同形态；seq 短行会掩盖窗口 bug）
+    const out = await SHELL.run({
+      command: `python3 -c "print(('x'*150+'\\n')*4000)"`,
+      wait_ms: 8000,
+    });
+    const jid = jobIdOf(String(out));
+    expect(jid).toBeTruthy();
+    const page = SHELL.status(jid, undefined, 200); // lines=200：修复前返回 ~32KB
+    const text = String(page);
+    // header + 截断输出 + tail 的总预算受约束（给 header/cmd/tail 留余量）
+    expect(text.length).toBeLessThan(9500);
+    expect(text).toContain(`job ${jid}`);
+    // offset 分页仍工作（修复未破坏既有语义）
+    const p2 = String(SHELL.status(jid, 100, 10));
+    expect(p2).toContain("from_offset=100");
+    await SHELL.kill(jid);
+  });
+});
