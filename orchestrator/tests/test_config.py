@@ -109,3 +109,28 @@ def test_ingest_result_has_no_public_token_in_report(tmp_path):
     result = resolve_ingest(environ=dict(BASE_ENV))
     assert result.report.token_found is True
     assert result.token == TOKEN  # token 只在 L0 返回值
+
+
+class TestHarnessV2Flag:
+    """v2 特性开关：模块级读 env（v2 总闸，默认 off，旁路零回归）。"""
+
+    def test_default_off(self, monkeypatch):
+        monkeypatch.delenv("HARNESS_V2", raising=False)
+        from orchestrator.config import HARNESS_V2
+
+        assert HARNESS_V2 is False
+
+    def test_on(self, monkeypatch):
+        import importlib
+
+        from orchestrator import config
+
+        monkeypatch.setenv("HARNESS_V2", "on")
+        importlib.reload(config)
+        try:
+            assert config.HARNESS_V2 is True
+        finally:
+            # reload 回默认态，避免污染其他测试看到的模块级常量
+            monkeypatch.delenv("HARNESS_V2", raising=False)
+            importlib.reload(config)
+            assert config.HARNESS_V2 is False

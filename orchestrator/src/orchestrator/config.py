@@ -65,6 +65,18 @@ def build_solver_env(
     return env
 
 
+def _bool(key: str, default: bool) -> bool:
+    """v2 特性开关解析（HARNESS_V2 总闸）：1/on/true/yes 视为开，默认 off。"""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "on", "true", "yes")
+
+
+# v2 控制面总闸（模块级读 env，供后续 v2 模块 import 判断；默认 off = 旁路零回归）
+HARNESS_V2 = _bool("HARNESS_V2", False)
+
+
 @dataclass(slots=True)
 class RuntimeConfig:
     """启动期一次性解析产物；之后全项目只读它。"""
