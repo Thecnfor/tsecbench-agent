@@ -31,8 +31,6 @@ def build_summary(task: dict) -> str:
         parts.append("description: " + str(task["description"])[:1500])
     if task.get("targets"):
         parts.append("targets: " + json.dumps(task["targets"], ensure_ascii=False))
-    if task.get("hint"):
-        parts.append("hint: " + str(task["hint"])[:500])
     prior = task.get("prior") or {}
     for key in ("assets", "explored", "open_leads"):
         items = prior.get(key) or []

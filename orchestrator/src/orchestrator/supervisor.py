@@ -48,7 +48,6 @@ def prepare_workspace(
     *,
     attempt: int,
     prior: dict | None = None,
-    hint: str | None = None,
     sops: list[str] | None = None,
     repair_note: str | None = None,
 ) -> Path:
@@ -65,7 +64,6 @@ def prepare_workspace(
         "correct_flag_count": rec.correct_flag_count,
         "targets": list(rec.container_addr),
         "flag_pattern": None,  # 平台不提供；从 description 推断或靠通用正则兜底
-        "hint": hint,
         "attempt": attempt,
         "prior": prior or {"assets": [], "explored": [], "open_leads": []},
         # harness-v2 注入位（solver 侧缺失时不使用，向后兼容）：

@@ -56,7 +56,7 @@ Docker镜像(限制3G)
 | **ARTEX** | **只读架构，不进镜像、不引用代码** —— AGPL-3.0 + 强制 PostgreSQL + **原仓库已从 GitHub 下架**（CrowdStrike 报告点名后的时间线高度吻合） | [architecture.md](architecture.md) §10.2 |
 | 体积 | **压缩后 ~1.88GB**（原 1.41GB）。**头号风险：3GB 若指解压后则直接超标**，已备好降级阶梯 | [image-spec.md](image-spec.md) §4、§4.1 |
 | API 限速 | **默认自我限速 ≤3 req/s**（上届规则，本届未提但必须防）；新增 `403` 关卡门与 `429` 的防御性分支 | [platform-api.md](platform-api.md) §4.11–4.13 |
-| hint 扣分默认值 | **按 10% 设初值**（上届两处口径一致；本届 `hint_cost_radio` 读不到） | [platform-api.md](platform-api.md) §4.7 |
+| hint | **不取 hint**（链路整体删除）—— 成本不可知（`hint_cost_radio` 读不到）+ 实测 10 次仅 1 次换出解出 | [platform-api.md](platform-api.md) §4.7 |
 | **合规红线** | `refs/` 与两届获奖队素材**绝不进镜像**，也不把上届题解喂进 prompt —— 平台按作弊处置且全程审计 | [architecture.md](architecture.md) §10.4、[image-spec.md](image-spec.md) §6 |
 | 大模型 | **DeepSeek**（`api.deepseek.com`，OpenAI 兼容 `/v1`） | [platform-api.md](platform-api.md) §4 |
 | **Jev（10-10 决策：完全排除）** | **不落地任何 Jev 代码**：核查结论是「产品真实（勘误 §11.2）但托管不可达 + 本地收益未验证」，用户决策**完全排除** —— 判定层不建、零新增依赖、零新增环境变量；相关落地项（原 A20、原 B14、runbook/image-spec 的 Jev 条目）已全部撤回 | [architecture.md](architecture.md) §12 |

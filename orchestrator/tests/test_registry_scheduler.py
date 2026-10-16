@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from orchestrator.registry import ChallengeRecord, Registry
-from orchestrator.scheduler import can_start, eligible, plan_phase, priority_key
+from orchestrator.scheduler import (
+    can_start,
+    eligible,
+    plan_phase,
+    priority_key,
+    slice_for,
+    slice_weight,
+)
 
 
 def row(code: str, **kw) -> dict:
@@ -89,6 +96,19 @@ def test_priority_easy_high_value_first():
     assert order == ["easy100", "easy50", "hard"]
 
 
+def test_priority_easy_not_starved_by_medium():
+    """回归：easy 100 分必须排在 medium 300 分之前。
+
+    原 cost（easy 1.0）下 easy100 性价比 100 < medium300 的 150，实测导致 6 道
+    easy 送分题整轮从未被启动 —— 先易后难的纪律被成本模型反噬。"""
+    records = {
+        "easy100": rec("easy100", difficulty="easy", total_score=100, flag_count=1),
+        "medium300": rec("medium300", difficulty="medium", total_score=300, flag_count=1),
+    }
+    order = [r.unique_code for r in eligible(records)]
+    assert order == ["easy100", "medium300"]
+
+
 def test_priority_level_and_difficulty_tiebreak():
     """性价比相同时 level 升序，再 easy → hard。"""
     records = {
@@ -119,9 +139,37 @@ def test_concurrency_gate():
 
 
 def test_plan_phase1_slice_clamped():
-    """TOTAL=3600，6 题：phase1 预算 1620s，每题片 270s（在 120~1200 内）。"""
+    """TOTAL=3600，6 题，并发 3：phase1 预算 1620s × 3 并发 / 6 题 = 810s/题。
+
+    并发系数是关键：`预算 / 题数` 算的是串行墙钟，实际 3 路并发同时烧预算，
+    每题可用墙钟是它的 3 倍。漏掉系数会把片压到地板（实测 63 题全被压到 300s）。"""
     plan = plan_phase(elapsed_s=0, total_s=3600, reserve_s=600, n_eligible=6)
-    assert (plan.phase, round(plan.slice_s), plan.finalize) == (1, 270, False)
+    assert (plan.phase, round(plan.slice_s), plan.finalize) == (1, 810, False)
+
+
+def test_plan_phase1_scales_with_concurrency():
+    """并发越高，每题墙钟片越长（同一份预算摊给同样多的题）。"""
+    lo = plan_phase(elapsed_s=0, total_s=3600, reserve_s=600, n_eligible=20, concurrency=1)
+    hi = plan_phase(elapsed_s=0, total_s=3600, reserve_s=600, n_eligible=20, concurrency=3)
+    assert hi.slice_s > lo.slice_s
+
+
+# ---- 分数加权（§4.3 修订）----
+def test_slice_weight_orders_by_remaining_score():
+    """高分题权重更大；1800 分题不拿 6 倍（sqrt 缩放 + 上限 2.5）。"""
+    low = rec("low", difficulty="easy", total_score=100, flag_count=1)
+    mid = rec("mid", difficulty="medium", total_score=300, flag_count=1)
+    high = rec("high", difficulty="medium", total_score=1200, flag_count=4)
+    huge = rec("huge", difficulty="hard", total_score=1800, flag_count=6)
+    assert slice_weight(low) < slice_weight(mid) < slice_weight(high) <= slice_weight(huge)
+    assert slice_weight(huge) <= 2.5  # 上限，避免吃光预算
+
+
+def test_slice_for_clamps_to_bounds():
+    big = rec("big", difficulty="hard", total_score=1800, flag_count=6)
+    assert slice_for(big, 3000.0, slice_min_s=120, slice_max_s=1800) == 1800
+    small = rec("small", difficulty="easy", total_score=100, flag_count=1)
+    assert slice_for(small, 1.0, slice_min_s=120, slice_max_s=1800) == 120
 
 
 def test_plan_phase1_slice_floored_at_min():

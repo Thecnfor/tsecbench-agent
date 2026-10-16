@@ -17,7 +17,6 @@ import pytest
 from mock_server.server import make_server
 from mock_server.state import ChallengeSpec
 from orchestrator.config import RuntimeConfig
-from orchestrator.journal import Journal
 from orchestrator.main import run_agent
 
 TOKEN = "mock-token"
@@ -52,6 +51,9 @@ elif mode == "attempt2":
         print("no idea yet (attempt 1)", flush=True)
 elif mode == "nothing":
     print("no idea", flush=True)
+elif mode == "hang":
+    print("grinding, no flag yet", flush=True)
+    time.sleep(999)
 # 总是写 result.json（编排器不信任它）
 status = "solved" if mode == "ok" else "unknown"
 (ws / "out" / "result.json").write_text(json.dumps({"status": status}))
@@ -89,7 +91,6 @@ def make_config(total_s=120, reserve=5, concurrency=3) -> RuntimeConfig:
         reserve_seconds=reserve,
         concurrency_limit=concurrency,
         api_max_qps=50.0,
-        hint_cost_threshold=0.1,
         slice_min_s=2,  # e2e 用极短时间片，让超时杀/多轮重试在秒级发生
         slice_max_s=6,
     )
@@ -103,7 +104,6 @@ def run(
     *,
     env=None,
     journal_path=None,
-    initial_hints=None,
 ):
     return asyncio.run(
         run_agent(
@@ -113,7 +113,6 @@ def run(
             config=config,
             workspace=tmp_path / "ws",
             journal_path=journal_path or (tmp_path / "journal.jsonl"),
-            initial_hints=initial_hints,
             env=env,
             qps=50.0,
             poll_interval_s=0.1,
@@ -246,8 +245,10 @@ def test_level_gate_lock_and_unlock(env_factory, tmp_path):
     assert summary["awarded"] == 200
 
 
-# ---- 8. hint 路径：零 flag → 取 hint → 第二轮解出 ----
-def test_hint_taken_then_solved(env_factory, tmp_path):
+# ---- 8. 零 flag → 不取 hint，靠重试第二轮解出 ----
+def test_zero_flag_retry_without_hint(env_factory, tmp_path):
+    """旧 Hint Broker 的触发场景（完整时间片 + 零 flag + 预算够）现在走普通重试：
+    第二轮换策略解出，且**从不**触碰 hint 路由。"""
     base, state, solver = env_factory([ChallengeSpec("c1", flags=["FLAG{late}"])])
     journal_path = tmp_path / "journal.jsonl"
     summary = run(
@@ -259,20 +260,44 @@ def test_hint_taken_then_solved(env_factory, tmp_path):
         journal_path=journal_path,
     )
     assert summary["awarded"] == 100
-    assert "c1" in state.hint_viewed  # 确实取过 hint
+    assert state.hint_viewed == set()  # 绊线：编排器一次都没打 hint 接口
     events = [
         json.loads(ln)["event"] for ln in journal_path.read_text(encoding="utf-8").splitlines()
     ]
-    assert "hint" in events
+    assert "hint" not in events
+    assert "HINT_RETRY" not in summary["per_challenge"]["c1"]["state"]
 
 
-# ---- 9. 崩溃恢复：Journal 记过 hint → 重启不重复取 ----
-def test_crash_recovery_no_double_hint(env_factory, tmp_path):
+# ---- 9b. 零 flag 超时 → EVOSTER 修复（widen）必须触发 ----
+def test_zero_flag_timeout_triggers_repair(env_factory, tmp_path):
+    """回归：零 flag 超时此前被 Hint Broker 分支提前 return 短路，`choose_repair`
+    从未执行（实测整轮 `repair` 事件数 = 0，widen 形同虚设）。删掉 hint 后必须
+    回到「超时 → 换姿势重投」，且第二次尝试拿到加长的时间片。"""
     base, state, solver = env_factory([ChallengeSpec("c1", flags=["FLAG{never}"])])
     journal_path = tmp_path / "journal.jsonl"
-    j = Journal(journal_path)
-    j.append_hint("c1", attempt=1)  # 上次运行已取过
-    j.close()
+    summary = run(
+        base,
+        solver,
+        tmp_path,
+        make_config(total_s=60, reserve=3),
+        env=fake_env("FLAG{never}", mode="hang"),
+        journal_path=journal_path,
+    )
+    assert summary["awarded"] == 0
+    events = [json.loads(ln) for ln in journal_path.read_text(encoding="utf-8").splitlines()]
+    repairs = [e for e in events if e.get("event") == "repair"]
+    assert repairs, "超时后必须走 EVOSTER 修复（此前恒为空）"
+    assert repairs[0]["action"] == "widen"  # 平票走固定优先序，widen 优先
+    durs = [e["duration_s"] for e in events if e.get("event") == "solver_done"]
+    assert len(durs) == 2 and durs[1] > durs[0]  # 第二轮时间片被 widen 放大
+
+
+# ---- 9. 绊线：整轮跑完绝不命中 hint 路由 ----
+def test_never_calls_hint_endpoint(env_factory, tmp_path):
+    """零 flag + 超时 + 预算充足 —— 旧实现必取 hint 的场景。删掉 hint 链路后，
+    平台侧（mock）的 hint 路由必须一次都不被命中，这是防复发的回归防线。"""
+    base, state, solver = env_factory([ChallengeSpec("c1", flags=["FLAG{never}"])])
+    journal_path = tmp_path / "journal.jsonl"
     summary = run(
         base,
         solver,
@@ -282,8 +307,7 @@ def test_crash_recovery_no_double_hint(env_factory, tmp_path):
         journal_path=journal_path,
     )
     assert summary["awarded"] == 0
-    # 平台侧从未收到 hint 请求 —— Journal 恢复生效
-    assert "c1" not in state.hint_viewed
+    assert state.hint_viewed == set()  # 平台侧从未收到 hint 请求
 
 
 # ---- 10. 极短 TOTAL：收尾保护 ----

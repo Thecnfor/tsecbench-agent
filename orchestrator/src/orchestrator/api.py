@@ -1,12 +1,15 @@
 """Platform API Client —— 平台 API 的唯一出口（architecture.md §3/§5.1）。
 
-5 个接口（platform-api.md §2）+ 全局令牌桶 + 重试 + 错误码分派。
+4 个接口（platform-api.md §2，**不含 hint**）+ 全局令牌桶 + 重试 + 错误码分派。
+
+hint 接口被主动删除（见 §4.4）：扣分不可逆且本届读不到 `hint_cost_radio`，
+实测 10 次取 hint 只有 1 次换来解出 —— 期望收益为负，整个调用面从代码里拿掉，
+不给「随手取一下」留任何入口。
 
 错误分派按**接口**而非按错误码（platform-api.md §4.5 三义性）：
   - 404 task_not_found                     → TaskEnded（致命，全局停机）
   - 404 challenge_not_found                → ChallengeGone（剔除该题）
   - 409 invalid_state @ start              → StartFull（腾位置重试）
-  - 409 invalid_state @ hint               → HintCompleted（标记该题通关）
   - 409 invalid_state @ 其他               → TaskEnded（任务结束，全局停机）
   - 409 duplicate @ submit                 → Duplicate（不算失败）
   - 403（本届未列出，防御性）              → LevelLocked（移入 LOCKED）
@@ -55,10 +58,6 @@ class ChallengeGone(ApiError):
 
 class StartFull(ApiError):
     """409 invalid_state @ start —— 活跃数达上限，腾位置重试。"""
-
-
-class HintCompleted(ApiError):
-    """409 invalid_state @ hint —— 该题已通关。"""
 
 
 class Duplicate(ApiError):
@@ -163,8 +162,6 @@ class PlatformClient:
                     # 三义性按接口分派（platform-api.md §4.5）
                     if method == "POST" and path.endswith("/start"):
                         raise StartFull("409 invalid_state @ start: active limit reached")
-                    if method == "GET" and path.endswith("/hint"):
-                        raise HintCompleted("409 invalid_state @ hint: already completed")
                     raise TaskEnded(f"409 invalid_state (task ended): {payload}")
                 raise RetryableError(f"409 unexpected code {code!r}")
             if status == 429:
@@ -204,7 +201,7 @@ class PlatformClient:
     async def _sleep(self, base: float) -> None:
         await asyncio.sleep(base + random.uniform(0, self.jitter))  # noqa: S311 - 仅抖动
 
-    # ---- 5 个接口（platform-api.md §2）---------------------------------------
+    # ---- 4 个接口（platform-api.md §2）---------------------------------------
     async def list_challenges(self) -> list[dict]:
         data = await self._request("GET", "/openapi/v1/challenges")
         return data  # type: ignore[no-any-return]
@@ -214,12 +211,6 @@ class PlatformClient:
             "POST", "/openapi/v1/challenges/start", query=f"unique_code={quote_plus(unique_code)}"
         )
         return data  # type: ignore[return-value]
-
-    async def hint(self, unique_code: str) -> str:
-        data = await self._request(
-            "GET", "/openapi/v1/challenges/hint", query=f"unique_code={quote_plus(unique_code)}"
-        )
-        return data["hint"]  # type: ignore[index,no-any-return]
 
     async def submit(self, unique_code: str, flag: str) -> dict:
         data = await self._request(

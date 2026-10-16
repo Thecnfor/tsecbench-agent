@@ -33,6 +33,18 @@ SLICE_MAX_S ?= 1800
 run:
 	set -a; . ./solver/.env; set +a; SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) $(UV) run python -m orchestrator
 
+## rerun: 快速调试循环 —— 停掉在跑的编排器与 solver，后台重启（日志 /tmp/tsec-run.log）
+## 注意：改 solver/ 下的代码本就实时生效（每题新起子进程），改完无需重启；
+## 只有改 orchestrator/ 才需要这个（进程启动即把代码载入内存）。
+## 重启走崩溃恢复：journal + 平台对账续跑，已解出的题不会丢。
+rerun:
+	-@pkill -f '[s]olver/main\.py' 2>/dev/null
+	-@pkill -f 'python -m [o]rchestrator' 2>/dev/null
+	@sleep 1
+	@set -a; . ./solver/.env; set +a; \
+	 SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) nohup $(UV) run python -m orchestrator >> /tmp/tsec-run.log 2>&1 & \
+	 echo "orchestrator restarted -> tail -f /tmp/tsec-run.log  (journal: workspaces/journal.jsonl)"
+
 ## mock: 启动平台 mock server（runbook.md §4.1，只绑 loopback）
 mock:
 	$(UV) run python -m mock_server

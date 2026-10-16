@@ -11,16 +11,45 @@ from dataclasses import dataclass
 from .registry import ChallengeRecord
 
 DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2}
-# 预估成本映射（§4.2 性价比的分母）：难度为主，level 加权
-_DIFF_COST = {"easy": 1.0, "medium": 2.0, "hard": 4.0}
+# 预估成本映射（§4.2 性价比的分母）：难度为主，level 加权。
+# easy 从 1.0 降到 0.6（§4.2 修订）：原值下 easy 100 分的性价比（100）低于
+# medium 300（150）与 hard 500（125），实测 63 题里 6 道 easy 送分题（共 600 分）
+# 排到队尾、整轮从未启动。easy 题接近必解，按「每分每秒的期望得分」应当先做。
+_DIFF_COST = {"easy": 0.6, "medium": 2.0, "hard": 4.0}
 
 PHASE1_BUDGET_RATIO = 0.45  # Phase 1 广撒网占总时限比例（§4.3）
 SLICE_MIN_S = 120
 SLICE_MAX_S = 1200
 
+# 时间片按剩余分数加权（§4.3 修订）：多阶段高分题（b-01 1200 / b-02 1800）
+# 与 200 分单题拿同样的片，实测 300s 下必死 —— 用 sqrt 缩放，避免 1800 分题
+# 拿到 6 倍片把预算吃光。
+SCORE_REF = 300.0  # 加权基准分：300 分题权重 = 1.0
+WEIGHT_FLOOR = 0.7
+WEIGHT_CEIL = 2.5
+
 
 def estimated_cost(rec: ChallengeRecord) -> float:
     return _DIFF_COST.get(rec.difficulty, 2.0) * (1.0 + 0.1 * max(0, rec.level - 1))
+
+
+def slice_weight(rec: ChallengeRecord) -> float:
+    """按剩余分数给时间片加权（sqrt 缩放 + 上下夹）。"""
+    if rec.remaining_score <= 0:
+        return WEIGHT_FLOOR
+    weight = (rec.remaining_score / SCORE_REF) ** 0.5
+    return max(WEIGHT_FLOOR, min(WEIGHT_CEIL, weight))
+
+
+def slice_for(
+    rec: ChallengeRecord,
+    base_slice: float,
+    *,
+    slice_min_s: float = SLICE_MIN_S,
+    slice_max_s: float = SLICE_MAX_S,
+) -> float:
+    """把 phase 基础片按该题分数加权，夹回 [min, max]。"""
+    return max(slice_min_s, min(slice_max_s, base_slice * slice_weight(rec)))
 
 
 def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
@@ -67,25 +96,32 @@ def plan_phase(
     remaining_score: float = 0.0,
     slice_min_s: float = SLICE_MIN_S,
     slice_max_s: float = SLICE_MAX_S,
+    concurrency: int = 3,
 ) -> PhasePlan:
     """两阶段预算与收尾保护（§4.3）。
 
     - 剩余 < RESERVE → finalize（停止启动新题、杀 solver、强制提交与 close）；
-    - elapsed < 0.45×TOTAL → Phase 1，每题时间片 = 0.45×TOTAL / 题数（夹在上下限）；
+    - elapsed < 0.45×TOTAL → Phase 1，每题时间片 = 预算 × 并发 / 题数（夹在上下限）；
     - 之后 Phase 2，剩余预算按进展度重投（这里给一个统一的大时间片）。
+
+    **并发系数是必须的**（§4.3 修订）：`预算 / 题数` 算的是「串行墙钟」，
+    但同一时刻有 `concurrency` 个 solver 在跑，每题实际可用墙钟是其 `concurrency` 倍。
+    漏掉这个系数会让每题少拿 3 倍片 —— 实测把 63 题的片全压到 300s 地板，
+    23 次超时里一大半是「差一点」被砍死的。
     """
     remaining = total_s - elapsed_s
     if remaining <= reserve_s:
         return PhasePlan(phase=2, slice_s=0.0, finalize=True)
+    conc = max(1, concurrency)
     phase1_total = PHASE1_BUDGET_RATIO * total_s
     if elapsed_s < phase1_total and n_eligible > 0:
-        slice_s = max(slice_min_s, min(slice_max_s, phase1_total / n_eligible))
+        slice_s = max(slice_min_s, min(slice_max_s, phase1_total * conc / n_eligible))
         # Phase 1 末尾预留过渡：时间片不得超过 phase1 剩余
         slice_s = min(slice_s, max(slice_min_s, phase1_total - elapsed_s))
         return PhasePlan(phase=1, slice_s=slice_s, finalize=False)
     # Phase 2：剩余预算摊给还有剩余分数的题；无剩余分数给最小片
     remaining_budget = remaining - reserve_s
-    slice_s = max(slice_min_s, min(slice_max_s * 2, remaining_budget / max(1, n_eligible)))
+    slice_s = max(slice_min_s, min(slice_max_s * 2, remaining_budget * conc / max(1, n_eligible)))
     if remaining_score <= 0:
         slice_s = slice_min_s
     return PhasePlan(phase=2, slice_s=slice_s, finalize=False)

@@ -10,6 +10,7 @@ TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.14）+ Go recorder 
 - `make lint` 两关都要过：`ruff check` + `ruff format --check`；`make fmt` 一键修复两者。无 CI、无 pre-commit，提交前自查就是 `make lint && make test`
 - `make check`：快速接入自检（`scripts/check_access.py`，只读探测平台 API，零副作用）
 - `make run`：本地评测起编排器。**有真实副作用**（会 start 题目、消耗任务时限、真 LLM 调用）—— 冒烟验证用 `make check`，别随手 run；`make run` 会 source `solver/.env` 取 LLM key（key 只存在那里，gitignored）
+- `make rerun`：快速调试循环 —— 停掉在跑的编排器 + solver 并后台重启（日志 `/tmp/tsec-run.log`）。**solver 代码改动本就实时生效**（每题新起子进程，直接读仓库源码），只有改 `orchestrator/` 才需要重启；重启走崩溃恢复（journal + 平台对账），已解出的题不丢
 - `make mock`：平台 mock，绑 `127.0.0.1:8787`，`MOCK_*` 环境变量控制限频/关卡门/故障注入（行为契约见 `runbook.md §4.1`）
 - Go：`cd recorder && go build ./cmd/recorder`（零第三方依赖，无 go.sum）；Node：`cd mcp && npm ci && npm run build`（跳过 `npm ci` 会 `tsc: not found`）
 - 镜像：`make image`（= `docker build -f docker/Dockerfile`）；`make build-recorder` / `make build-mcp` 只验证对应阶段。**`docker/Dockerfile` 是骨架**，runtime 阶段工具清单还是 TODO

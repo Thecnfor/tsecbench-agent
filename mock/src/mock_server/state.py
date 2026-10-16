@@ -4,8 +4,9 @@
 - 题面（含 flag 真值、故障注入序列）可由 `MOCK_CHALLENGES_JSON` 指定的 JSON 文件注入，
   便于单测与 e2e 构造任意场景；默认内置 4 题。
 - 对外 API 形状严格按本届文档（platform-api.md §5）：裸 JSON、`unique_code`、
-  `BENCHMARK_TOKEN` 头；**故意不提供** `hint_cost_radio` / `hint_viewed`，
-  让编排器在 mock 阶段就习惯「hint 状态只能自己记」。
+  `BENCHMARK_TOKEN` 头；**故意不提供** `hint_cost_radio` / `hint_viewed`（与本届真平台同形）。
+  hint 路由保留但**本项目不调用**（platform-api §4.7）—— 它现在是绊线：编排器整轮
+  跑下来若命中它即视为回归，靠 `hint_viewed` 断言。
 """
 
 from __future__ import annotations

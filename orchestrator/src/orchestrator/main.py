@@ -2,7 +2,12 @@
 
 CLI 入口：`python -m orchestrator`。
 对 mock 可全链路真实测试：list → start → poll available → solver → harvest →
-submit → close，含 LOCKED 重入队、hint 决策、收尾保护、崩溃恢复对账。
+submit → close，含 LOCKED 重入队、收尾保护、崩溃恢复对账。
+
+**hint 接口已整体移除**（architecture.md §4.4）：扣分不可逆、本届读不到
+`hint_cost_radio` 无法做成本判断，实测 10 次取 hint 仅 1 次换来解出 —— 期望收益
+为负。删掉的是整条链路：PlatformClient.hint / Hint Broker / HINT_RETRY 状态 /
+`hints_taken` 记账 / Journal 的 hint 事件与 fsync / task.json 的 `hint` 字段。
 """
 
 from __future__ import annotations
@@ -18,7 +23,6 @@ from . import sop as sop_mod
 from . import streams
 from .api import (
     ChallengeGone,
-    HintCompleted,
     LevelLocked,
     PlatformClient,
     RetryableError,
@@ -30,12 +34,12 @@ from .harvester import harvest, submit_candidates
 from .journal import Journal, score_summary
 from .registry import ChallengeRecord, Registry
 from .repair import BASE_WEIGHTS, choose_repair, update_weights
-from .scheduler import can_start, eligible, plan_phase
+from .scheduler import can_start, eligible, plan_phase, slice_for
 from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
 AVAILABLE_TIMEOUT_S = 120.0
-MAX_ATTEMPTS = 2  # 非 hint 路径的普通重试上限
+MAX_ATTEMPTS = 2  # 普通重试上限（失败一次后换策略再投一轮）
 
 
 @dataclass(slots=True)
@@ -46,7 +50,6 @@ class RunContext:
     journal: Journal
     workspace_root: Path
     solver_cmd: list[str]
-    hints: dict[str, str] = field(default_factory=dict)  # code → hint 文本（下轮回灌）
     priors: dict[str, dict] = field(default_factory=dict)  # code → 双图状态（跨轮合并）
     running: set[str] = field(default_factory=set)
     stopped: bool = False
@@ -156,7 +159,6 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         rec,
         attempt=rec.attempts,
         prior=ctx.priors.get(code),
-        hint=ctx.hints.get(code),
         sops=sops,
         repair_note=ctx.repair_notes.get(code),
     )
@@ -217,27 +219,6 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         await _safe_close(ctx, rec)
         rec.state = "QUEUED"
         return
-    if rec.correct_flag_count == 0 and rec.hints_taken == 0 and not rec.is_completed:
-        # Hint Broker 触发件（§4.4）：完整时间片 + 零 flag + 未取过 + 预算够再投一轮
-        remaining = ctx.t0 + ctx.config.total_time_limit_s - time.time()
-        if remaining > 2 * slice_s:
-            hint: str | None = None
-            try:
-                hint = await ctx.client.hint(code)
-            except HintCompleted:
-                rec.is_completed = True  # 题目级 409：该题已通关（§4.5）
-            except RetryableError, ChallengeGone, StartFull, LevelLocked:
-                hint = None
-            except TaskEnded:
-                ctx.stopped = True
-            if hint:
-                ctx.hints[code] = hint
-                rec.hints_taken += 1
-                ctx.journal.append_hint(code, attempt=rec.attempts)
-                rec.state = "HINT_RETRY"
-                await _safe_close(ctx, rec)
-                rec.state = "QUEUED"  # 带 hint 重新入队
-                return
     if rec.attempts >= MAX_ATTEMPTS:
         rec.state = "ABANDONED"
         await _safe_close(ctx, rec)
@@ -245,7 +226,7 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         ctx.repair_notes.pop(code, None)
         ctx.journal.append("abandoned", unique_code=code)
         return
-    # EVOSTER 在线修复（§5）：失败信号 → 有界动作；attempt/hint 预算全不动
+    # EVOSTER 在线修复（§5）：失败信号 → 有界动作；attempt 预算不动
     repair = choose_repair(
         rec,
         outcome,
@@ -275,7 +256,6 @@ async def run_agent(
     config: RuntimeConfig | None = None,
     workspace: Path | None = None,
     journal_path: Path | None = None,
-    initial_hints: dict[str, int] | None = None,
     env: dict[str, str] | None = None,
     qps: float = 3.0,
     poll_interval_s: float = POLL_INTERVAL_S,
@@ -292,7 +272,6 @@ async def run_agent(
         reserve_seconds=600,
         concurrency_limit=3,
         api_max_qps=qps,
-        hint_cost_threshold=0.1,
     )
     workspace = (workspace or Path("./workspaces")).resolve()
     journal = Journal(journal_path or (workspace / "journal.jsonl"))
@@ -307,12 +286,6 @@ async def run_agent(
         env=env,
         t0=time.time(),
     )
-    # 崩溃恢复：Journal 里「已取过 hint」的题恢复计数（平台读不回来，§4.4）
-    replayed = journal.replay()
-    recovered = initial_hints or {
-        code: info["hints_taken"] for code, info in replayed.items() if info.get("hints_taken")
-    }
-
     tasks: set[asyncio.Task] = set()
     reconciled = False
     try:
@@ -321,9 +294,6 @@ async def run_agent(
             if ctx.stopped or rows is None:
                 break
             ctx.registry.sync(rows)
-            for code, count in recovered.items():
-                if code in ctx.registry.records:
-                    ctx.registry.records[code].hints_taken = count
             if not reconciled:
                 # 开局对账即关残留（round2 活锁教训）：上进程留下的 active 容器若
                 # 占满平台全局 active 上限，start 持续 409 StartFull、eligible 又
@@ -339,10 +309,12 @@ async def run_agent(
                 elapsed_s=time.time() - ctx.t0,
                 total_s=config.total_time_limit_s,
                 reserve_s=config.reserve_seconds,
-                n_eligible=len(eligible(ctx.registry.records)),
+                # 分母 = 真正还要解的题（可启动 + 在跑），在跑的也是预算消耗者
+                n_eligible=len(eligible(ctx.registry.records)) + len(ctx.running),
                 remaining_score=_remaining_score(ctx.registry),
                 slice_min_s=config.slice_min_s,
                 slice_max_s=config.slice_max_s,
+                concurrency=config.concurrency_limit,
             )
             if plan.finalize:
                 ctx.journal.append("finalize")
@@ -362,8 +334,15 @@ async def run_agent(
                 if rec.unique_code in ctx.running:
                     continue
                 rec.state = "QUEUED"
-                # EVOSTER widen（§5）：下轮时间片有覆盖则用一次即清
-                attempt_slice, rec.next_slice_s = rec.next_slice_s or plan.slice_s, None
+                # 分数加权（§4.3 修订）：高分多阶段题拿更长片；EVOSTER widen 的
+                # 覆盖值（已在上一轮按加权片算好）优先，用一次即清。
+                attempt_slice = rec.next_slice_s or slice_for(
+                    rec,
+                    plan.slice_s,
+                    slice_min_s=config.slice_min_s,
+                    slice_max_s=config.slice_max_s,
+                )
+                rec.next_slice_s = None
                 task = asyncio.create_task(_pipeline(ctx, rec.unique_code, attempt_slice))
                 tasks.add(task)
                 ctx.running.add(rec.unique_code)
@@ -379,7 +358,7 @@ async def run_agent(
         rows = await _safe_list(ctx)
         summary = score_summary(rows or [])
         summary["per_challenge"] = {
-            code: {"state": rec.state, "attempts": rec.attempts, "hints": rec.hints_taken}
+            code: {"state": rec.state, "attempts": rec.attempts}
             for code, rec in sorted(ctx.registry.records.items())
         }
         journal.append("run_end", **{k: v for k, v in summary.items() if k != "per_challenge"})

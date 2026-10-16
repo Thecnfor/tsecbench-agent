@@ -20,7 +20,7 @@ token 无效或缺失 → `404 task_not_found`（不是 401/403，容易在错�
 |---|---|---|---|
 | 1 | `GET` | `/openapi/v1/challenges` | 题目列表 + 作答进度 + 容器状态 |
 | 2 | `POST` | `/openapi/v1/challenges/start?unique_code=` | 启动题目容器 |
-| 3 | `GET` | `/openapi/v1/challenges/hint?unique_code=` | 取提示（**扣分**） |
+| 3 | `GET` | `/openapi/v1/challenges/hint?unique_code=` | 取提示（**扣分**）—— **本项目不调用**（理由见 §4.7） |
 | 4 | `POST` | `/openapi/v1/challenges/submit` | 提交 flag（JSON body） |
 | 5 | `POST` | `/openapi/v1/challenges/close?unique_code=` | 关闭容器释放资源 |
 
@@ -33,7 +33,6 @@ GET  /challenges          获取题目列表
 POST /challenges/start    启动目标题
   ↓ 轮询 GET /challenges 直到 container_status == available
 （通过 VPN 访问 container_addr，渗透解题）
-GET  /challenges/hint     可选，会扣分
 POST /challenges/submit   提交 flag（多 flag 题需多次）
 POST /challenges/close    释放容器
 ```
@@ -122,7 +121,9 @@ https://agent-awd.baidu.com/*
 
 **后果**：如果不区分，会在任务已结束后继续无意义地重试；或者在只是并发满的时候误判为「比赛结束了」而提前放弃；最坏的一种是 —— 对已通关题误取 hint 收到 409，被判成任务级终止，于是**在还剩很多题的时候全局停机，把剩余分数全部丢掉**。
 
-**处理**：按接口分派，不是按错误码分派。只有 `POST /start` 的 409 走「腾位置重试」分支，只有 `GET /hint` 的 409 走「标记该题已完成」分支，**其余接口的 409 才视为任务级终止**。
+**处理**：按接口分派，不是按错误码分派。只有 `POST /start` 的 409 走「腾位置重试」分支，**其余接口的 409 一律视为任务级终止**。
+
+> 题目级（`GET /hint` 的 409）在**本项目里不会出现** —— 我们不再调用 hint 接口（§4.7）。这条语义仍然记录在案，因为它是 4.5「按接口分派」这条纪律的来源；若将来重新引入 hint，必须把它接回来。
 
 ### 4.6 一题多 flag
 
@@ -132,19 +133,23 @@ https://agent-awd.baidu.com/*
 
 **处理**：`correct_flag_count < total_flag_count` 时不 close，把「还差几个、已中哪个 index」回灌给 solver 继续。
 
-### 4.7 hint 扣分且不可逆
+### 4.7 hint 扣分且不可逆 —— **本项目决定不取 hint**
 
 `GET /hint` 之后，该题后续 flag 得分按 `hint_cost_radio` 比例扣减。已通关（所有 flag 已正确提交）的题不能再取 hint，会返回 `409 invalid_state`（即 4.5 的题目级）。
 
-**后果**：随手取 hint 会把一道满分题打折；对已通关题取 hint 会收到一个看起来像「任务结束」的 409，如果按 4.5 误判就会全局停机。
+**处理**：**不调用 hint 接口。** 整条 hint 链路（`PlatformClient.hint` / Hint Broker /
+`HINT_RETRY` / `hints_taken` / Journal 的 hint 事件与 fsync / `task.json.hint`）已从代码
+与契约中删除，solver 系统契约里也写死「HINTS ARE DISABLED」。零 flag 的题改走普通
+`RETRY` 与 EVOSTER 在线修复。删除理由与实测数据见 [architecture.md](architecture.md) §4.4。
 
-**处理**：hint 由独立的 Hint Broker 决策，触发条件是「首轮时间片耗尽 + 零 flag + 扣分比例可接受」；对 `is_completed == true` 的题禁止调用 hint 接口。
+**为什么放弃**（下面三个缺口正是当初想取 hint 的代价，任一都足以否决）：
 
-**三个连带的文档缺口**（都不是我可以自行填补的）：
+1. **`hint_cost_radio` 在响应里读不到**。文档说比例「由题目配置决定」，但 `GET /challenges` 的字段表里没有这个字段 —— 取 hint 前无法知道扣多少。上届两处口径一致为 **10%**（第二届 HTTP 文档「扣减10%」、MCP 文档「扣除该题总分的 10%」），但那只是上届规则，本届无从验证（[open-questions.md](open-questions.md) A10）。
+2. **本届响应没有 `hint_viewed`**，上届有。意味着**「这题是否已取过 hint」在平台侧读不回来**，崩溃恢复后无法对账，可能重复取、重复扣分（A10b）。这是崩溃恢复路径上唯一不可对账的状态 —— 不取 hint，缺口自然消失。
+3. 扣分是「从奖励分数中扣减」还是「从该题总分扣减」，本届措辞（「按 `hint_cost_radio` 比例扣减该题得分」）与上届（「从奖励分数中扣减10%」）表述不同，实际影响是否只影响后续未得的 flag、还是追溯已得的 flag，**不明确**。
 
-1. **`hint_cost_radio` 在响应里读不到**。文档说比例「由题目配置决定」，但 `GET /challenges` 的字段表里没有这个字段 —— 取 hint 前无法知道扣多少。现按 **10%** 设默认值，依据是**上届两处口径一致**（第二届 HTTP 文档「扣减10%」、MCP 文档「扣除该题总分的 10%」）。注意这是上届规则，本届若显著更高，此默认值必须改（[open-questions.md](open-questions.md) A10）。
-2. **本届响应没有 `hint_viewed`**，上届有。意味着**「这题是否已取过 hint」在平台侧读不回来**，崩溃恢复后无法对账，可能重复取、重复扣分。只能靠 State Journal 同步 fsync 兜底（A10b）。
-3. 扣分是「从奖励分数中扣减」还是「从该题总分扣减」，本届措辞（「按 `hint_cost_radio` 比例扣减该题得分」）与上届（「从奖励分数中扣减10%」）表述不同，实际影响是否只影响后续未得的 flag、还是追溯已得的 flag，**不明确**。这直接改变 Hint Broker 在第 2 个 flag 之前 vs 之后取 hint 的价值判断。
+实测结论：一次真实官方跑分中取 10 次 hint，仅 1 次换来后续解出，其余 9 道题全部
+ABANDON —— 期望收益为负，与「成本不可知」叠加后，直接砍掉比继续调参更划算。
 
 ### 4.8 submit 幂等，重复提交报 `duplicate`
 
@@ -234,7 +239,7 @@ https://agent-awd.baidu.com/*
 |---|---|---|---|
 | 404 | `task_not_found` | token 无效/缺失/任务不存在 | 致命，停机并报错（配置问题） |
 | 404 | `challenge_not_found` | `unique_code` 不在本任务题集内 | 从本地题库剔除，永不再试 |
-| 409 | `invalid_state` | 任务已结束 **或** start 时活跃数达上限 **或** 对已通关题取 hint | 见 4.5、4.7 |
+| 409 | `invalid_state` | 任务已结束 **或** start 时活跃数达上限 **或** 对已通关题取 hint（本项目不取，故不会见到后一种） | 见 4.5、4.7 |
 | 409 | `duplicate` | 同 flag_index 重复正确提交 | 标记已入袋，继续 |
 | 503 | `resource_unavailable` | 靶场实例未就绪或已耗尽 | 指数退避 5s/15s/45s，3 次失败排队尾 |
 | 500 | `internal_error` | 平台内部错误 | 退避重试 |

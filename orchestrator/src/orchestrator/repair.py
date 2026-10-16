@@ -6,7 +6,7 @@ EVOSTER 的「在线修复」对齐：失败发生即处置，不等整个轨迹
 结果增减（update_weights，+25% / −20%），Argmax 遇平票走固定优先级，
 全程确定性、可单测。
 
-红线（§5.2）：MAX_ATTEMPTS 上限、hint 经济学、finalize 保护一律不动 ——
+红线（§5.2）：MAX_ATTEMPTS 上限、finalize 保护一律不动 ——
 本模块只在 attempt 预算内选择「换什么姿势重投」，不放宽任何闸门。
 """
 

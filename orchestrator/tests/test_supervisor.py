@@ -28,13 +28,13 @@ def rec(code: str = "t1", **kw) -> ChallengeRecord:
 # ---- workspace / task.json 契约 ----
 def test_workspace_writes_task_json(tmp_path):
     r = rec(flag_count=2, correct_flag_count=1, description="d")
-    ws = prepare_workspace(tmp_path, r, attempt=2, prior={"assets": [{"v": 1}]}, hint="try x")
+    ws = prepare_workspace(tmp_path, r, attempt=2, prior={"assets": [{"v": 1}]})
     task = json.loads((ws / "task.json").read_text(encoding="utf-8"))
     assert task["unique_code"] == "t1"
     assert task["targets"] == ["10.0.0.1:8080"]  # 数组，不只第一个
     assert task["flag_count"] == 2 and task["correct_flag_count"] == 1
     assert task["attempt"] == 2
-    assert task["hint"] == "try x"
+    assert "hint" not in task  # hint 链路已整体删除，task.json 不再有该字段
     assert task["prior"] == {"assets": [{"v": 1}]}
     assert (ws / "out" / "flags").is_dir()
 

@@ -2,9 +2,10 @@
 
 职责：
   - 记录所有状态迁移与平台交互，崩溃后配合 GET /challenges 对账恢复（§3.2）；
-  - **hint 记录必须同步 fsync**（§4.4）：「是否已取过 hint」平台读不回来，
-    重复取 = 重复扣分，这是崩溃恢复路径上唯一不可对账的状态；
   - token 不落盘（Journal 文件可能被审计/公开）。
+
+**hint 事件与 fsync 已随 hint 接口整体移除**（§4.4）：平台状态可对账后，本地
+不再持有任何「读不回来」的状态，也就没有必须同步落盘的事件。
 """
 
 from __future__ import annotations
@@ -21,49 +22,15 @@ class Journal:
         self._fh = open(path, "a", encoding="utf-8")  # noqa: SIM115 - 进程生命周期持有
 
     def append(self, event: str, **fields: object) -> None:
-        self._write(event, fields, fsync=False)
+        self._write(event, fields)
 
-    def append_hint(self, unique_code: str, **fields: object) -> None:
-        """hint 事件：同步落盘 + fsync，崩溃恢复不重复扣分（§4.4）。"""
-        self._write("hint", {"unique_code": unique_code, **fields}, fsync=True)
-
-    def _write(self, event: str, fields: dict, *, fsync: bool) -> None:
+    def _write(self, event: str, fields: dict) -> None:
         record = {"ts": round(time.time(), 3), "event": event, **fields}
         self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if fsync:
-            self._fh.flush()
-            import os
-
-            os.fsync(self._fh.fileno())
-        else:
-            self._fh.flush()
+        self._fh.flush()
 
     def close(self) -> None:
         self._fh.close()
-
-    # ---- 恢复 ---------------------------------------------------------------
-    def replay(self) -> list[dict]:
-        """重放 Journal，恢复本地不可对账状态（hints_taken 等）。"""
-        state: dict[str, dict] = {}
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return []
-        for line in lines:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 半行（崩溃时被截断）安全跳过
-            event = record.get("event")
-            if event == "hint":
-                code = record.get("unique_code", "")
-                state.setdefault(code, {"hints_taken": 0})
-                state[code]["hints_taken"] += 1
-            elif event == "submitted":
-                code = record.get("unique_code", "")
-                entry = state.setdefault(code, {"hints_taken": 0})
-                entry.setdefault("submitted", []).append(record.get("flag"))
-        return state
 
 
 def score_summary(rows: list[dict]) -> dict:

@@ -121,7 +121,7 @@ const STRATEGY: Record<string, string> = {
 // ---- 共享上下文（只读；可变数据一律走节点间 schema 流）------------------------
 const task = readTask()
 const targets = ((task.targets as string[] | undefined) ?? []).join(", ")
-const taskText = [String(task.description ?? ""), String(task.hint ?? ""), targets].join(" ")
+const taskText = [String(task.description ?? ""), targets].join(" ")
 logEvent("meta", { solver: "ts-workflow", model: LLM_MODEL })
 
 // step 1：确定性侦察（recon_recipe.py 预聚合 JSON，§1.6）

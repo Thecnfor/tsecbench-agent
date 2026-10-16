@@ -103,6 +103,35 @@ docker run --rm -it --network host \
 
 本地模式 `GATEWAY_MODE=off`：直连真实 `https://api.deepseek.com/v1`，不做 `.tsecbench.gw` 改写。
 
+#### 快速调试循环（宿主机直跑，比容器快得多）
+
+容器镜像的 runtime 阶段目前**尚未 COPY `orchestrator/`**、ENTRYPOINT 还是骨架，所以「在容器里跑官方测试」暂不成立。调参/调代码走宿主机直跑：
+
+```bash
+make check     # 只读连通自检（零副作用）
+make run       # 前台起编排器（Ctrl-C 停）
+make rerun     # 停掉在跑的编排器 + solver，后台重启（日志 /tmp/tsec-run.log）
+```
+
+**代码生效时机（关键）**：
+- **改 `solver/` 下的代码实时生效** —— 每题都是新起的子进程，直接读仓库源码；改完下一个时间片就是新逻辑，**不需要重启**。
+- **改 `orchestrator/` 需要 `make rerun`** —— 进程启动即把代码载入内存。重启走崩溃恢复（journal + 平台对账续跑），**已解出的题不会丢**，代价只是杀掉在跑的题。
+
+**观察点**：`tail -f workspaces/journal.jsonl`（事件流：started / solver_done / repair / solved / abandoned）；每题完整轨迹在 `workspaces/workspaces/<code>_attempt<N>/stdout.log`。
+
+**将来要在容器里跑同一套源码**（验证镜像行为又不想每次 rebuild）：把工作区 bind mount 进去，容器内看到的就是宿主机当前源码 —— 挂载点对齐 Dockerfile 的 COPY 目标（`solver/ → /opt/tsecbench/solver/`）：
+
+```bash
+docker run --rm -it --network host \
+  -v "$PWD/solver:/opt/tsecbench/solver" \
+  -v "$PWD/orchestrator:/opt/tsecbench/orchestrator" \
+  -e BENCHMARK_TOKEN -e BENCHMARK_BASE_URL -e LLM_API_KEY \
+  -e GATEWAY_MODE=off -e LLM_BASE_URL=https://api.deepseek.com/v1 \
+  tsecbench-agent:latest
+```
+
+（镜像与 prompt 的红线不变：`ing/` / `refs/` 绝不进镜像，挂载时也只挂源码目录。）
+
 ### 2.5 观察点
 
 - 编排器是否正确列出题目、排序、遵守并发 ≤3；
@@ -160,7 +189,6 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 | `API_MAX_QPS` | 可选 | `3` | 全局令牌桶速率（上届限频值，本届未提但默认自我限速，见 platform-api §4.12） |
 | `TRAFFIC_MAX_MB` | 可选 | `512` | 单题 recorder 录制体积上限；超限降级为「只存 header + body 摘要，不存全文」，防 workspace 撑爆磁盘 |
 | `RESERVE_SECONDS` | 可选 | `600` | 收尾保护预留时间 |
-| `HINT_COST_THRESHOLD` | 可选 | `0.1` | 扣分比例超过此值则不取 hint。**默认 0.1 而非 0.5** —— 依据是上届两处口径均为 10%（platform-api §4.7）；本届 `hint_cost_radio` 读不到，若主办方答复比例更高，此值必须上调 |
 | `LOG_LEVEL` | 可选 | `info` | |
 | `VPN_CONFIG` | ❌ 见下 | — | 仅当 §6.3 探测到需要容器内自拨时才用 |
 
@@ -190,8 +218,9 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 - 活跃容器计数与 `POST /start` 的 `409 invalid_state`（第 4 题时起）；
 - 全部错误码：`task_not_found` / `challenge_not_found` / `invalid_state` / `duplicate` / `resource_unavailable` / `internal_error` / `422`；
 - 一题多 flag：`flag_count > 1`，逐次 submit 递增 `correct_flag_count`；
-- hint 扣分与「已通关题取 hint 返回 409」；
-- **响应里不提供 `hint_cost_radio`，也不提供 `hint_viewed`** —— 必须照此实现，让我们**在 mock 阶段就暴露出「这个状态只能自己记」的后果**，而不是等真平台才发现；
+- hint 扣分与「已通关题取 hint 返回 409」——**本项目不调用 hint**（platform-api §4.7），
+  mock 保留该路由**作绊线**：编排器整轮跑下来若命中它，即视为回归（见 §4.2 用例）；
+- **响应里不提供 `hint_cost_radio`，也不提供 `hint_viewed`** —— 照本届文档实现，保持 mock 与真平台同形；
 - 任务级超时：到点后所有接口一律返回 `invalid_state`；
 - 故障注入：慢响应、连接重置、500、503、返回体畸形。
 
@@ -224,9 +253,9 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 | flag 只在 stdout | 验证「不信任 result.json」 |
 | 超长 / 空 flag 候选 | 长度过滤，不触发 422 |
 | 编排器崩溃重启 | Journal + `GET /challenges` 对账恢复，不重复计分 |
-| **重启后 hint 状态** | **平台无 `hint_viewed` → 验证 Journal fsync 后重启不会重复取 hint 重复扣分** |
+| **绊线：整轮不碰 hint** | 零 flag + 超时 + 预算充足的旧 Hint Broker 触发场景下，mock 的 hint 路由零命中（`state.hint_viewed` 为空）|
 | 极短 `TOTAL` | Phase 1/2 切换、收尾保护、强制 close 与提交 |
-| hint 触发与禁止 | 零 flag 才取；`is_completed` 题绝不取 |
+| 零 flag 重试 | 不取 hint，靠 `RETRY`（换策略第二轮）解出；`task.json` 不含 `hint` 字段 |
 | 网关改写 | 19 项白名单逐条断言 + 边界 + 幂等 |
 | 配置解析 | **完整跑 [architecture.md](architecture.md) §7.1 的 22 条摄取用例矩阵**（含「值内含冒号不能被切成 https」「无 ing/ 目录视为正常托管模式」「solver 环境不得含 BENCHMARK_TOKEN」）|
 | VPN 双模 | 可达时不拨；不可达且有 tun+NET_ADMIN 时拨；拨失败时降级继续 |
@@ -262,7 +291,7 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 | 所有模型调用超时 / DNS 失败 | `GATEWAY_MODE` 未设 `on`，或 base_url 改写错误 | 检查环境变量；托管模式无法现场修，只能重新上传镜像 |
 | start 一直 409 | 有容器没 close，或本地计数与平台漂移 | 看 Registry 对账日志；必要时手动 close 低优先级题 |
 | solver 报连不上靶场 | VPN 未通 / 未等 `available` 就冲 | 检查 `container_status` 时序与 VPN 探测日志 |
-| 分数低于预期 | hint 扣分 / 多 flag 题提前 close / 收尾未提交 | 查 Journal 里的 `awarded`、`correct_flag_count` 轨迹 |
+| 分数低于预期 | 多 flag 题提前 close / 收尾未提交 | 查 Journal 里的 `awarded`、`correct_flag_count` 轨迹 |
 | 接口全部 `invalid_state` | 任务已超时结束 | 已无法挽回；复盘预算分配与收尾保护是否触发过晚 |
 | 容器被 OOM | solver 内存超配额 | 降低单 solver 并发工具数，或降 `CONCURRENCY_LIMIT` |
 
@@ -273,6 +302,6 @@ docker rmi tsecbench-agent:latest 2>/dev/null; \
 沙箱一次性销毁、平台不留存程序，因此**日志是唯一资产**：
 
 - 全程 JSON lines 日志必须在容器存活期间持续输出到 stdout（平台会采集审计）；
-- 记录每题的时间片消耗、token 消耗、工具调用序列、候选 flag 与 submit 结果、hint 使用情况；
+- 记录每题的时间片消耗、token 消耗、工具调用序列、候选 flag 与 submit 结果；
 - 脱敏：token 与 API key 不得出现在日志中；
 - 赛后按「未解出题目的失败模式」归类，作为决赛（AI-KOH）与下一次的输入。

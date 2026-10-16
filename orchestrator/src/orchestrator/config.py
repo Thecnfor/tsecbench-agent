@@ -79,7 +79,6 @@ class RuntimeConfig:
     reserve_seconds: int
     concurrency_limit: int
     api_max_qps: float
-    hint_cost_threshold: float
     slice_min_s: int = 120  # 每题时间片下限（秒）
     slice_max_s: int = 1200  # 每题时间片上限（秒）
     solver_cmd: list[str] = field(default_factory=list)  # solver 入口命令
@@ -125,7 +124,6 @@ def resolve_config(root: str | None = None, environ: dict[str, str] | None = Non
         reserve_seconds=_int("RESERVE_SECONDS", 600),
         concurrency_limit=concurrency,
         api_max_qps=_float("API_MAX_QPS", 3.0),
-        hint_cost_threshold=_float("HINT_COST_THRESHOLD", 0.1),
         slice_min_s=_int("SLICE_MIN_S", 120),
         slice_max_s=_int("SLICE_MAX_S", 1200),
         solver_cmd=solver_cmd_env.split() if solver_cmd_env else [],

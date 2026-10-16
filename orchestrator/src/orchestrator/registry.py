@@ -24,7 +24,6 @@ STATES = (
     "SUBMITTING",
     "SOLVED",
     "RETRY",
-    "HINT_RETRY",
     "ABANDONED",
     "LOCKED",
     "CLOSING",
@@ -53,7 +52,6 @@ class ChallengeRecord:
     description: str | None = None
     # 本地记账（平台读不回来的状态）
     locked: bool = False  # 收到过 403
-    hints_taken: int = 0  # 只存在于 Journal，平台读不回来（§4.4）
     attempts: int = 0
     submitted: set[str] = field(default_factory=set)  # 已提交过的候选
     matched_indices: set[int] = field(default_factory=set)

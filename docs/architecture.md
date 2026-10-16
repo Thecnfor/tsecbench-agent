@@ -8,7 +8,7 @@
 
 ## 0. 总体思路
 
-平台 API 的那些约束（并发 ≤3、`available` 轮询、`close` 释放、hint 扣分、总时限、flag 去重）是**规则明确、错了就直接丢分**的东西，交给确定性代码，绝不让大模型自由发挥。
+平台 API 的那些约束（并发 ≤3、`available` 轮询、`close` 释放、总时限、flag 去重）是**规则明确、错了就直接丢分**的东西，交给确定性代码，绝不让大模型自由发挥。
 
 渗透解题是**开放式、需要大量工具与试错**的东西，交给成熟的 agent 框架。
 
@@ -18,7 +18,7 @@
 ┌─────────────────────────────────────────────────────────┐
 │ L0  Orchestrator（Python 3.14 asyncio，确定性，不经大模型）│
 │      Platform API ─ Registry ─ Scheduler ─ Harvester     │
-│      Submitter ─ Hint Broker ─ Journal ─ Gateway Resolver│
+│      Submitter ─ Journal ─ Gateway Resolver              │
 └────────────────────────┬────────────────────────────────┘
                          │ Solver Adapter 契约（进程边界 + 文件约定）
         ┌────────────────┼────────────────┐
@@ -218,7 +218,7 @@ L0~L3 全在解决「**我们的代码跑在我们这边**」。Lua 解决一个
 | 环境变量 `LLM_API_KEY` | 大模型密钥（运行时注入，不在镜像内） |
 | 环境变量 `LLM_MODEL` | 模型名，默认 `deepseek-chat` |
 | 环境变量 `SOLVER_DEADLINE_EPOCH` | 编排器分配给本题的**时间片**截止时间（Unix 秒），非比赛总时限。solver 应据此自我收敛 |
-| 环境变量 `SOLVER_BUDGET_HINT` | 软性提示：可用 token / 轮次预算的参考值 |
+| 环境变量 `SOLVER_BUDGET_HINT` | 本题时间片总长（秒）。solver 据此判断「时间过半」，在片快用尽时收敛（并给单条命令设上限，防止一条命令吃掉整片） |
 | 环境变量 `HTTP_PROXY` / `HTTPS_PROXY` | 指向该题的 recorder sidecar（`127.0.0.1:<per-challenge-port>`）。**这是强制路径而非可选**：solver 用 `requests` / `curl` / `httpx` 时自动被录制，无需模型配合。CA 证书路径经 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` 注入 |
 | 环境变量 `RECORDER_STATE` | recorder 已录条目数的快照与去重索引位置，让 solver 能查「这个包是否发过」 |
 | 进程 cwd | 该题独占的 workspace 目录 |
@@ -236,7 +236,6 @@ L0~L3 全在解决「**我们的代码跑在我们这边**」。Lua 解决一个
   "correct_flag_count": 1,
   "targets": ["10.0.1.5:8080"],
   "flag_pattern": null,
-  "hint": null,
   "attempt": 1,
   "prior": {
     "assets": [],
@@ -251,7 +250,6 @@ L0~L3 全在解决「**我们的代码跑在我们这边**」。Lua 解决一个
 - `targets` 是**数组**。`container_addr` 可能包含多个入口（web + db，或多台内网机器），必须全部传入，不能只取第一个。
 - `description` 可能为 `null`。solver 必须能在零描述下工作（纯靠扫描与枚举）。
 - `flag_pattern` 为 `null` 或形如 `flag{...}` 的模式（借鉴 ARTEMIS `configs/tests/ctf_easy.yaml` 的同名字段）。平台文档未提供该字段，只能从 `description` 里推断或留空；留空时 Flag Harvester 用通用正则兜底。
-- `hint` 由 Hint Broker 决定是否填充；填了就意味着这题分数已被打折，solver 应更激进地收敛。
 - `attempt` 用于让 solver 知道自己是第几次尝试，重试时可以换策略而非重复同一条路。
 - `prior` 是**结构化**的跨轮次状态（设计依据见 §2.5）：`assets` = 已确证的客观资产，`explored` = 已尝试过的假设及其结论（含**已否证**的，这是避免重试走死路的关键），`open_leads` = 尚未验证的线索。首轮全为空数组。solver 只提交原始观察，去重与父子关系由编排器计算。
   **注意：`prior` 只能来自本次运行内自己产出的信息，绝不能是预置的题目答案 —— 后者属于作弊。**
@@ -380,8 +378,7 @@ Flag Harvester 直接正则扫整个 workspace 的所有文件产物 + 子进程
 | **Recorder Manager** | 每题 spawn 一个 Go `recorder` sidecar：分配端口、签发/挂载 CA、随 solver 同进程组启停、落盘 JSONL、维护 `(method,url,body-hash)` 去重索引、向 Prior Store 回流客观 assets | Supervisor, Prior Store |
 | **Prior Store** | 该题双图状态（`assets` / `explored` / `open_leads`）的持久化与合并。读入各轮 `out/prior.json`，**由编排器计算去重键与父子关系**（solver 只交原始观察，见 §2.5），生成下一轮 `task.json.prior` | Harvester |
 | **Submitter** | 逐个 submit，处理 `duplicate` / `matched_flag_index`，回写 Registry；**submit 成功且提示解锁时通知 Registry 重算 `LOCKED`** | Harvester |
-| **Hint Broker** | 决定是否花 hint 换一轮重试；对 `is_completed` 的题硬性禁止调用；**「已取过 hint」只存在于 State Journal，平台读不回来（§4.4）** | Registry, Scheduler |
-| **State Journal** | append-only JSONL，记录所有状态迁移与平台交互。崩溃后配合 `GET /challenges` 对账恢复。**hint 记录必须同步 fsync** | 无 |
+| **State Journal** | append-only JSONL，记录所有状态迁移与平台交互。崩溃后配合 `GET /challenges` 对账恢复。**不再有任何同步落盘事件**（hint 链路已删，本地无可对账缺口，§4.4） | 无 |
 | **VPN Prober** | 启动期探测靶场可达性；必要时按 §6.3 拨 VPN | Config Resolver |
 
 ### 3.1 单题状态机
@@ -404,10 +401,10 @@ HARVESTING（收割 flags/*.txt + prior.json + stdout）
 SUBMITTING
    ↓
  ┌──────────────┬──────────────┬───────────────┐
- ↓              ↓              ↓               ↓
-SOLVED        RETRY         HINT_RETRY      ABANDONED
-（全部 flag） （换策略再投）  （取 hint 再投）  （放弃）
- ↓              ↓              ↓               ↓
+ ↓              ↓              ↓
+SOLVED        RETRY         ABANDONED
+（全部 flag） （换策略再投）  （放弃）
+ ↓              ↓              ↓
 CLOSING ─────────────────────────────────────→ CLOSED
 ```
 
@@ -453,6 +450,12 @@ CLOSING ────────────────────────
 
 直觉：**先易后难，快速落袋**。初赛是按分数排名，把时间烧在一道 hard 题上而放弃三道 easy 题是净亏。hard 题只用来填空档或进入 Phase 2 深挖。
 
+**成本映射修订（实测）**：`difficulty → cost` 原为 `easy 1.0 / medium 2.0 / hard 4.0`。这个比例下
+easy 100 分的性价比（100）低于 medium 300（150）与 hard 500（125）—— 结果一次 63 题的真实跑分里
+**6 道 easy 送分题（共 600 分）排到队尾、整轮从未被启动**。easy 题接近必解、耗时也最短，按
+「每分每秒的期望得分」应当先做，故 easy 成本下调到 **0.6**（easy100 → 167，高于 medium300 的 150）。
+medium/hard 不变。
+
 `level` 升序还有一层含义：若本届沿用上届的关卡 gating（§10.3），低 `level` 的题本来就先解锁，按 `level` 升序排天然与解锁顺序一致，不会无谓地撞 403。
 
 ### 4.3 两阶段预算
@@ -460,7 +463,20 @@ CLOSING ────────────────────────
 设总时限为 `TOTAL`（运行时配置，见 [open-questions.md](open-questions.md)），编排器启动时刻为 `T0`。
 
 **Phase 1 · 广撒网**（`T0` ~ `T0 + 0.45 × TOTAL`）
-每题分配一个小时间片（`0.45 × TOTAL / 题数`，并设上下限），目标是「摸一遍所有题，找出哪些能快速拿下、哪些有进展」。快速拿下的直接落袋。
+每题分配一个小时间片，目标是「摸一遍所有题，找出哪些能快速拿下、哪些有进展」。快速拿下的直接落袋。
+
+时间片公式（**必须含并发系数**）：
+```
+base_slice = clamp(0.45 × TOTAL × 并发 / 剩余题数, SLICE_MIN_S, SLICE_MAX_S)
+每题片     = clamp(base_slice × sqrt(剩余分数 / 300), SLICE_MIN_S, SLICE_MAX_S)
+```
+- **并发系数是必需的**：`0.45×TOTAL / 题数` 算的是「串行墙钟」，但同一时刻有 3 个 solver 在跑，
+  每题实际可用墙钟是它的 3 倍。漏掉系数会把每题少给 3 倍片 —— 实测 63 题全部被压到 `SLICE_MIN_S`
+  地板（300s），23 次超时里一大半是「差一点」被砍死的（6 道解出的题耗时 208~294s，全贴着红线）。
+- **按分数加权**（`sqrt` 缩放 + 上下限 0.7~2.5）：多阶段高分题（b-01 1200 / b-02 1800）此前与 200 分
+  单题拿同样的片，300s 下必死。加权后 medium 300 分题 ≈ 1.0×、hard 500 ≈ 1.29×、1200 分 ≈ 2.0×、
+  1800 分 ≈ 2.45×，高价值题拿到与身价相称的跑道，又不至于把预算吃光。
+- 分母用「剩余题数 = 可启动 + 在跑」：在跑的题也是预算消耗者。
 
 **Phase 2 · 深挖**（`T0 + 0.45 × TOTAL` ~ `T0 + TOTAL − RESERVE`）
 把剩余预算按「进展度」重投：
@@ -483,20 +499,33 @@ close 全部 `active_since_reconcile` 残留（本进程此刻必无在跑题）
 
 超时后平台所有接口一律 `invalid_state`（见 [platform-api.md](platform-api.md) §4.10），收尾没做完等于把已解出的题白扔。
 
-### 4.4 hint 决策
+### 4.4 hint 决策（**已删除**）
 
-Hint Broker 触发条件（全部满足）：
+**本届不取 hint。** 原先设计的 Hint Broker 及其整条链路（`PlatformClient.hint` /
+触发判定 / `HINT_RETRY` 状态 / `hints_taken` 记账 / Journal 的 hint 事件与 fsync /
+`task.json.hint` 字段）已从代码与契约中整体移除，solver 的系统契约里也明确写死
+「HINTS ARE DISABLED」——不留任何调用入口。
 
-1. 该题至少完成过一次完整时间片，且 `correct_flag_count == 0`；
-2. `is_completed == false`（已通关题调用会 409，硬性禁止）；
-3. 扣分比例可接受（阈值可配）；
-4. 剩余预算还够再投一轮（取 hint 却没时间用 = 白扣分）。
+删除依据（两条，任一都足以否决）：
 
-**关于第 3 条的默认值**：本届文档提到 `hint_cost_radio` 但 `GET /challenges` 响应里**没有这个字段**（[open-questions.md](open-questions.md) A10），所以拿 hint 前无法知道会扣多少。**默认按 10% 估**，依据是上届两处口径均为 10%（HTTP API 文档「答题成功将从奖励分数中扣减10%」，MCP 文档「首次查看会扣除该题总分的 10%」，见 §10.3）。10% 换一轮重试在绝大多数情况下是划算的 —— 但这是**推定而非事实**，若主办方答复的比例显著更高，此默认值必须改。
+1. **成本不可知且不可逆。** 本届文档说按 `hint_cost_radio` 比例扣减，但
+   `GET /challenges` 响应里**没有这个字段**（[open-questions.md](open-questions.md) A10），
+   取之前无法知道扣多少。上届口径是 10%（HTTP 文档「扣减10%」、MCP 文档「扣除该题总分的 10%」，
+   见 §10.3），本届无从验证。一旦扣分比例显著更高，为一个 100 分的题取 hint 可能净亏。
+2. **实测期望收益为负。** 一次真实官方跑分中取了 10 次 hint，**只有 1 次**（`a-10`）
+   换来后续解出，其余 9 次对应的题最终全部 ABANDON —— 等于 9 道题白扣分且一分未得。
+   把同样的时间片投给「换策略重试」（`RETRY`）或 EVOSTER 修复的收益更高。
 
-取到 hint 后填入 `task.json.hint`，`attempt += 1`，走 `HINT_RETRY`。`hint` 为 `null` 时不重试，直接判 ABANDON。
+因此「取 hint 换一轮」的决策被彻底拿掉：零 flag 的题走普通 `RETRY`（`MAX_ATTEMPTS=2`）
+与 EVOSTER 在线修复，不再有任何「花钱买提示」的分支。
 
-**「是否已取过 hint」只能自己记。** 上届响应有 `hint_viewed` 布尔，**本届没有** —— 崩溃恢复后无法从平台读回这个状态，只能靠 State Journal。这使 hint 决策成为崩溃恢复路径上唯一不可对账的状态，Journal 的这一条必须写成同步落盘（append + fsync），不能进缓冲。
+**随之消失的崩溃恢复负担**：上届响应有 `hint_viewed` 布尔、本届没有，导致「这题是否已取过
+hint」在平台侧读不回来，曾是崩溃恢复路径上**唯一不可对账**的状态，需要 Journal 同步
+fsync 兜底（旧 §4.4）。不再取 hint 后，本地不再持有任何读不回来的状态，Journal 也就
+不再需要任何同步落盘事件 —— 这是一个顺带消除的复杂度。
+
+> 历史对比（上届有 hint、本届字段缺口）保留在 §10.3 与
+> [open-questions.md](open-questions.md) A10/A10b，作为「为什么不接」的证据链。
 
 ---
 
@@ -511,7 +540,6 @@ Hint Broker 触发条件（全部满足）：
 | **`403`（本届错误码表未列出）** | **推定为「关卡未解锁 / 比赛未开始」**（上届有此语义，见 §10.3）。处理：把该题移入 `LOCKED` 集合，**不再对其 start**，直到某次提交触发解锁后重新 `GET /challenges` 对账。绝不能当普通错误重试 —— 否则 Phase 1 会拿全部高关卡题反复撞墙，白烧预算与限频配额。本届是否真有 403 待确认（[open-questions.md](open-questions.md) A19），**但处理分支要先写好**：没有 403 时这段代码永不触发，零成本 |
 | `409 invalid_state` @ `POST /start` | 活跃数达上限 → 全局对账清僵尸；仍满则 close 优先级最低的题腾位置，退避后重试 |
 | `409 invalid_state` @ 其他接口 | 任务已结束 → 全局停机，落盘审计日志 |
-| `409 invalid_state` @ `GET /hint` | 该题已通关 → 标记 `is_completed`，不再对其调 hint |
 | `409 duplicate` @ submit | 标记该候选已入袋，继续下一个，**不算失败** |
 | **`429`（本届文档未提，上届为「每队每秒 3 次，所有接口共享计数」）** | **默认按 ≤3 req/s 自我限速**（全局令牌桶，所有接口共享一个桶），从源头避免撞限频；真收到 429 则退避 1s 重试。即使本届无限频，自我限速也无害 |
 | `503 resource_unavailable` | 指数退避 5s / 15s / 45s（带 jitter），3 次失败 → 该题排队尾，不阻塞其他题 |
@@ -656,13 +684,13 @@ token 尚未生效，以下除「端到端」外全部可以立刻做。
 
 | 层 | 手段 | 现在能做 |
 |---|---|---|
-| 平台 API 客户端 | 自建 mock server，实现 5 个接口 + 全部错误码 + `pending → available` 状态时序，编排器对着 mock 跑完整状态机 | ✅ |
+| 平台 API 客户端 | 自建 mock server，实现 5 个接口（含 hint，作绊线）+ 全部错误码 + `pending → available` 状态时序，编排器对着 mock 跑完整状态机 | ✅ |
 | 网关改写 | 纯函数单测，19 项白名单逐条断言 + 边界与幂等 | ✅ |
 | 配置解析 | 见下方 **§7.1 摄取用例矩阵** —— 这是唯一能提前防住「下次下发形状变了」的手段 | ✅ |
 | Solver 契约 | 假 solver：写假 flag、只写 `result.json` 不写 flags 文件、超时不退出、崩溃、产出脏输出、flag 散落在 stdout 里 —— 逐一验证收割与提交链路 | ✅ |
 | 韧性 | mock 注入 503 / 409 / 500 / 慢响应 / 连接重置，验证退避、对账、僵尸清理、崩溃恢复、收尾保护 | ✅ |
 | 并发闸门 | mock 返回 3 题 `available` + 第 4 题 start 409，验证腾位置逻辑 | ✅ |
-| 预算与 hint | 用极短 `TOTAL` 跑 mock，验证 Phase 1/2 切换、收尾保护、hint 触发与禁止条件 | ✅ |
+| 预算与重试 | 用极短 `TOTAL` 跑 mock，验证 Phase 1/2 切换、收尾保护、零 flag → `RETRY` 换策略；**绊线断言：整轮跑完 mock 的 hint 路由零命中**（§4.4） | ✅ |
 | 镜像验收 | `docker run --rm -e … agent:latest` 启动即自解；查体积 ≤3GB、无敏感文件、日志干净、无公网依赖 | ✅（除真 token） |
 | 端到端 | token 下发后真平台跑：先单题 → 再 3 题并发 → 再全程限时 | ⏳ 等 token |
 
@@ -799,7 +827,7 @@ token 尚未生效，以下除「端到端」外全部可以立刻做。
 | **限频：每队每秒最多 3 次调用，所有接口共享计数，超出返回 429** | 本届文档**完全没提限频**。这是 [open-questions.md](open-questions.md) A6 的具体化假设：编排器的 API Client 应**默认按 ≤3 req/s 自我限速**，即使本届没有也无害 |
 | **关卡 gating**：响应含 `current_level`，`403 = 比赛尚未开始 / 尚未解锁对应关卡`，提交正确后 `message` 追加 `【您已成功解锁新的关卡】` | 本届响应里**有 `level` 字段但没有 `current_level`，错误码表里也没有 403**。CHYing-agent 复盘佐证上届确实卡关（「卡在了第三关」）。**必须问清本届是否有 403 关卡门**（已列入 A19）—— 若有而编排器不处理 403，会在 Phase 1 把所有高关卡题反复撞墙，白烧预算 |
 | **hint 扣 10%**（`POST /api/hint`，「答题成功将从奖励分数中扣减10%」；MCP 文档同口径） | 本届文档说「按 `hint_cost_radio` 比例扣减」但**响应里不给这个字段**（A10 缺口）。**10% 是一个有出处的默认值**，B6 的保守全局阈值应以此起步 |
-| 响应含 `hint_viewed` 布尔；实例状态为 `stopped/pending/running`；`entrypoint` 为数组且仅运行时返回 | 本届 `container_status` 多了一个 `stop_pending`（四态），且**没有 `hint_viewed`** → 是否取过 hint 只能靠我们自己的 State Journal 记，崩溃恢复后无法从平台读回。`entrypoint` 数组语义与本届 `container_addr` 一致，**印证了 [platform-api.md](platform-api.md) §4.1 的分析** |
+| 响应含 `hint_viewed` 布尔；实例状态为 `stopped/pending/running`；`entrypoint` 为数组且仅运行时返回 | 本届 `container_status` 多了一个 `stop_pending`（四态），且**没有 `hint_viewed`** → 上届可查的「是否取过 hint」本届读不回来，曾是崩溃恢复的唯一缺口（旧 §4.4）。**本届不取 hint，该缺口随之消失**。`entrypoint` 数组语义与本届 `container_addr` 一致，**印证了 [platform-api.md](platform-api.md) §4.1 的分析** |
 | 上届主赛**共 54 个 flag**（CHYing-agent 复盘） | A9（题集规模）的第一个真实数据点。按 54 flag / 两阶段预算反推，Phase 1 的每题时间片量级是可估的 |
 | 第二届**同时提供 MCP 接入**（5 工具 + 5 种框架示例） | 见 §9.2 勘误。本届改回纯 REST；但上届有 MCP 说明主办方有能力提供，**平台页面上是否另有现成网关地址/MCP 端点值得去问**（A18）。另：上届 MCP 文档里的模型配置写的是 `MODEL_URL = "<LLM_GATEWAY_URL>" # 您生成的大模型网关地址` —— **上届是直接下发一个生成好的网关 URL，本届改成下发改写规则让我们自己拼**。这个差异需要确认（A18）：若本届平台页面其实也直接给了拼好的网关地址，我们手拼 `.tsecbench.gw` 就有出错风险，而这是 §6.2 说的「单点风险最高的 20 行代码」 |
 | BreachWeave 的 host 侧规划 loop：30s 轮询、严守 3 实例、`runtime.maxSolvers`、按 `total_score/total_got_score` 排窗、久攻不下主动释放窗口、planner/solver prompt 解耦 | **与本项目 §3/§4 独立设计出的方案高度同构**，是一次有效的交叉验证。差异点：它是 30s 固定轮询，我们是事件驱动 + 轮询兜底；它把策略做成可配 prompt，我们做成确定性代码 —— 后者更符合 §0「规则明确的事不交给大模型」 |
@@ -825,7 +853,7 @@ token 尚未生效，以下除「端到端」外全部可以立刻做。
 | Rust 用途明确为高速暴力枚举，且**优先用 `feroxbuster`** 而非自研 | 用户决策 + 现成工具优先 | §1 / [image-spec.md](image-spec.md) §3 |
 | API Client 默认自我限速 ≤3 req/s | 上届限频规则 | §5.1 |
 | 新增 `403` 错误码处理分支（关卡未解锁 / 比赛未开始） | 上届有 403 关卡门，本届错误码表无 403 | §5.1 |
-| hint 扣分默认阈值取 **10%** | 上届两口径均为 10% | §4.4 |
+| ~~hint 扣分默认阈值取 **10%**~~ → **不取 hint**（整条链路删除） | 成本不可知（A10）+ 实测 10 次仅 1 次换出解出，期望收益为负 | §4.4 |
 | 构建期泄漏检查新增「不得含 `refs/` 与上届题目素材」 | 平台作弊条款 + 审计公开 | [image-spec.md](image-spec.md) §6 |
 | 撤回 §9.3 对 ARTEMIS 技术栈描述的错误否定 | clone 后见 `codex-rs/` | §9.3 |
 | 撤回 §9.1 里 ARTEMIS 的性能数字作为选型依据 | 仓库正文无这些数字，仅论文口径，本地无法核实 | §9.1 |
@@ -934,7 +962,7 @@ token 尚未生效，以下除「端到端」外全部可以立刻做。
 | Phase 1 时间片 | 公式 `0.45×TOTAL / 题数` | **162min ÷（63 题 ÷ 3 并发 = 21 波）≈ 7~8min/题** | 上下限按此收敛；「先易后难、快速落袋」（§4.2）的权重更高 |
 | Phase 2 | — | ≈188min（按进展度重投） | 不变 |
 | 仍需向主办方问的 | 是否多机 / Windows / 云形态 | **A9 保留 + 新增 A20（云攻击域靶场形态）** | 见 §13.2 |
-| hint 默认 | 10% | 不变 | — |
+| hint | 默认 10% 阈值 | **不取 hint**（链路整体删除） | 见 §4.4 |
 
 ### 13.2 六域覆盖自检（现状映射 + 缺口）
 

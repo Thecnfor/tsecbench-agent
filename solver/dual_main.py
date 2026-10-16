@@ -3,7 +3,7 @@
 
 双内核耦合（.trae/documents/dual-kernel-solver-plan.md）：
   治理层（本文件，v0 = 动态提示词注入的雏形）：
-    读 SOLVER_TASK → setup_orch_mode 组装契约/目标/prior/hint →
+    读 SOLVER_TASK → setup_orch_mode 组装契约/目标/prior →
     APPEND_SYSTEM.md 进程内注入（不覆盖 pi 默认系统提示）
   执行层：@earendil-works/pi-coding-agent headless 单发解题
 
@@ -188,9 +188,7 @@ def main() -> int:
                 + (decision["strategy"])
             )
     # 治理层知识检索（离线 kb，零 LLM）
-    task_text = " ".join(
-        str(x) for x in (task.get("description") or "", task.get("hint") or "", common.TARGET_INFO)
-    )
+    task_text = " ".join(str(x) for x in (task.get("description") or "", common.TARGET_INFO))
     knowledge = kb_snippets(task_text)
     if knowledge:
         sess.log("kb", sections=len(knowledge.split("## KB:")) - 1)

@@ -121,6 +121,7 @@ def main() -> int:
     totals = common.TOTALS
     totals.update({"prompt": 0, "completion": 0, "calls": 0, "llm_errors": 0})
     nudges = 0
+    closing_nudged = False
     last_prompt_tokens = 0
     turn = 0
 
@@ -198,6 +199,11 @@ def main() -> int:
                 )
                 continue
 
+            remaining = common.remaining_seconds()
+            if remaining is not None:
+                # 单条命令不得吃掉整片：最多用掉剩余时间的一半，留出后续轮次。
+                # 实测有题在 300s 片里跑一条 150s 的映射脚本，一轮就烧掉半片。
+                t = min(t, max(20, int(remaining * 0.5)))
             t = max(5, min(t, 600))
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
@@ -211,9 +217,26 @@ def main() -> int:
             for flag in find_flags(result["output"]):
                 report_candidate(flag)
 
+            remaining = common.remaining_seconds()
+            # 只在时间紧时附带剩余秒数（常态不注入，省 token）
+            note = ""
+            if remaining is not None and common.SLICE_S and remaining < 0.4 * common.SLICE_S:
+                note = f" | slice_time_left={int(remaining)}s"
             messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": f"[{meta}]\n{out}"}
+                {"role": "tool", "tool_call_id": call.id, "content": f"[{meta}{note}]\n{out}"}
             )
+            # 收尾提示：片快用尽时要求收敛（只改节奏，不打断已有探索）
+            if remaining is not None and remaining < 60 and not closing_nudged:
+                closing_nudged = True
+                print("[solver] closing nudge: slice nearly over", flush=True)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Time slice is nearly over. Stop opening new threads: verify any "
+                        "candidate flag you already have and output it now. If nothing is confirmed, "
+                        "write your best hypothesis and next step to /root/notes.md.",
+                    }
+                )
 
         # Context guard: drop oldest tool exchanges when the prompt gets large.
         if last_prompt_tokens > 45000 or len(messages) > 140:

@@ -160,7 +160,6 @@ def select(task: dict) -> tuple[str, str]:
         for x in (
             task.get("description") or "",
             *(task.get("targets") or []),
-            task.get("hint") or "",
         )
     )
     cat = classify(text)

@@ -8,7 +8,7 @@
 ## 0. 动机、边界与映射总表
 
 初赛前夜（2026-10-17 开赛）只做**加法升级**：不动 `docker/Dockerfile`、
-不动 toolchain 版本真值源、不动并发/hint/submit 的既有经济学；全部新层
+不动 toolchain 版本真值源、不动并发/submit 的既有经济学；全部新层
 确定性实现、离线可测、任一环节失败即退回原路径。五层与仓库落点：
 
 | 层 | 机制来源 | 仓库落点 | 目标语义 | 状态 |
@@ -55,10 +55,10 @@ dual_main 原先的 `proc.communicate(timeout)` 整批等待。行到即处理�
 
 ### 2.3 语义红线
 
-早收交后**不杀在跑 solver**（完成收尾仍走原状态机）；hint 触发条件
-（完整时间片 + 零 flag + 未取过）不受本地早交影响 —— `correct_flag_count`
-是平台对账真值；超时杀进程组纪律不变（killpg，不留孤儿）；Journal 的
-hint 记账只在既有路径写入。
+早收交后**不杀在跑 solver**（完成收尾仍走原状态机）；重试触发条件
+（完整时间片 + 零 flag）不受本地早交影响 —— `correct_flag_count`
+是平台对账真值；超时杀进程组纪律不变（killpg，不留孤儿）。
+（注：hint 链路已整体删除，见 architecture.md §4.4；本层的早收割不与之耦合。）
 
 ## 3. L2 ReActNet 图工程
 
@@ -130,7 +130,7 @@ APPEND_SYSTEM，标头写明「generic，按当前题型退化改写」。旧 so
 
 ### 5.2 红线
 
-`MAX_ATTEMPTS`、hint 经济学、finalize 收尾保护一律不动 —— 本层只在既有
+`MAX_ATTEMPTS`、finalize 收尾保护一律不动 —— 本层只在既有
 attempt 预算内选择「换什么姿势重投」，不放宽任何闸门；widen 切片覆盖
 用一次即清（`rec.next_slice_s`），`repair_widened` 防重复放大。
 

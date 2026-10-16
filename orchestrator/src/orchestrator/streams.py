@@ -8,7 +8,7 @@
 红线不变（§2.3）：
   - 不杀在跑的 solver（早交后仍等自然退出，收尾走原状态机）；
   - 去重仍靠 rec.submitted（早交与片尾收割同一真值）；
-  - hint 经济学不动（correct_flag_count 是平台真值，本地早交不修改）。
+  - 计分经济学不动（correct_flag_count 是平台真值，本地早交不修改）。
 """
 
 from __future__ import annotations

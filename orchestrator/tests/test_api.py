@@ -13,7 +13,6 @@ from orchestrator.api import (
     ChallengeGone,
     Duplicate,
     FlagRejected,
-    HintCompleted,
     LevelLocked,
     PlatformClient,
     ResourceUnavailable,
@@ -77,7 +76,6 @@ def test_full_five_interfaces(factory):
 
     row = run(wait_available())
     assert row["container_addr"]
-    assert run(c.hint("c1")) == "mock hint for c1"  # 通关前取 hint 正常
     result = run(c.submit("c1", "FLAG{a}"))
     assert result["matched_flag_index"] == 0
     assert run(c.close("c1"))["container_status"] == "stopped"
@@ -126,15 +124,6 @@ def test_start_409_is_start_full(factory):
         run(c.start(f"c{i}"))
     with pytest.raises(StartFull):
         run(c.start("c3"))
-
-
-def test_hint_on_completed_is_hint_completed(factory):
-    base, _ = factory([ChallengeSpec("c1", flags=["FLAG{a}"])])
-    c = client(base)
-    run(c.start("c1"))
-    run(c.submit("c1", "FLAG{a}"))
-    with pytest.raises(HintCompleted):
-        run(c.hint("c1"))
 
 
 def test_task_timeout_is_task_ended_from_list(factory):
