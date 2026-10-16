@@ -109,6 +109,19 @@ def test_priority_easy_not_starved_by_medium():
     assert order == ["easy100", "medium300"]
 
 
+def test_multi_flag_downweighted_to_back():
+    """多阶段题（flag_count>1）实测零产出，按成本放大排到队尾。
+
+    b-01（medium 1200 分 4 flag）原本性价比 600 排第一，放大后应低于
+    普通 medium 300 分单 flag 题。"""
+    records = {
+        "b-01": rec("b-01", difficulty="medium", total_score=1200, flag_count=4),
+        "medium300": rec("medium300", difficulty="medium", total_score=300, flag_count=1),
+    }
+    order = [r.unique_code for r in eligible(records)]
+    assert order == ["medium300", "b-01"]
+
+
 def test_priority_level_and_difficulty_tiebreak():
     """性价比相同时 level 升序，再 easy → hard。"""
     records = {
@@ -139,12 +152,22 @@ def test_concurrency_gate():
 
 
 def test_plan_phase1_slice_clamped():
-    """TOTAL=3600，6 题，并发 3：phase1 预算 1620s × 3 并发 / 6 题 = 810s/题。
+    """TOTAL=3600，6 题，并发 3：并发系数算出 810s，但被 Phase 1 上限 420s 夹住。
 
-    并发系数是关键：`预算 / 题数` 算的是串行墙钟，实际 3 路并发同时烧预算，
-    每题可用墙钟是它的 3 倍。漏掉系数会把片压到地板（实测 63 题全被压到 300s）。"""
+    并发系数：`预算/题数` 是串行墙钟，3 路并发应 ×3（漏掉会把片压到地板）。
+    Phase 1 上限：上限只决定「失败题占用槽位多久」——成功题几十秒就结束，
+    压到 420s 让一个槽位 30 分钟能周转 ~4 题（实测 1785s 的片让 3 个槽位被
+    b-01/b-02/b-03 独占 30 分钟）。"""
     plan = plan_phase(elapsed_s=0, total_s=3600, reserve_s=600, n_eligible=6)
-    assert (plan.phase, round(plan.slice_s), plan.finalize) == (1, 810, False)
+    assert (plan.phase, round(plan.slice_s), plan.finalize) == (1, 420, False)
+    assert plan.slice_cap_s == 420
+
+
+def test_phase1_cap_bounds_failing_challenge():
+    """高分多阶段题在 Phase 1 也拿不到超过上限的片（否则独占槽位）。"""
+    huge = rec("b-02", difficulty="hard", total_score=1800, flag_count=6)
+    plan = plan_phase(elapsed_s=0, total_s=21600, reserve_s=600, n_eligible=40, concurrency=3)
+    assert slice_for(huge, plan.slice_s, slice_min_s=300, slice_max_s=plan.slice_cap_s) == 420
 
 
 def test_plan_phase1_scales_with_concurrency():

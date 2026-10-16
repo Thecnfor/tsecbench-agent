@@ -353,7 +353,7 @@ async def run_agent(
                     rec,
                     plan.slice_s,
                     slice_min_s=config.slice_min_s,
-                    slice_max_s=config.slice_max_s,
+                    slice_max_s=plan.slice_cap_s,
                 )
                 rec.next_slice_s = None
                 task = asyncio.create_task(_pipeline(ctx, rec.unique_code, attempt_slice))

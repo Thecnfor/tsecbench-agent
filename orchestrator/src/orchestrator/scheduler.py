@@ -20,6 +20,11 @@ _DIFF_COST = {"easy": 0.6, "medium": 2.0, "hard": 4.0}
 PHASE1_BUDGET_RATIO = 0.45  # Phase 1 广撒网占总时限比例（§4.3）
 SLICE_MIN_S = 120
 SLICE_MAX_S = 1200
+# Phase 1 单题时间片上限（§4.3 修订）：上限只决定「**失败题占用槽位多久**」——
+# 成功题几十秒就结束，上限对它们无影响。实测 1785s 的片让 3 个槽位被
+# b-01/b-02/b-03 连续独占 30 分钟，其余 60 题全部排队。压到 420s 后，一个槽位
+# 30 分钟能周转 ~4 题。Phase 2 深挖不受此限（用 SLICE_MAX_S）。
+PHASE1_SLICE_MAX_S = 420
 
 # 时间片按剩余分数加权（§4.3 修订）：多阶段高分题（b-01 1200 / b-02 1800）
 # 与 200 分单题拿同样的片，实测 300s 下必死 —— 用 sqrt 缩放，避免 1800 分题
@@ -29,8 +34,15 @@ WEIGHT_FLOOR = 0.7
 WEIGHT_CEIL = 2.5
 
 
+# 多 flag（多阶段）题的额外成本系数（§4.2 修订）：实测 b-01/b-02/b-03（4/6/4 flag）
+# 试过 3 轮零产出，且每题要串联多个 flag 才算通关 —— 按 flag_count 放大预估成本，
+# 把它们排到队尾，先把单 flag 的题扫完（用户决策：得分优先）。
+_MULTI_FLAG_COST = 1.5
+
+
 def estimated_cost(rec: ChallengeRecord) -> float:
-    return _DIFF_COST.get(rec.difficulty, 2.0) * (1.0 + 0.1 * max(0, rec.level - 1))
+    base = _DIFF_COST.get(rec.difficulty, 2.0) * (1.0 + 0.1 * max(0, rec.level - 1))
+    return base * (1.0 + _MULTI_FLAG_COST * max(0, rec.flag_count - 1))
 
 
 def slice_weight(rec: ChallengeRecord) -> float:
@@ -83,8 +95,9 @@ def eligible(records: dict[str, ChallengeRecord]) -> list[ChallengeRecord]:
 @dataclass(slots=True)
 class PhasePlan:
     phase: int  # 1 广撒网 / 2 深挖
-    slice_s: float  # 每题时间片
+    slice_s: float  # 每题时间片（本 phase 的基准）
     finalize: bool  # 进入收尾保护
+    slice_cap_s: float = SLICE_MAX_S  # 本 phase 的单题上限（分数加权后夹到这里）
 
 
 def plan_phase(
@@ -115,16 +128,17 @@ def plan_phase(
     conc = max(1, concurrency)
     phase1_total = PHASE1_BUDGET_RATIO * total_s
     if elapsed_s < phase1_total and n_eligible > 0:
-        slice_s = max(slice_min_s, min(slice_max_s, phase1_total * conc / n_eligible))
+        cap1 = min(slice_max_s, PHASE1_SLICE_MAX_S)
+        slice_s = max(slice_min_s, min(cap1, phase1_total * conc / n_eligible))
         # Phase 1 末尾预留过渡：时间片不得超过 phase1 剩余
         slice_s = min(slice_s, max(slice_min_s, phase1_total - elapsed_s))
-        return PhasePlan(phase=1, slice_s=slice_s, finalize=False)
+        return PhasePlan(phase=1, slice_s=slice_s, finalize=False, slice_cap_s=cap1)
     # Phase 2：剩余预算摊给还有剩余分数的题；无剩余分数给最小片
     remaining_budget = remaining - reserve_s
     slice_s = max(slice_min_s, min(slice_max_s * 2, remaining_budget * conc / max(1, n_eligible)))
     if remaining_score <= 0:
         slice_s = slice_min_s
-    return PhasePlan(phase=2, slice_s=slice_s, finalize=False)
+    return PhasePlan(phase=2, slice_s=slice_s, finalize=False, slice_cap_s=slice_max_s * 2)
 
 
 def can_start(*, active_count: int, concurrency_limit: int) -> bool:
