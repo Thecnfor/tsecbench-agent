@@ -37,6 +37,8 @@ export interface BranchState {
   lastBystanderAt: number;
   lastCoreTs: number; // 最近一次 core_log / flag 事件（剪枝与停滞信号共用）
   recentCmds: string[]; // 最近 shell 命令（重复模式信号）
+  roundsSinceCore: number; // 连续无 core_log/flag 的轮数（轮级轻推信号）
+  nudgesUsed: number; // 本段 core_log 轻推次数
 }
 
 /** 序列化给 worker 跨段持有的分支状态（计数器不跨段，恢复即重置）。 */
@@ -92,6 +94,8 @@ export class BranchManager {
       lastBystanderAt: 0,
       lastCoreTs: now,
       recentCmds: [],
+      roundsSinceCore: 0,
+      nudgesUsed: 0,
     });
   }
 
@@ -114,6 +118,8 @@ export class BranchManager {
         lastBystanderAt: 0,
         lastCoreTs: now, // 恢复后给一个剪枝宽限期
         recentCmds: [],
+        roundsSinceCore: 0,
+        nudgesUsed: 0,
       });
       this.nextId = Math.max(this.nextId, st.id + 1);
       this.forkCount = Math.max(this.forkCount, st.id);
@@ -215,6 +221,8 @@ export class BranchManager {
       lastBystanderAt: 0,
       lastCoreTs: now,
       recentCmds: [],
+      roundsSinceCore: 0,
+      nudgesUsed: 0,
     };
     this.branches.set(id, branch);
     return { branch, directive };
@@ -282,10 +290,13 @@ export class BranchManager {
     return b;
   }
 
-  /** core_log / flag 事件到达 → 刷新停滞时钟。 */
+  /** core_log / flag 事件到达 → 刷新停滞时钟 + 轮级轻推计数。 */
   recordCore(id: number, now: number): void {
     const b = this.branches.get(id);
-    if (b && !b.pruned) b.lastCoreTs = now;
+    if (b && !b.pruned) {
+      b.lastCoreTs = now;
+      b.roundsSinceCore = 0;
+    }
   }
 
   /** 记录 shell 命令（重复模式信号）。 */

@@ -175,6 +175,9 @@ export interface Config {
   bystander_cooldown_sec: number;
   stall_short_sec: number;
   stall_long_sec: number;
+  // core_log 轮级轻推（执行层兜底）
+  core_log_nudge_rounds: number;
+  core_log_nudge_max: number;
   extra_env: Record<string, string>;
   llm_base_url: string;
   llm_api_key: string;
@@ -244,6 +247,10 @@ export const CFG: Config = {
   // 组合信号（任二成立触发）的分档阈值：停滞时长按题目分类取值
   stall_short_sec: num("AGENT_STALL_SHORT_SEC", "300"),
   stall_long_sec: num("AGENT_STALL_LONG_SEC", "600"),
+  // core_log 执行层兜底（轮级轻推，零 LLM 调用）：连续 N 轮无 core_log →
+  // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给旁观者。
+  core_log_nudge_rounds: num("AGENT_CORE_LOG_NUDGE_ROUNDS", "3"),
+  core_log_nudge_max: num("AGENT_CORE_LOG_NUDGE_MAX", "2"),
 
   // 追加到 shell 子进程环境的变量
   extra_env: {

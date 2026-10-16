@@ -709,6 +709,7 @@ export async function solveTask(
     }
 
     turn++;
+    const roundsAtTurnStart = br.roundsSinceCore; // core_log 轮计数基准（轮末比较用）
     const tLlmStart = nowSec();
     let resp: ChatResponse | null = null;
     let err: unknown = null;
@@ -858,6 +859,28 @@ export async function solveTask(
       } else {
         result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
       }
+      // core_log 轮级轻推（执行层兜底，零 LLM 调用）：本轮最后一个工具结果尾部附提醒。
+      // multiOn 闸 = core_log 工具在场（常规模式无此工具，提醒会诱导 unknown tool）。
+      // 实时判定（core_log 若发生在本分支本轮更早的 tc 上，rounds 已清零 → 不注入）。
+      if (
+        multiOn &&
+        tc === toolCallsRaw[toolCallsRaw.length - 1] &&
+        typeof result === "string" &&
+        br.roundsSinceCore >= CFG.core_log_nudge_rounds &&
+        br.nudgesUsed < CFG.core_log_nudge_max
+      ) {
+        const n =
+          result +
+          `\n[系统提醒·核心日志] 已连续 ${br.roundsSinceCore} 轮无 core_log：` +
+          `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）或已证伪的路径，` +
+          `请立即 core_log 一张证据卡再继续——黑板空白会被判定停滞（分支回收、旁观者无从插手）。`;
+        result = n;
+        br.nudgesUsed++;
+        br.roundsSinceCore = 0; // 给模型 3 轮响应期
+        log(
+          `[${code}] core_log nudge injected for branch ${br.id} (${br.nudgesUsed}/${CFG.core_log_nudge_max})`,
+        );
+      }
       const tToolEnd = nowSec();
       // 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联；起止 = 工具执行）
       conv.write("tool", {
@@ -877,6 +900,10 @@ export async function solveTask(
       );
       br.messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
     }
+
+    // 轮末 core_log 轮计数：本轮发生过 core/flag（rounds 被 recordCore 清零）或刚被
+    // 轻推归零时保持；否则累计（连续 N 轮触发下一轮的轻推判定）。
+    if (br.roundsSinceCore === roundsAtTurnStart) br.roundsSinceCore++;
 
     // 轮末 materialize fork（此时父分支上下文 tool 配对完整，拷贝协议安全）
     for (const pf of pendingForks) {

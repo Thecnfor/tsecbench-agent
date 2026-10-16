@@ -266,6 +266,99 @@ describe("fork 模式完整性", () => {
   });
 });
 
+describe("core_log 轮级轻推（执行层兜底）", () => {
+  /** 每轮 shell、永不 core_log 的脚本。 */
+  function shellOnlyClient() {
+    let n = 0;
+    const client: LlmClient = {
+      async create(opts) {
+        const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
+        if (sys === BYSTANDER_SYSTEM) throw new Error("旁观者不该被触发（stall 阈值已放大）");
+        n++;
+        return {
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [tc(`s${n}`, "shell", { command: `echo step${n}` })],
+              },
+            },
+          ],
+        };
+      },
+    };
+    return { client };
+  }
+
+  it("连续 3 轮无 core_log → 第 4/8 轮注入提醒，每段恰 2 次", async () => {
+    CFG.bystander_enabled = true; // multiOn（core_log 工具在场）但旁观者不触发
+    CFG.stall_short_sec = 99999; // 放大全部时间信号，专注测轮级轻推
+    const conv = rec().conversation("t-n1");
+    const { client } = shellOnlyClient();
+    CFG.task_max_turns = 8;
+    await solveTask(client, "t-n1", "卡", 600, conv, { taskClass: "short" });
+
+    const recs = convOf("t-n1");
+    const nudged = recs.filter(
+      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·核心日志]"),
+    );
+    expect(nudged.length).toBe(2); // 恰 2 次（上限）
+    // 注入落在第 4、8 轮的工具结果上（turn 后缀）
+    expect(String(nudged[0].turn)).toMatch(/:4$/);
+    expect(String(nudged[1].turn)).toMatch(/:8$/);
+    // messages 与 conv 一致（不双份不遗漏）
+    // （conv 计数即忠实落盘；messages 内容由同一 result 变量写入）
+  });
+
+  it("该轮 core_log 清零 → 重新累计；多模态外常规模式绝不注入", async () => {
+    CFG.bystander_enabled = true;
+    CFG.stall_short_sec = 99999;
+    const conv = rec().conversation("t-n2");
+    let n = 0;
+    const client: LlmClient = {
+      async create(opts) {
+        if (
+          String(opts.messages.find((m) => m.role === "system")?.content ?? "") === BYSTANDER_SYSTEM
+        ) {
+          throw new Error("旁观者不该触发");
+        }
+        n++;
+        // 轮 2 调 core_log（应把轮计数清零 → 提醒从轮 2 后重新数 3 轮 → 第 5 轮注入）
+        const tcs =
+          n === 2
+            ? [tc("c1", "core_log", { note: "证据: 端口 8080 开放" })]
+            : [tc(`s${n}`, "shell", { command: `echo r${n}` })];
+        return {
+          choices: [{ message: { role: "assistant", content: null, tool_calls: tcs } }],
+        };
+      },
+    };
+    CFG.task_max_turns = 6;
+    await solveTask(client, "t-n2", "卡", 600, conv, { taskClass: "short" });
+    const recs = convOf("t-n2");
+    const nudged = recs.filter(
+      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·核心日志]"),
+    );
+    expect(nudged.length).toBe(1); // 轮2 清零 → 重新累计3轮 → 轮6 注入（6 轮内恰一次）
+    expect(String(nudged[0].turn)).toMatch(/:6$/);
+
+    // 常规模式（multiOn 关）：跑 8 轮绝不注入（无 core_log 工具，注入会诱导 unknown tool）
+    Object.assign(CFG, SNAP);
+    CFG.model = "deepseek-flash";
+    CFG.bystander_enabled = false;
+    CFG.fork_enabled = false;
+    CFG.task_max_turns = 8;
+    const conv2 = rec().conversation("t-n3");
+    const { client: plain } = shellOnlyClient();
+    await solveTask(plain, "t-n3", "卡", 600, conv2, { taskClass: "short" });
+    const recs2 = convOf("t-n3");
+    expect(
+      recs2.filter((r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒")).length,
+    ).toBe(0);
+  });
+});
+
 describe("旁观者模式完整性", () => {
   it("插嘴 messages/conv 各恰一条；续段不重复；冷却内不二次注入", async () => {
     CFG.bystander_enabled = true;
