@@ -60,14 +60,21 @@ export function buildServer(state: ArenaState, cfg: ArenaConfig): Server {
 }
 
 async function handle(state: ArenaState, cfg: ArenaConfig, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://arena.local");
+  const path = `${url.pathname}`;
+  const method = req.method ?? "GET";
+
+  // 存活探针（无鉴权、零信息量）：agent 容器 entrypoint 的 VPN 预检可指到
+  // http://<host>:<port>/healthz，本地跑 arena 时不依赖真 VPN。
+  if (path === "/healthz" && method === "GET") {
+    send(res, 200, { status: "ok" });
+    return;
+  }
   // ① token 守卫（官方：无效/缺失 → 404 task_not_found）
   if (req.headers["benchmark_token"] !== cfg.token) {
     sendErr(res, 404, "task_not_found", "missing or invalid BENCHMARK_TOKEN");
     return;
   }
-  const url = new URL(req.url ?? "/", "http://arena.local");
-  const path = `${url.pathname}`;
-  const method = req.method ?? "GET";
   const code = qsCode(url);
 
   if (path === "/openapi/v1/challenges" && method === "GET") {

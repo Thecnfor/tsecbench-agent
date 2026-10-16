@@ -33,7 +33,7 @@ class Handler(BaseHTTPRequestHandler):
             blob = WEB / "validator"
             if not blob.is_file():
                 # validator 不入库（gitignore），缺失时优雅降级（取法见本题包 README.md）
-                self._send(404, b"<h1>404 — validator not deployed</h1>", "text/html")
+                self._send(404, b"<h1>404 - validator not deployed</h1>", "text/html")
                 return
             self._send(
                 200,

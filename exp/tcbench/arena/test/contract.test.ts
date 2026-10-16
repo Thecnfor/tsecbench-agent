@@ -91,6 +91,12 @@ describe("API 契约（官方 §5）", () => {
     }
   });
 
+  it("/healthz 无鉴权可用（agent 容器 VPN 预检探针）", async () => {
+    const resp = await b.req("/healthz", "GET", undefined, null);
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toEqual({ status: "ok" });
+  });
+
   it("list：字段齐全、初始 stopped、container_addr 为空", async () => {
     const resp = await b.req("/openapi/v1/challenges");
     expect(resp.status).toBe(200);
