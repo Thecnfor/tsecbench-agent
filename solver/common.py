@@ -239,8 +239,13 @@ def kb_snippets(text: str, top_k: int = 3) -> str:
     if not hits:
         return ""
     blocks = [f"## KB: {h['doc']}/{h['section']}\n{h['body']}" for h in hits]
-    return "# KNOWLEDGE (offline cheatsheet hits for THIS task — try these first)\n" + "\n\n".join(
-        blocks
+    return (
+        "# KNOWLEDGE — APPLY FIRST (offline cheatsheet hits for THIS task)\n"
+        "If a section below matches this challenge, your FIRST command MUST apply its payload "
+        "directly (substitute the target host/port). Do NOT re-derive or spend turns exploring "
+        "what the cheatsheet already states — running the payload IS the verification. Only "
+        "improvise after the known technique has been tried and observed to fail.\n\n"
+        + "\n\n".join(blocks)
     )
 
 

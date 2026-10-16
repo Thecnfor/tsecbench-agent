@@ -38,8 +38,8 @@ run:
 ## 只有改 orchestrator/ 才需要这个（进程启动即把代码载入内存）。
 ## 重启走崩溃恢复：journal + 平台对账续跑，已解出的题不会丢。
 rerun:
-	-@pkill -f '[s]olver/main\.py' 2>/dev/null
-	-@pkill -f 'python -m [o]rchestrator' 2>/dev/null
+	-@pkill -f '/solver/main\.py$$' 2>/dev/null
+	-@pkill -f 'python -m orchestrator$$' 2>/dev/null
 	@sleep 1
 	@set -a; . ./solver/.env; set +a; \
 	 SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) nohup $(UV) run python -m orchestrator >> /tmp/tsec-run.log 2>&1 & \
