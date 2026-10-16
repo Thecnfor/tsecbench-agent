@@ -243,7 +243,8 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_REASONING_EFFORT_SHORT` | 短题思考档位（`low`/`medium`/`high`；空=不发=模型默认档，空即关特性） | `low` |
 | `AGENT_REASONING_EFFORT_LONG` | 长题思考档位（空=不发=模型默认档，不降质） | ``（空） |
 | `AGENT_CORE_LOG_NUDGE_ROUNDS` / `AGENT_CORE_LOG_NUDGE_MAX` | core_log 轮级轻推：连续 N 轮无记录提醒 / 每段每分支上限 | `3` / `2` |
-| `AGENT_STALL_SHORT_SEC` / `AGENT_STALL_LONG_SEC` | 停滞信号阈值（短题/长题分档） | `300` / `600` |
+| `AGENT_STALL_SHORT_SEC` / `AGENT_STALL_LONG_SEC` | 分支停滞阈值（短题/长题分档） | `300` / `600` |
+| `AGENT_FLAG_STALL_SHORT_SEC` / `AGENT_FLAG_STALL_LONG_SEC` | **flag 主时钟**（题级：距上个新 flag 的介入阈值，一票触发；以 flag 为核心） | `400` / `900` |
 | `AGENT_VISION` | 多模态读图 `auto`/`on`/`off`（auto=网关拒图时本会话降级为文本，只给元数据） | `auto` |
 | `AGENT_VISION_MAX_KB` | `action=view` 单图 data URL 上限，超出先自动压缩 | `4096` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
