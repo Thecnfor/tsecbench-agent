@@ -1,0 +1,13 @@
+{
+  "unique_code": "web_sqli_01",
+  "description": "登录页存在 SQL 注入，注入进后台拿到管理员会话后读取 flag",
+  "difficulty": "easy",
+  "level": 1,
+  "total_score": 100,
+  "hint": "用户名输入框里试试单引号，想想 tautology 注入",
+  "hint_cost_ratio": 0.2,
+  "flags": ["FLAG{arena_demo_web_sqli}"],
+  "container_ports": [8080],
+  "flag_inject": "env",
+  "ready_path": "/"
+}

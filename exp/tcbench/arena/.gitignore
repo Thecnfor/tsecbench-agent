@@ -1,0 +1,8 @@
+# 依赖与构建产物不入库
+node_modules/
+dist/
+# 运行态（flag 进度/任务时限）不入库
+state.json
+*.log
+# 真题二进制不入库（来源见 challenges/f2-05/README.md，从 bench 存档取）
+challenges/f2-05/web/validator

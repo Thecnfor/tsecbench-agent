@@ -379,6 +379,12 @@ tcbench/
 │   ├── src/panel/                 # React 面板（web/ 前端 + server.ts + data.ts）
 │   ├── test/                      # vitest 自测（e2e.test.ts 离线端到端）
 │   └── README.md                  # 快速使用说明
+├── arena/                         # 内部本地跑分题场（自建计分服务 + docker 真靶机）
+│   ├── src/                       # server（路由/鉴权）/ state（状态机+计分+持久化）/ docker（驱动）
+│   ├── challenges/<code>/         # 题包：challenge.json + Dockerfile（含 flag 字面量；
+│   │                              #   .dockerignore 已排除 arena/，绝不进交付镜像）
+│   ├── test/                      # vitest 契约+单测（22 用例，离线，FakeDriver）
+│   └── README.md                  # 题场设计、题包 schema、ARENA_* 配置
 ├── docker/
 │   ├── Dockerfile                 # Kali + 渗透工具 + openvpn + 纯 JS agent 产物
 │   ├── entrypoint.sh              # VPN → 预检 → DNS → 冒烟 → 跑分
@@ -392,6 +398,22 @@ tcbench/
 │                                   #   （`nuclei-templates/cves.json` = CVE→模板路径 精确索引）
 └── tsec_agent/node_modules/        # pnpm 依赖（gitignore 不入库；镜像不带，运行时零第三方依赖）
 ```
+
+## 内部本地跑分题场（arena/）
+
+不依赖官方下发 token 的自建计分服务：API 线格式与官方 Challenges API 逐字段一致，
+`start`/`close` 真的创建/删除 docker 靶机容器（active 上限 3、发布端口 9100-9199、
+label 对账），flag 运行时注入、计分/扣分/重复/终态全语义。agent 接入零改动：
+
+```bash
+cd arena && pnpm install && pnpm dev      # 127.0.0.1:8899，启动时预热构建靶机镜像
+# tsec_agent 侧 .env（local 模式）：BENCHMARK_BASE_URL=http://<宿主机>:8899、BENCHMARK_TOKEN=arena-dev-token
+```
+
+加题 = `arena/challenges/<code>/` 下写 `challenge.json` + `Dockerfile`。内置两道示例：
+`web_sqli_01`（SQL 注入，flag env 注入）与 `f2-05`（逆向题，从 bench 存档复刻的真题形态：
+静态页 + `/download` 下发 validator ELF，flag 是逆向产物不进容器）。红线：题包含 flag 字面量，
+`.dockerignore` 已排除 `arena/`，**别把它加回构建上下文**。细节见 `arena/README.md`。
 
 ## 测试
 

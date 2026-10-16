@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>f2-05 · 嵌入式授权引擎</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #0d1117; color: #c9d1d9;
+    min-height: 100vh; display: flex; justify-content: center; align-items: center;
+  }
+  .container { max-width: 720px; width: 100%; padding: 2rem; }
+  h1 {
+    font-size: 1.8rem; color: #58a6ff;
+    border-bottom: 1px solid #21262d; padding-bottom: .6rem; margin-bottom: 1rem;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 1.2rem; margin-bottom: 1rem;
+  }
+  .card h2 { font-size: 1.1rem; color: #58a6ff; margin-bottom: .6rem; }
+  p { line-height: 1.6; margin-bottom: .5rem; }
+  code { background: #1f2937; padding: 2px 6px; border-radius: 3px; font-size: .9em; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>&#x1F512; 嵌入式授权引擎</h1>
+
+  <div class="card">
+    <h2>&#x1F4CB; Challenge</h2>
+    <p>某嵌入式设备的固件中集成了一个授权引擎，需要输入正确的访问码才会输出设备的授权凭证。
+       该引擎对内部逻辑做了较强的保护。请逆向分析该程序，提取其中隐藏的 flag。</p>
+  </div>
+
+  <div class="card">
+    <h2>&#x1F4E5; Download</h2>
+    <p>Download the validator binary for analysis:</p>
+    <p style="margin-top:.4rem;"><a href="/download">&#x1F4BE; validator</a>
+       &nbsp;(ELF x86-64, stripped)</p>
+  </div>
+
+  <div class="card">
+    <h2>&#x1F4DD; Submit Answer</h2>
+    <p>逆向分析二进制、提取到 flag 后，直接提交 flag 字符串。</p>
+  </div>
+</div>
+</body>
+</html>

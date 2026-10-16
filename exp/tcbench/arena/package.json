@@ -1,0 +1,23 @@
+{
+  "name": "tcbench-arena",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TSecBench 内部本地跑分：题场 API（线格式兼容官方 Challenges API）+ docker 真靶机驱动",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "dev": "pnpm build && pnpm start",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

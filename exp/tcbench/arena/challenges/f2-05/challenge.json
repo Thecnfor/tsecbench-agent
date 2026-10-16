@@ -1,0 +1,13 @@
+{
+  "unique_code": "f2-05",
+  "description": "某嵌入式设备厂商为保护核心授权逻辑，自研了一套内部执行机制来承载访问码校验与凭据输出流程，该机制对逆向分析做了较强抵抗。请分析该可执行文件，理解其内部工作方式并取得被保护的凭据。",
+  "difficulty": "hard",
+  "level": 1,
+  "total_score": 500,
+  "hint": "二进制的字符串表里有访问码线索（如一段可疑的 KEY 字面量）；运行时逐字节输出的点号对应表里的 31 字节数据，想想每字节是怎么变换的。",
+  "hint_cost_ratio": 0.2,
+  "flags": ["FLAG{by73c0d3_vm_r3v3rs3d_0x5A}"],
+  "container_ports": [8080],
+  "flag_inject": "none",
+  "ready_path": "/"
+}
