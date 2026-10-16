@@ -146,6 +146,7 @@ export function dispatchBranchTool(
     return {
       result:
         `logged to core log (branch ${branchId}): ${note.slice(0, 120)}\n` +
+        `[六要素自查] 方法/参数/尝试方向/涉及范畴/结果/判断 齐了吗？判断带置信（已验证|不敢保证）。` +
         `(黑板文件全分支可读：tasks/<题目编号>/corelog.jsonl，可 shell cat 看全局进展)`,
     };
   }
