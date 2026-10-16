@@ -99,7 +99,7 @@ describe("多模态 action=view", () => {
     expect([w, h]).toEqual([1, 1]);
   });
 
-  it("AGENT_VISION=off → 文本模式（含 OCR 兜底提示）", async () => {
+  it("AGENT_VISION=off → 文本模式（只有元数据，不做本地 OCR）", async () => {
     setTaskCwd(imgdir);
     const old = CFG.vision;
     CFG.vision = "off";
@@ -107,6 +107,7 @@ describe("多模态 action=view", () => {
       const txt = await dispatchShell({ action: "view", path: "x.png" });
       expect(typeof txt).toBe("string");
       expect(String(txt)).toContain("文本模式");
+      expect(String(txt)).not.toContain("OCR");
     } finally {
       CFG.vision = old;
     }

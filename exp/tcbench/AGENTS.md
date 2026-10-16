@@ -67,7 +67,7 @@
    - 进程必须独立进程组（Node：`spawn detached:true`；Python 版是 `start_new_session`），kill 时整组杀，超时由 watcher 兜底。
    - **多模态**：`action=view` 把图片以 `image_url` part 作为**工具结果**返回（tool 消息
      的 content 可以是 parts 列表）；网关拒图时 `stripImages` 剥掉图片重试一次并把
-     `CFG.vision_ok` 置 False，本会话后续 view 走文本模式（OCR+元数据）。对话重建时
+     `CFG.vision_ok` 置 False，本会话后续 view 走文本模式（只有元数据）。对话重建时
      列表型 result 原样还原，**不能 JSON.stringify 成字符串**。
 3. **模型网关双模式**：local=官方 `https://api.deepseek.com/v1`（公网，key 在 `.env`），
    hosted=平台内网转写网关 `http://api.deepseek.com.tsecbench.gw/v1`（**依赖 VPN 内网 DNS，只在容器连上 VPN 后可解析**）。
@@ -242,10 +242,17 @@ POST {BASE}/openapi/v1/challenges/close?unique_code=X  释放名额（通关/放
 - [ ] 改了 Dockerfile/entrypoint → 重新 build + `--smoke` 验证
 - [ ] **镜像体积 ≤3GB——口径是 push 上传后的压缩体积**，不是 `docker images` 的原始数字：
   `docker save tsec-agent:latest | gzip -1 -c | wc -c` 实测。
-  **当前（2026-10-14）：原始 6.97GB / 压缩 1.58GB**（比值约 4.4×）。
-  已按要求装入：`metasploit-framework`（原始约 +1.7GB，含 mingw 硬依赖）、
-  `security-knowledge-base`（196MB）、JRE/python2/ssh/php/gcc/make/node/go/telnet；
-  `seclists` 全量字典、`oracle-instantclient`、`hashcat` 仍不要装
+  **当前（2026-10-16）：原始 10.1GB / 压缩 2.71GB**（比值约 3.7×，余量约 290MB）。
+  已按要求装入：`metasploit-framework`、`hashcat`（无 GPU=CPU/pocl，只做离线爆破）、`zaproxy`（`-cmd` 无头）、
+  `nuclei`、`responder`、`netexec` + BloodHound 采集器（`bloodhound-python`/`bloodhound-ce-python`/`sharphound`，
+  **不装 neo4j 服务端**）、`aircrack-ng`、`volatility3==2.28.2`（pip，命令 `vol`）、`ghidra`
+  （headless 入口 `analyzeHeadless` 已链到 PATH）、`security-knowledge-base`、
+  JRE/python2/ssh/php/gcc/make/node/go/telnet；
+  **版本口径**：基底按 digest 钉死、pip 精确钉版本、apt 跟 rolling 最新，全量快照在镜像内 `/opt/toolchain.lock`
+  （硬钉某包照它写 `pkg=ver`）；**新增安装层自己清理 doc/man/locale**（清理层在前，之后的层会自带一批），
+  且**删除只在 builder 阶段有意义**（最终阶段删 = 白花一层 whiteout，基底字节仍在 save 里）；
+  读图走多模态，**镜像不装 OCR 工具**（`tesseract` 不进镜像，拒图降级只给元数据）；
+  `seclists` 全量字典、`oracle-instantclient`、`nuclei-templates` 全量仍不要装
 - [ ] **限网运行**：容器只允许 AI API + 靶场 VPN 出站，公网全 ban。
   新依赖必须**预装进镜像**（apt/pip/字典），不要依赖运行时联网安装；
   新的外联需求先加到 Dockerfile 再改提示词

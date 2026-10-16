@@ -355,7 +355,7 @@ export function stripImages(messages: ChatMessage[]): number {
     if (had) {
       keep.unshift({
         type: "text",
-        text: "[网关不支持图像输入：本条图片已移除，请改用上一条文本里的OCR/元数据，或用 shell 分析原文件]",
+        text: "[网关不支持图像输入：本条图片已移除，请改用上一条文本里的元数据，或用 shell 分析原文件]",
       });
       m.content = keep;
     }

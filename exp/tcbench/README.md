@@ -125,7 +125,7 @@
 - **网络隔离**：容器 `NET_ADMIN + tun` 仅作用于自身 netns；宿主机路由表、DNS 均不被修改。
 - **多模态读图**：`{"action":"view","path":"..."}` 把图片本体作为工具结果返回给模型
   （截图/验证码/隐写图直接看懂；文件头解析尺寸、超限自动压缩、网关拒图自动降级为
-  OCR+元数据文本，见 `AGENT_VISION`）。
+  元数据文本，见 `AGENT_VISION`）。
 - **工具参数容错**：模型偶发把 shell 工具参数序列化坏（`action` 混入 XML 参数片段或整段命令、
   JSON 值漏引号）→ `shell_tool.parseToolArguments` 直接修复后照常执行，结果带
   `[参数已自动修复：…]` 前缀、原样参数记在 `events.jsonl` 的 `tool_arg_repaired`
@@ -230,7 +230,7 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
 | `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
-| `AGENT_VISION` | 多模态读图 `auto`/`on`/`off`（auto=网关拒图时本会话降级为文本+OCR） | `auto` |
+| `AGENT_VISION` | 多模态读图 `auto`/`on`/`off`（auto=网关拒图时本会话降级为文本，只给元数据） | `auto` |
 | `AGENT_VISION_MAX_KB` | `action=view` 单图 data URL 上限，超出先自动压缩 | `4096` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
 | `VPN_WAIT_SEC` | VPN 预检最长等待（hosted 强制） | `90` |
@@ -329,12 +329,20 @@ agent.js 自身：`0` 正常收尾 / `2` 模型网关不可达 / `4` 控制器�
 
 ## 目录结构
 
-> 镜像体积硬约束：**≤ 3 GB，口径是 push 上传后的压缩体积**（原始体积不是判据，两者约 4.4×）。
-> 实测（2026-10-14）：`docker images` **原始 6.97 GB**；压缩
-> `docker save tsec-agent:latest | gzip -1 -c | wc -c` = **1.58 GB** ✓
-> 已按要求装入的大件：`metasploit-framework`（原始约 1.7GB，硬依赖 mingw-w64）、
-> `security-knowledge-base`（196MB 离线知识库）、JRE / python2 / ssh / php / gcc / make / node / go / telnet。
-> 仍不要引入：seclists 全量字典、oracle-instantclient、hashcat（无 GPU 用 john）。
+> 镜像体积硬约束：**≤ 3 GB，口径是 push 上传后的压缩体积**（原始体积不是判据，实测比值约 3.7×）。
+> 实测（2026-10-16）：`docker images` **原始 10.1 GB**；压缩
+> `docker save tsec-agent:latest | gzip -1 -c | wc -c` = **2.71 GB** ✓（余量约 290 MB）
+> 工具面（按领域覆盖、同类去重，每类留代表）：`metasploit-framework`、
+> `hashcat`（容器无 GPU → CPU/pocl，只做离线爆破）、`zaproxy`（`-cmd -quickurl …` 无头 Web 漏扫）、
+> `nuclei`、`responder`、`netexec` + BloodHound 采集器（`bloodhound-python` /
+> `bloodhound-ce-python` / `sharphound`，**不装 neo4j 服务端**）、`aircrack-ng`、
+> `volatility3`（pip 钉 `==2.28.2`，命令 `vol`）、`ghidra` 12.1.4（headless 入口 `analyzeHeadless`，
+> 已链到 PATH）、`security-knowledge-base` 离线知识库，以及 JRE/python2/ssh/php/gcc/make/node/go/telnet。
+> 版本口径：基底 `kalilinux/kali-rolling` 按 **digest 钉死**（升级 = 换两处 FROM 里的 sha256）、
+> pip 精确钉版本、apt 跟随 rolling 最新；当次解析到的全量版本快照在镜像内 **`/opt/toolchain.lock`**，
+> 要硬钉某个包照它写 `pkg=ver`。瘦身（doc/man/locale、`/usr/lib/jvm/*/jmods` ~340M、
+> ghidra Extensions）**只能在 builder 阶段删**——最终阶段删只加 whiteout 层，`docker save` 里基底字节照旧。
+> 仍不要引入：seclists 全量字典、oracle-instantclient、nuclei-templates 全量（GB 级，知识库里已有精选）。
 
 ```
 tcbench/

@@ -60,7 +60,7 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | 平台 API | 原生 `fetch` + `AbortSignal.timeout` | 同上，无 axios/undici 显式依赖 |
 | 记录持久化 | `node:fs`（appendFileSync JSONL + 原子 rename 写 meta） | 与 Python 版产物格式逐字节兼容，panel/续跑重建共用 |
 | 归档基线读取 | 系统 `tar`（`execFileSync`） | Node 无内置 tar.gz；容器/宿主机都有 GNU tar，不引 node-tar |
-| 压图 / OCR | 系统 `python3 -c PIL` / `tesseract` 子进程 | 与 Python 版一致（镜像已带 python3-pil 与 tesseract-ocr），不引 sharp/tesseract.js（体积与镜像约束） |
+| 压图 | 系统 `python3 -c PIL` 子进程 | 镜像已带 python3-pil；不引 sharp（体积与镜像约束）。读图**不用本地 OCR**（镜像不装 tesseract）——模型自带视觉能力，`view` 一律交图片本体，网关拒图时才降级为元数据文本 |
 | 前端 | **React 19 + Vite** | 只在构建期出现在 devDependencies；产物是静态文件，由 Node 服务托管 |
 | 面板服务 | Node 内置 `node:http` | 只读记录 + 转发平台 API，无 express |
 | 测试 | **Vitest** | 与 Vite 共用配置；`test/setup.ts` 在模块图加载前隔离宿主 `.env`；e2e 用 fake client + `vi.mock` 平台层，全离线 |
@@ -72,7 +72,7 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | 文件 | 职责 |
 | --- | --- |
 | `agent.ts` | 控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close；并行调度、分段解题、VPN 守卫、平台终态收敛、`--smoke` |
-| `shell.ts` | 异步 shell：Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（含 PIL 压图/OCR 降级） |
+| `shell.ts` | 异步 shell：Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（PIL 压图；网关拒图降级为元数据文本） |
 | `shell_tool.ts` | shell 工具 schema、参数容错修复（`parseToolArguments`）、动作路由 |
 | `llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换（匿名优先，标签只带尾 4 位掩码） |
 | `bench.ts` | 平台 API 客户端（fetch/start/close/选题策略/名额释放），错误码分类（含 `TaskFinishedError` 终态） |

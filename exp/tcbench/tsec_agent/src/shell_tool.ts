@@ -24,7 +24,7 @@ export const SHELL_TOOL_SCHEMA = {
       "Multimodal: to look at an image (screenshot, chart, captcha, photo) call " +
       "action=view with path — the picture itself is returned to you, so you can " +
       "read/understand it directly; if the gateway rejects images it degrades to " +
-      "text (OCR + metadata) automatically. " +
+      "text (metadata) automatically. " +
       "Actions: run (default), wait, wait_any (block until ANY of several jobs " +
       "makes progress), status, kill, list, view. " +
       "Environment already contains BENCHMARK_TOKEN and BENCHMARK_BASE_URL.",

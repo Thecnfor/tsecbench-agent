@@ -5,13 +5,24 @@
 #
 # 两阶段构建：阶段1 全量安装+裁剪（裁掉的文件留在中间层）；阶段2 只 COPY 最终
 # 文件系统——否则 seclists 这种"装 1.9G 再删"会把镜像层撑爆。
+#
+# 版本口径（不搞 Nix 级锁定，够用即可）：
+#   - 系统基底：两个 FROM 都按 **digest 钉死**（= 当前 kali-rolling 最新内容，2026-10-11）。
+#     升级系统 = `docker pull kalilinux/kali-rolling` 后把两处 sha256 换成新 digest（同一字符串）。
+#   - apt 工具：随 kali-rolling 滚动用最新（Kali 源只留当前版本，硬钉 `pkg=ver` 过几周必然构建失败）；
+#     当次解析到的全部版本落在镜像内 **/opt/toolchain.lock**（dpkg-query -W + pip3 list），
+#     要复现旧版本/硬钉某个包时照它写 `pkg=ver` 即可。
+#   - pip：PyPI 版本长期可取，**精确钉死**（见 volatility3 那层）。
 # 已知连带依赖教训（勿再"无意间"引入）：
 #   commix → unicorn-magic → metasploit(632M) + oracle-instantclient(206M) + mingw(490M)
-#   hashcat → pocl-opencl-icd(127M)（容器无 GPU，hashcat 无意义，用 john 代替）
-#   注：metasploit 现在是**有意安装**（见文件尾的独立层），但别再靠 commix 这类间接带进来，
-#   也不要为了它去装 postgresql-server（msf 无库可用，DB 功能受限即可）。
+#   hashcat → pocl-opencl-icd + libpocl2t64/libllvm21（原始约 500M）：容器无 GPU，
+#     hashcat 只能走 CPU（pocl），只用于**离线、对时延不敏感**的哈希爆破，别拿它跑在线破解
+#   注：metasploit 与 hashcat 都是**有意安装**（见文件尾的独立层），别靠 commix 这类
+#   间接依赖把它们带进来，也不要为了 msf 去装 postgresql-server（msf 无库可用，DB 功能受限即可）。
+#   同理别碰：oracle-instantclient、seclists 全量（已裁剪）、nuclei-templates 全量
+#   （在线模板库 GB 级，且 offline 知识库 security-knowledge-base 里已有一份精选）。
 
-FROM kalilinux/kali-rolling AS builder
+FROM kalilinux/kali-rolling@sha256:02f5d6c019e549b0f55da58e835cad5355ef1030c6b2645265a324e37dfc4acc AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -45,7 +56,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tshark arp-scan hping3 net-tools \
         binutils file gdb strace ltrace radare2 ropper python3-pwntools \
         binwalk libimage-exiftool-perl steghide foremost \
-        tesseract-ocr tesseract-ocr-eng \
         exploitdb \
         wordlists seclists \
         expect rlwrap lsof p7zip-full zip unzip rsync tmux vim-tiny \
@@ -102,8 +112,75 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         metasploit-framework \
     && rm -rf /var/lib/apt/lists/*
 
+# ── 批量漏扫 / 内网协议 / 无线（按要求装；体积小的合一层，独立于前面缓存）──
+#   nuclei            : 模板化漏扫（模板走离线知识库 /opt/security-knowledge-base，不装 nuclei-templates）
+#   responder         : LLMNR/NBT-NS/MDNS 抢答与 SMB 中继
+#   netexec           : 内网协议横移（硬依赖 python3-impacket 已在前面，自带 bloodhound.py 采集器）
+#   bloodhound-ce-python : BloodHound CE 图数据采集器（只装采集器：neo4j 服务端硬依赖 +1GB，超预算）
+#   aircrack-ng       : 无线审计
+#   python3-yara/pycryptodome/artifacts : volatility3 插件与通用逆向取证的可选依赖（几 MB）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nuclei responder netexec bloodhound-ce-python sharphound aircrack-ng \
+        python3-yara python3-pycryptodome python3-artifacts \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── OWASP ZAP（Web 漏扫；无头跑 -cmd/-quickapi）────────────────────────────
+#   独立层：拉 default-jre 的 GUI 部分（headless JRE 前面已装，这里只补 GUI 库）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        zaproxy \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── hashcat（按要求装；独立层：连带 pocl/libllvm 约 500M 原始体积）──────────
+#   容器无 GPU → 只能 CPU(pocl) 爆破，适合离线哈希；在线/快爆破仍用 john/hydra。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        hashcat \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Ghidra（逆向；按要求装；最大单层 ~1.2G 原始体积，放最后免得拖累前面缓存）──
+#   Kali 包硬依赖 openjdk-25-jdk（Ghidra 12 需 JDK21+，连带 jdk-headless ~350M）；
+#   --no-install-recommends 会跳过 ghidra-data 样例工程。
+#   headless 分析器 /usr/share/ghidra/support/analyzeHeadless 不在 PATH → 链到 /usr/local/bin，
+#   无显示的容器里模型只能用它（ghidraRun 起 GUI 会直接失败）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ghidra \
+    && ln -sf /usr/share/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Volatility 3（内存取证；Kali 源无 volatility 包，走 pip 装 wheel）────────
+#   核心依赖只有 pefile（yara/pycryptodome 已由 apt 那层提供）；--no-cache-dir 不留 pip 缓存
+RUN pip3 install --break-system-packages --no-cache-dir volatility3==2.28.2 \
+    || pip3 install --no-cache-dir volatility3==2.28.2
+
+# ── 最终瘦身（builder 的最后一次清理，删掉的东西不进成品文件系统）──────────
+# 前面每个工具层都会把自己那批 doc/man/locale 带回来（清理层在它们之前），这里统一收口：
+#   doc/man/locale/lintian/bug/omf : 与前段清理层同口径，纯文档与翻译
+#   jvm */jmods + */man + */demo   : 只有 jlink/jpackage 用得上（~340M，jmod=zip 不可再压），
+#                                    运行期 java/编译类工具都不读它
+#   ghidra/Extensions             : 可选扩展 zip（Jython/Z3/样例…），只在 GUI 扩展管理器里装，
+#                                   headless analyzeHeadless 不加载
+# ⚠️ 删除**必须发生在 builder 阶段**（本阶段的删除会随 `COPY --from=builder / /` 进成品）；
+#   放到最终阶段只会加一层 whiteout：基底镜像自身的 doc/locale 字节仍在 save 的 tar 里，
+#   实测压缩体积反而 +176KB（save|gzip 是按层收字节的，白花一层）。
+# 实测合计约：原始 560M / 压缩 450M——3GB 预算主要靠这一层（见文件头的体积口径）
+RUN rm -rf /usr/share/doc /usr/share/man /usr/share/locale /usr/share/lintian \
+           /usr/share/bug /usr/share/omf \
+           /usr/lib/jvm/*/jmods /usr/lib/jvm/*/man /usr/lib/jvm/*/demo \
+           /usr/share/ghidra/Extensions \
+           /var/log/* /var/cache/apt/* /var/lib/apt/lists/* \
+    && true
+
+# ── 版本锁文件：把本次构建实际解析到的版本落盘，供复现/硬钉参考 ──────────
+#   apt 随 kali-rolling 滚动（源只留当前版本，硬钉 pkg=ver 会随更新失效）；
+#   需要复现或钉死某个包时，从这里抄版本号写成 `pkg=ver` 即可。
+RUN { \
+        echo "# tsec-agent 镜像版本锁（构建自动生成；基底 digest 见 docker/Dockerfile 的 FROM 行）"; \
+        echo "# 升级：改 FROM 的 sha256 / pip 钉的版本；apt 工具跟随 kali-rolling 最新"; \
+        echo; echo "## dpkg"; dpkg-query -W; \
+        echo; echo "## pip"; pip3 list --format=freeze 2>/dev/null; \
+    } > /opt/toolchain.lock && wc -l /opt/toolchain.lock
+
 # ── 最终阶段：只拷贝成品文件系统（builder 中删除的文件不带进来）────────
-FROM kalilinux/kali-rolling
+FROM kalilinux/kali-rolling@sha256:02f5d6c019e549b0f55da58e835cad5355ef1030c6b2645265a324e37dfc4acc
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
