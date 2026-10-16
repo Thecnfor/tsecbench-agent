@@ -39,6 +39,7 @@ export class FetchLlmClient implements LlmClient {
     tool_choice?: string;
     temperature?: number;
     max_tokens?: number;
+    thinking?: { type: "disabled" } | { type: "enabled"; [k: string]: unknown };
     signal?: AbortSignal;
   }): Promise<ChatResponse> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -53,6 +54,7 @@ export class FetchLlmClient implements LlmClient {
       body.tool_choice = opts.tool_choice ?? "auto";
     }
     if (opts.max_tokens !== undefined) body.max_tokens = opts.max_tokens;
+    if (opts.thinking) body.thinking = opts.thinking; // 轻调用关思考省 completion
 
     const timeoutSig = AbortSignal.timeout(this.timeout * 1000);
     // AbortSignal.any 需 Node ≥20.3；Kali apt 的 nodejs 可能更旧 → 降级为只用超时信号
@@ -258,12 +260,14 @@ export function setStopCheck(fn: () => boolean): void {
  * - useTools=false：复盘总结轮/旁观者轮用——不下发工具，模型只能输出文本。
  * - extra.tools：动态工具集（fork/core_log/broadcast 开启时由 solveTask 组装）；
  *   缺省仍只有 shell（默认行为不变）。
+ * - extra.thinking：轻调用（旁观者/复盘）传 {type:"disabled"} 省 completion——
+ *   实测 thinking 占 completion 68-87%、占单题成本 37-69%（跨 4 run 归档统计）。
  */
 export async function callLlm(
   client: LlmClient,
   messages: ChatMessage[],
   useTools = true,
-  extra: { signal?: AbortSignal; tools?: unknown[] } = {},
+  extra: { signal?: AbortSignal; tools?: unknown[]; thinking?: { type: "disabled" } } = {},
 ): Promise<ChatResponse> {
   let delayMs = 2000;
   let attempt = 0;
@@ -282,6 +286,7 @@ export async function callLlm(
         opts.tools = extra.tools?.length ? extra.tools : [SHELL_TOOL_SCHEMA];
         opts.tool_choice = "auto";
       }
+      if (extra.thinking) opts.thinking = extra.thinking; // 轻调用关思考
       if (extra.signal) opts.signal = extra.signal; // 限时调用（通关总结）的中止信号
       return await active.create(opts);
     } catch (e) {

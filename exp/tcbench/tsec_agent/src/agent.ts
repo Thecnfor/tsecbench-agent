@@ -617,7 +617,8 @@ export async function solveTask(
           { role: "user", content: input },
         ],
         false,
-        { signal: ac.signal },
+        // 只要 ≤120 字建议：关思考省 completion（thinking 占成本大头，实测 37-69%）
+        { signal: ac.signal, thinking: { type: "disabled" } },
       );
       advice = (resp.choices[0].message.content ?? "").trim();
     } catch (e) {
@@ -955,7 +956,10 @@ export async function closingSummary(
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   let resp: ChatResponse;
   try {
-    resp = await callLlm(client, messages, false, { signal: ac.signal });
+    resp = await callLlm(client, messages, false, {
+      signal: ac.signal,
+      thinking: { type: "disabled" }, // 复盘是纯文本总结：关思考省 completion
+    });
   } catch (e) {
     const timedOut = ac.signal.aborted;
     const emsg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);

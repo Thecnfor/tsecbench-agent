@@ -369,6 +369,8 @@ describe("旁观者模式完整性", () => {
       async create(opts) {
         const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
         if (sys === BYSTANDER_SYSTEM) {
+          // 轻调用关思考（省 completion：thinking 实测占成本大头）
+          expect((opts.thinking as { type: string } | undefined)?.type).toBe("disabled");
           return {
             choices: [{ message: { role: "assistant", content: "换抽象层审计 JS。" } }],
           };

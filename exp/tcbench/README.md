@@ -229,6 +229,7 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_DEADLINE_SEC` | 任务总时限秒（0=不限） | `0` |
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
+| `AGENT_SHELL_MAX_OUTPUT` | 单条工具结果进上下文字符上限（截头留尾+日志路径指针；历史实测 tool.result 是膨胀与 thinking 成本第二大源头） | `8192` |
 | `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
 | `AGENT_FORK` | fork 多分支（`1`/`on` 开：分支工具 fork/core_log/broadcast + 交错轮转；缓存实测交错零代价） | `0` |
 | `AGENT_BYSTANDER` | 旁观者（`1`/`on` 开：卡塞组合信号触发独立短上下文插嘴；可单独于 fork 开） | `0` |

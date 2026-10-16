@@ -220,7 +220,11 @@ export const CFG: Config = {
 
   // shell 工具
   shell_default_wait_ms: num("AGENT_SHELL_WAIT_MS", "1500"),
-  shell_max_output: num("AGENT_SHELL_MAX_OUTPUT", "32768"),
+  // 单条工具结果进上下文的字符上限：8192（≈2k token）。曾为 32768——历史归档实测
+  // tool.result 占对话字节 29-40%，是上下文膨胀（f2-05 实测 88-143×）与 thinking
+  // 成本（占单题成本 37-69%）的第二大源头；截断头尾保留 + 结果自带日志路径，
+  // 全量可 tail（out_file/分页兜底既有机制）。ANSI 转义实测为 0（管道非 TTY 禁色），无需剥离。
+  shell_max_output: num("AGENT_SHELL_MAX_OUTPUT", "8192"),
   // 后台命令硬上限：到点整组 kill（有 out_file 兜底，杀掉不丢数据）；0=永不杀
   shell_hard_sec: num("AGENT_SHELL_HARD_SEC", "1800"),
   // 同时在跑的后台 job 上限（满了拒绝新 run）

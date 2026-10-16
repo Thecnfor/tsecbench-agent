@@ -42,6 +42,8 @@ export interface LlmClient {
     tool_choice?: string;
     temperature?: number;
     max_tokens?: number;
+    /** DeepSeek 思考控制：轻调用（旁观者/复盘/冒烟）传 {type:"disabled"} 省 completion */
+    thinking?: { type: "disabled" } | { type: "enabled"; [k: string]: unknown };
     signal?: AbortSignal;
   }): Promise<ChatResponse>;
 }

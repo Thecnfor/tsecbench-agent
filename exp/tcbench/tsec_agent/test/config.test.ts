@@ -97,3 +97,10 @@ describe("detect_mode", () => {
     expect(GATEWAY_SUFFIX).toBe(".tsecbench.gw");
   });
 });
+
+describe("成本优化默认值", () => {
+  it("shell_max_output 默认 8192（历史归档实测 tool.result 占字节 29-40%，是膨胀与 thinking 成本第二大源头）", async () => {
+    const { CFG } = await import("../src/config.js");
+    expect(CFG.shell_max_output).toBe(8192);
+  });
+});
