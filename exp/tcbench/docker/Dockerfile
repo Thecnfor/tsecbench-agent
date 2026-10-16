@@ -79,11 +79,6 @@ RUN pip3 install --break-system-packages --no-cache-dir \
         requests flask itsdangerous flask-unsign pydash cryptography pyjwt scapy \
     || pip3 install --no-cache-dir requests flask itsdangerous flask-unsign pydash cryptography pyjwt scapy
 
-# ── python 脚本运行时 lint（tsec_agent/src/py_lint.ts 检测 ruff，缺失时 stdlib ast 兜底）──
-# 宽松安装（版本实际值落 toolchain.lock，机制见文件头；不编造钉死号防构建断）
-RUN pip3 install --break-system-packages --no-cache-dir ruff \
-    || pip3 install --no-cache-dir ruff
-
 # ── 出站白名单防火墙（限网模式 entrypoint 下发规则用；独立层保前面缓存）──
 RUN apt-get update && apt-get install -y --no-install-recommends iptables \
     && rm -rf /var/lib/apt/lists/*
@@ -155,6 +150,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   核心依赖只有 pefile（yara/pycryptodome 已由 apt 那层提供）；--no-cache-dir 不留 pip 缓存
 RUN pip3 install --break-system-packages --no-cache-dir volatility3==2.28.2 \
     || pip3 install --no-cache-dir volatility3==2.28.2
+
+# ── python 脚本运行时 lint（tsec_agent/src/py_lint.ts 检测 ruff，缺失时 stdlib ast 兜底）──
+# 放 lock 层前：实际版本随本层之后的 toolchain.lock 记录（宽松安装不编造钉死号）；
+# 放尾部独立层：只新建一层，前面全部缓存命中（Dockerfile 缓存纪律同 Ghidra/独立层先例）。
+RUN pip3 install --break-system-packages --no-cache-dir ruff \
+    || pip3 install --no-cache-dir ruff
 
 # ── 最终瘦身（builder 的最后一次清理，删掉的东西不进成品文件系统）──────────
 # 前面每个工具层都会把自己那批 doc/man/locale 带回来（清理层在它们之前），这里统一收口：
