@@ -634,7 +634,7 @@ export async function solveTask(
         ? stalledNow
         : need.map((x) => ({
             b: active.reduce((a, c) => (a.lastCoreTs >= c.lastCoreTs ? a : c)),
-            sig: need[0].sig,
+            sig: x.sig,
           }));
     const chosen = pickFrom.reduce((a, c) =>
       stalledNow.length > 0
@@ -657,6 +657,7 @@ export async function solveTask(
     }
     const entries = corelog ? readCorelog(corelog.path) : [];
     const input = buildBystanderInput({
+      taskCard,
       entries,
       branchId: target.id,
       branchLabel: target.label,

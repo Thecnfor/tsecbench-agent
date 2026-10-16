@@ -310,6 +310,8 @@ describe("旁观者信号与输入", () => {
     led.setTotal(3);
     led.add(1, 0);
     const input = buildBystanderInput({
+      taskCard:
+        "请渗透以下题目并提交其全部 flag：\n- unique_code: t-99\n- 题目描述: 一个带登录的 CMS",
       entries: [
         {
           ts: "2026-10-16 10:00:01",
@@ -335,6 +337,7 @@ describe("旁观者信号与输入", () => {
         count: 1,
       },
     });
+    expect(input).toContain("t-99"); // 题面必须在（run5 缺题面致旁观者臆测换题）
     expect(input).toContain("1/3 (idx:1)");
     expect(input).toContain("SQLi 疑似");
     expect(input).toContain("sqlmap");
@@ -577,6 +580,7 @@ describe("旁观者越权建议检测（run5 真实判例集）", () => {
 
   it("输入尾锚定声明存在（buildBystanderInput 末尾）", () => {
     const input = buildBystanderInput({
+      taskCard: "拿掉目标全部 flag",
       entries: [],
       branchId: 0,
       branchNames: new Map([[0, "主分支"]]),
