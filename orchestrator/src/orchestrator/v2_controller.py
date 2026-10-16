@@ -16,6 +16,7 @@ import asyncio
 
 from . import streams
 from .v2_bridge import Delegate, Finish, PlannerBridge
+from .v2_state import IllegalTransition, SlotFullError
 
 
 class StubPlanner:
@@ -77,6 +78,7 @@ class V2Controller:
         self.controller = GraphController(max_parallel=max_parallel, node_timeout_s=node_timeout_s)
         self.bridge = PlannerBridge(memory=memory, controller=self.controller)
         self.runner = runner
+        self.skipped_delegates = 0  # planner 重复/越权委派被跳过的计数（观测位）
 
     async def _drive(self, planner, *, poll_interval: float = 0.01) -> None:
         loop = asyncio.get_running_loop()
@@ -84,10 +86,12 @@ class V2Controller:
         finished = False
         try:
             while True:
-                # 熔断扫描：到点节点标 DEAD_END 并释放槽
+                # 熔断扫描：到点节点标 DEAD_END、释放槽，并取消其在跑 task
                 for key in self.controller.expired():
                     self.bridge.confirm_state(key, explored=False)
-                    running.pop(key, None)
+                    task = running.pop(key, None)
+                    if task is not None:
+                        task.cancel()
                 # 空槽 + planner 决策（Finish 后不再派新活，只排空在跑的）
                 while not finished and self.controller.free_slots > 0:
                     action = await loop.run_in_executor(
@@ -96,8 +100,19 @@ class V2Controller:
                     if isinstance(action, Finish):
                         finished = True
                         break
-                    self.bridge.handle_delegate(action)
-                    self.controller.begin(action.key)
+                    try:
+                        self.bridge.handle_delegate(action)
+                        self.controller.begin(action.key)
+                    except IllegalTransition:
+                        # planner 重复委派已入图节点（add_node 幂等后 begin 对
+                        # 非 UNEXPLORED 抛错）或 parent 未知：跳过该节点、不炸
+                        # 主循环（确定性——在跑/已完成节点不受影响）。
+                        self.skipped_delegates += 1
+                        continue
+                    except SlotFullError:
+                        # begin 前置检查 free_slots 与此处之间无并发写入者，
+                        # 正常不会触发；若触发视为「本轮无槽」，下一拍重试。
+                        break
                     running[action.key] = asyncio.create_task(
                         self._run_node(action.key, action.directive)
                     )

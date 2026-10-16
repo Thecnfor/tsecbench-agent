@@ -79,3 +79,23 @@ class TestStubPlanner:
         assert set(runner.ran) == {"root", "child"}
         states = {k: v["state"] for k, v in ctl.controller.snapshot().items()}
         assert states == {"root": EXPLORED, "child": EXPLORED}
+
+
+class TestReDelegate:
+    def test_redelegate_explored_node_does_not_crash_loop(self):
+        """planner 重复委派已 EXPLORED 节点：跳过不炸，后续委派照常执行。"""
+        runner = FakeRunner()
+        planner = ScriptedPlanner(
+            [
+                Delegate(key="recon", directive="d1"),
+                Delegate(key="recon", directive="d1-again"),  # 重复委派
+                Delegate(key="probe", directive="d2", parent="recon"),
+                Finish("done"),
+            ]
+        )
+        ctl = V2Controller(runner=runner, max_parallel=3, node_timeout_s=900)
+        asyncio.run(ctl.run_for_test(planner=planner))
+        assert runner.ran == ["recon", "probe"]  # probe 未受重复委派影响
+        assert ctl.skipped_delegates == 1
+        states = {k: v["state"] for k, v in ctl.controller.snapshot().items()}
+        assert states == {"recon": EXPLORED, "probe": EXPLORED}
