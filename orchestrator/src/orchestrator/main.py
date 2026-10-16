@@ -39,6 +39,13 @@ from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
 AVAILABLE_TIMEOUT_S = 120.0
+# 等 available 的轮询退避（§4.1 修订）。原先固定 0.2s：3 个 pipeline 同时轮询 =
+# 15 req/s 需求，而全局令牌桶只有 3 req/s —— 轮询把桶吃满，submit/close 排在
+# 轮询后面，实测每题 solver_done→solved 固定多花 ~11s（63 题 ≈ 11 分钟纯开销）。
+# 改为自适应：前几拍快（容器常 1~3s 就绪），随后退避，把额度让给写操作。
+AVAILABLE_POLL_START_S = 0.3
+AVAILABLE_POLL_MAX_S = 2.0
+AVAILABLE_POLL_GROWTH = 1.6
 MAX_ATTEMPTS = 2  # 普通重试上限（失败一次后换策略再投一轮）
 
 
@@ -84,8 +91,13 @@ async def _safe_close(ctx: RunContext, rec: ChallengeRecord) -> None:
 
 
 async def _wait_available(ctx: RunContext, rec: ChallengeRecord, timeout_s: float) -> bool:
-    """轮询等 container_status == available（platform-api.md §4.1）。"""
+    """轮询等 container_status == available（platform-api.md §4.1）。
+
+    自适应退避：见 AVAILABLE_POLL_* 常量说明 —— 固定快轮询会吃满令牌桶，
+    把 submit/close 挤到队列后面。
+    """
     deadline = time.monotonic() + timeout_s
+    delay = AVAILABLE_POLL_START_S
     while time.monotonic() < deadline:
         rows = await _safe_list(ctx)
         if ctx.stopped:
@@ -100,7 +112,8 @@ async def _wait_available(ctx: RunContext, rec: ChallengeRecord, timeout_s: floa
                 return True
             if rec.container_status == "stopped":
                 return False
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(delay)
+        delay = min(AVAILABLE_POLL_MAX_S, delay * AVAILABLE_POLL_GROWTH)
     return False
 
 
