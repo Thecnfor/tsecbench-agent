@@ -27,6 +27,7 @@ import {
   bystanderMessage,
   bystanderShouldFire,
   evaluateStall,
+  isOverreachingAdvice,
   recentDigest,
 } from "./bystander.js";
 import { CFG, env, resolveAsync } from "./config.js";
@@ -666,28 +667,48 @@ export async function solveTask(
       segElapsedSec: t - segStartTs,
       signals: sig,
     });
-    let advice = "";
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 60_000);
-    try {
-      const resp = await callLlm(
-        client,
-        [
-          { role: "system", content: BYSTANDER_SYSTEM },
-          { role: "user", content: input },
-        ],
-        false,
-        // 只要 ≤120 字建议：关思考省 completion（thinking 占成本大头，实测 37-69%）
-        { signal: ac.signal, thinking: { type: "disabled" } },
+    // 单次调用（越权重写复用同入口）
+    const ask = async (extraRule: string): Promise<string> => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 60_000);
+      try {
+        const resp = await callLlm(
+          client,
+          [
+            { role: "system", content: BYSTANDER_SYSTEM },
+            { role: "user", content: input + extraRule },
+          ],
+          false,
+          // 只要 ≤120 字建议：关思考省 completion（thinking 占成本大头，实测 37-69%）
+          { signal: ac.signal, thinking: { type: "disabled" } },
+        );
+        return (resp.choices[0].message.content ?? "").trim();
+      } catch (e) {
+        log(
+          `[${code}] bystander call failed: ${e instanceof Error ? `${e.name}: ${e.message}` : e}`,
+        );
+        return "";
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    let advice = await ask("");
+    if (!advice) return; // 失败不消耗限频额度
+    // 越权过滤（run5 实测 8/12 注入陷"转攻别的题"循环——执行者无换题能力）：
+    // 首稿越权 → 带硬约束重写一次；仍越权 → 丢弃（不注入不耗额度）
+    if (isOverreachingAdvice(advice)) {
+      log(`[${code}] bystander advice overreaching (换题类)，rewriting once`);
+      const retry = await ask(
+        "\n\n【重写约束】上一稿越权：只准给当前题目内的下一步（换方法/换层面/换子目标）；" +
+          "删除一切换题、做其他题、动平台接口的表述，否则整稿作废。",
       );
-      advice = (resp.choices[0].message.content ?? "").trim();
-    } catch (e) {
-      log(`[${code}] bystander call failed: ${e instanceof Error ? `${e.name}: ${e.message}` : e}`);
-      return; // 失败不消耗限频额度
-    } finally {
-      clearTimeout(timer);
+      if (!retry || isOverreachingAdvice(retry)) {
+        log(`[${code}] bystander advice still overreaching; DROPPED`);
+        rec().event("bystander_advice_rejected", { branch: target.id });
+        return;
+      }
+      advice = retry;
     }
-    if (!advice) return;
     const content = bystanderMessage(advice);
     target.messages.push({ role: "user", content });
     target.active = true; // 插嘴 = 新方向，激活 parked 分支

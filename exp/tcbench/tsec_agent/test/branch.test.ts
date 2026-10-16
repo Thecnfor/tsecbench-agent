@@ -10,6 +10,7 @@ import {
   bystanderMessage,
   bystanderShouldFire,
   evaluateStall,
+  isOverreachingAdvice,
   recentDigest,
 } from "../src/bystander.js";
 import {
@@ -546,5 +547,53 @@ describe("records 分支重建", () => {
     // 从孤儿 assistant（seq 3）截断：只剩 sys + card
     expect(msgs.length).toBe(2);
     expect(msgs.at(-1)?.content).toBe("card");
+  });
+});
+
+describe("旁观者越权建议检测（run5 真实判例集）", () => {
+  it("题内合法建议放行", () => {
+    // run5 [1][2][3]：题内换层面/换方法/纠错
+    expect(
+      isOverreachingAdvice(
+        "别再换参数。关键在 VM：31 字节数据与 4 字节 key 的运算才是来源，动态 dump 中间值",
+      ),
+    ).toBe(false);
+    expect(isOverreachingAdvice("B 的偏移可能错了：先核对真实文件偏移与段映射，再试解压")).toBe(
+      false,
+    );
+    expect(isOverreachingAdvice("改攻 8080 端口的注入点")).toBe(false); // 题内换目标合法
+  });
+
+  it("换题类越权命中（run5 条4-12 形态）", () => {
+    expect(isOverreachingAdvice("平台确认还有 web_sqli_01 未动，应转向该 SQLi 分支")).toBe(true);
+    expect(isOverreachingAdvice("若 8899 无果，转 web_sqli_01。")).toBe(true);
+    expect(isOverreachingAdvice("立即止损，转攻未动的 web_sqli_01：从注入点直接取库内 flag")).toBe(
+      true,
+    );
+    expect(isOverreachingAdvice("停掉 f2-05 全部动作，转攻完全未动的题")).toBe(true);
+    expect(isOverreachingAdvice("主分支已明确拒绝换题——继续观察")).toBe(true); // 含"换题"字样即触发重写（保守）
+    expect(isOverreachingAdvice("直接调用平台 start 接口换题")).toBe(true);
+  });
+
+  it("输入尾锚定声明存在（buildBystanderInput 末尾）", () => {
+    const input = buildBystanderInput({
+      entries: [],
+      branchId: 0,
+      branchNames: new Map([[0, "主分支"]]),
+      ledger: null,
+      recentDigest: "",
+      recentCmds: [],
+      segElapsedSec: 10,
+      signals: {
+        flagStall: false,
+        stall: false,
+        repeat: false,
+        hardFail: false,
+        hallucSubmit: false,
+        count: 0,
+      },
+    });
+    expect(input).toContain("只准是当前题目内");
+    expect(input).toContain("越权");
   });
 });
