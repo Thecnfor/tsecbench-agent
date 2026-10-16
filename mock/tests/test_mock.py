@@ -56,7 +56,7 @@ def req(base: str, method: str, path: str, body=None, token: str = TOKEN):
         status = 200
     try:
         return status, json.loads(raw)
-    except json.JSONDecodeError, UnicodeDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return status, {"_raw": raw.decode(errors="replace")}
 
 
@@ -71,7 +71,7 @@ def req_raw_body(base: str, method: str, path: str, body: bytes, token: str = TO
         raw = exc.read()
         try:
             return exc.code, json.loads(raw)
-        except json.JSONDecodeError, UnicodeDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return exc.code, {"_raw": raw.decode(errors="replace")}
 
 

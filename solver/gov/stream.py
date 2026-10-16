@@ -36,7 +36,7 @@ class PipeReader:
                 if not raw:
                     break
                 self._queue.put(raw)
-        except OSError, ValueError:
+        except (OSError, ValueError):
             pass  # 管道被 kill/关闭：自然 EOF
         finally:
             self._queue.put(_SENTINEL)

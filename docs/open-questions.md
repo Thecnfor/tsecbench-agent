@@ -58,9 +58,9 @@
 | 可用大模型 | 仅 DeepSeek（`api.deepseek.com`，OpenAI 兼容 `/v1`） |
 | 资源 | 8 核 16G，一次性沙箱，全程审计 |
 | **内层执行体路线** | **自研薄壳 + 读源码借鉴**（B1，2026-10-10 定） |
-| **编排器语言与版本** | **Python 3.14 + asyncio**（B2） |
+| **编排器语言与版本** | **Python 3.13 + asyncio**（B2；2026-10-16 从 3.14 降级以引入 OpenHands） |
 | **Ghidra / REA** | **装 Ghidra 12.1.x + JDK 21 + REA**（B3）；Node 由可选转必需 |
-| **五栈分层（用户 2026-10-10 指定）** | **Python 3.14（L0 编排 + L1 解题）· Go 1.26（L2，含自研 `recorder`）· Rust（L2，消费 feroxbuster/ripgrep）· Node 26.8.1（L3，MCP/REA）· Lua（L4，目标进程内注入）**。性能账见 [architecture.md](architecture.md) §1.6 |
+| **五栈分层（用户 2026-10-10 指定）** | **Python 3.13（L0 编排 + L1 解题，2026-10-16 从 3.14 降级以引入 OpenHands）· Go 1.26（L2，含自研 `recorder`）· Rust（L2，消费 feroxbuster/ripgrep）· Node 26.11.1（L3，MCP/REA）· Lua（L4，目标进程内注入）**。性能账见 [architecture.md](architecture.md) §1.6 |
 | **Rust 的定位** | **高速暴力枚举，优先用现成 `feroxbuster`**；自研仅限独立 CLI，不做 FFI |
 | **上届规则的可借鉴边界** | 上届官方文档与获奖队素材**可读、可借鉴架构**；**不可进镜像、不可作为题解喂给模型**（作弊条款）。上届的 API 形态（`Agent-Token` / `{code,message,data}` 包装 / MCP 接入）**本届已全部换代，不能复用代码，只能复用设计思路** |
 

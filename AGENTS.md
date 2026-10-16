@@ -1,6 +1,6 @@
 # AGENTS.md
 
-TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.14）+ Go recorder + Node MCP server，交付物是 Docker 镜像。设计文档 `docs/`（中文）是行为契约，入口 `docs/README.md`；代码注释大量按章节号引用它们（如 `architecture.md §6.5`），改行为前先读对应章节。**文档与代码冲突时以代码为准**（`README.md` 的「尚未开始实现」已过时：orchestrator/mock 已实现且全部单测绿）。
+TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.13）+ Go recorder + Node MCP server，交付物是 Docker 镜像。设计文档 `docs/`（中文）是行为契约，入口 `docs/README.md`；代码注释大量按章节号引用它们（如 `architecture.md §6.5`），改行为前先读对应章节。**文档与代码冲突时以代码为准**（`README.md` 的「尚未开始实现」已过时：orchestrator/mock 已实现且全部单测绿）。
 
 ## 命令
 
@@ -18,8 +18,9 @@ TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.14）+ Go recorder 
 ## 结构与工具链
 
 - workspace 三个成员（根 `pyproject.toml [tool.uv.workspace]`）：`orchestrator/` L0 编排器（src 布局，入口 `python -m orchestrator`）、`mock/` 平台 mock（`python -m mock_server`）、`solver/` L1 薄壳 —— **不是安装包**（`package = false`，脚本直接跑，自带 `.venv`/`.env`；ruff 对它豁免 E501，v0 原型不追排版）
-- `toolchain.env` 是全部工具链版本的唯一真值源（Python 3.14 / Go 1.26 / Node 26.8.1 / REA 6.3.0 / Ghidra 12.1.4 …）—— 构建脚本与 Dockerfile 不得另写版本号，改版本 = 改这里 + 重跑受影响自检
-- ruff：line-length 100、target py314、规则集 `E,F,I,UP,B,SIM`；格式化会产出 Python 3.14 语法（如无括号 `except A, B:`），不是 bug
+- `toolchain.env` 是全部工具链版本的唯一真值源（Python 3.13 / Go 1.26 / Node 26.11.1 / REA 6.3.0 / Ghidra 12.1.4 …）—— 构建脚本与 Dockerfile 不得另写版本号，改版本 = 改这里 + 重跑受影响自检
+- **Python 3.13 是硬约束**（2026-10-16 从 3.14 降级）：`openhands-ai` 全系 `requires_python <3.14`，作为库装不进来。代价是**弃用 PEP 758 无括号 `except A, B:`** —— 全仓已改写为 `except (A, B):`，ruff target 为 `py313`。写新代码时不要用 3.14 专有语法
+- ruff：line-length 100、target **py313**、规则集 `E,F,I,UP,B,SIM`；**不要写 3.14 专有语法**（无括号 `except A, B:` 在 3.13 是 SyntaxError，全仓已统一为 `except (A, B):`）
 
 ## 接入（本地 = 官方下发 ing/，正式 = 环境变量 + 上传镜像）
 

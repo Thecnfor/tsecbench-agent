@@ -152,11 +152,13 @@ attempt 预算内选择「换什么姿势重投」，不放宽任何闸门；wid
 
 ### 6.2 两个硬阻塞
 
-1. **Python 绑定 `requires-python <3.13`，本仓库钉死 3.14**（toolchain.env
-   唯一真值源；`ctf-agent` 硬限 `>=3.14`）。uv 直接拒绝安装 0.8.x 全系，
-   编排器（Python 侧）无论 writer 还是 reader 都装不上。可用的是
-   napi-rs Node 绑定 `triviumdb@0.8.8`，但本地与构建机均无可实证的
-   node 环境 —— API 形状未验证前写不出诚实的契约测试。
+1. ~~**Python 绑定 `requires-python <3.13`，本仓库钉死 3.14**，uv 直接拒绝安装~~
+   —— **2026-10-16 实测该记录有误**：`triviumdb==0.8.8` 在 Python 3.14 与 3.13 上
+   都装得上（`uv pip install triviumdb` 直接成功），API 完整可用：
+   `TriviumDB(path, dim=1536)` / `insert_with_id` / `link` / `neighbors(depth)` /
+   `reachable(max_depth)` / **`search_hybrid(query_vector, query_text)`**（TSNG 三信号）/
+   `leiden_cluster` / `Transaction` / `ReadOnlyError`。POC 全绿，0.007s 完成
+   建图 + 图遍历 + 混合检索 + flush/close/重开。**本阻塞已解除。**
 2. 运行期零公网：二进制绑定必须钉死版本 + sha256 进 pi-vendor 式 vendored
    阶段（image-spec.md §3 版本纪律），而 `docker/Dockerfile` 本周冻结。
 

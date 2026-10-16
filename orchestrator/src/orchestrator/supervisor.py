@@ -80,7 +80,7 @@ def collect_prior(ws: Path) -> dict:
     path = ws / "out" / "prior.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError, ValueError:
+    except (OSError, json.JSONDecodeError, ValueError):
         return {"assets": [], "explored": [], "open_leads": []}
     if not isinstance(data, dict):
         return {"assets": [], "explored": [], "open_leads": []}

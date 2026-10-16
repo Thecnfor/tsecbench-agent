@@ -50,7 +50,7 @@ def plan(task: dict, deadline_epoch: float | None) -> dict | None:
             deadline_epoch = float(deadline_epoch)  # noqa: F811 - 归一化入参类型
             if deadline_epoch - time.time() < MIN_REMAINING_S:
                 return None
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         deadline_epoch = None
     try:
         from openai import OpenAI  # 与 main.py 同款惰性导入

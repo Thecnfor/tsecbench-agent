@@ -2,7 +2,7 @@
 name = "orchestrator"
 version = "0.0.1"
 description = "L0 deterministic orchestrator: platform API, state machine, scheduling, harvest, submit"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = []
 
 [build-system]

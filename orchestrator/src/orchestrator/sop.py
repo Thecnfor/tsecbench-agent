@@ -79,7 +79,7 @@ def _read_index(base: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return {}
 
 
@@ -168,7 +168,7 @@ def _prune(base: Path, index: dict) -> None:
     for slug, entry in list(index.items()):
         try:
             (store_dir(base) / entry["file"]).read_bytes()
-        except OSError, KeyError:
+        except (OSError, KeyError):
             index.pop(slug, None)
 
 

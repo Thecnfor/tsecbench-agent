@@ -16,7 +16,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ L0  Orchestrator（Python 3.14 asyncio，确定性，不经大模型）│
+│ L0  Orchestrator（Python 3.13 asyncio，确定性，不经大模型）│
 │      Platform API ─ Registry ─ Scheduler ─ Harvester     │
 │      Submitter ─ Journal ─ Gateway Resolver              │
 └────────────────────────┬────────────────────────────────┘
@@ -61,19 +61,28 @@
 
 | 执行位置 | 语言 | 干什么 | 为什么必须是它 |
 |---|---|---|---|
-| **L0 编排平面**（我方常驻进程） | **Python 3.14** | 确定性编排器：平台 API、状态机、调度、预算、收割、提交 | 无语言优势，是**生态优势**：内层参考实现（ARTEMIS / ctf-agent / BoxPwnr）全是 Python，同栈 = 单一运行时 |
-| **L1 解题平面**（每题一个子进程） | **Python 3.14** | solver 薄壳 + 现场写的 exploit 脚本 | pwntools / pycryptodome / z3 / scapy 无可替代，CTF 事实标准 |
+| **L0 编排平面**（我方常驻进程） | **Python 3.13** | 确定性编排器：平台 API、状态机、调度、预算、收割、提交 | 无语言优势，是**生态优势**：内层参考实现（ARTEMIS / ctf-agent / BoxPwnr）全是 Python，同栈 = 单一运行时 |
+| **L1 解题平面**（每题一个子进程） | **Python 3.13** | solver 薄壳 + 现场写的 exploit 脚本 | pwntools / pycryptodome / z3 / scapy 无可替代，CTF 事实标准 |
 | **L2 工具平面**（spawn 出去的静态二进制） | **Go / Rust** | 高速扫描、目录爆破、流量检索、**流量录制（recorder）** | 见 §1.2/§1.4 —— 这是本项目**真正吃到多语言性能红利的唯一一层** |
 | **L3 能力平面**（常驻 sidecar，MCP/HTTP） | **Node 26 / TS** | REA 逆向工具面（133 个 MCP 工具）+ 自研 TS MCP server | REA 是 npm 分发的 TypeScript，**没有选择**；Node 26 原生 TS 直跑省一个构建步骤 |
 | **L4 注入平面**（**跑在目标进程里**） | **Lua** | nmap NSE 自定义探测；Redis/OpenResty 类目标的进程内执行 | **唯一能进目标运行时的语言** —— L0~L3 都是宿主侧语言，做不到 |
 
 **L4 是这一版新增的、也是唯一真正扩展能力边界的层。** 其余四层都在优化「我们的代码怎么跑」，L4 优化的是「能不能把逻辑送进对方进程」。
 
-### 1.1 Python 3.14（L0 + L1）
+### 1.1 Python 3.13（L0 + L1）
 
-- **钉死 3.14**：已发布满一年（维护版 3.14.8，本机即 3.14.4），`cp314` wheel 成熟；**下限由 `ctf-agent` 的 `requires-python = ">=3.14"` 硬定**。
-- **排除 3.15**：3.15.0 于 2026-10-09 发布（本设计定稿前一天），`cp315` wheel 生态为零，pwntools / z3-solver / gmpy2 / cryptography / pycryptodome 全部需源码编译 —— 3GB 镜像 + 4 天窗口不可接受。PEP 810 惰性导入是 opt-in 特性，不构成理由（§9）。
-- **3.14 不是 Debian trixie 自带版本**（自带 3.13），镜像内用 `python-build-standalone` 预编译包安装（按 tag + sha256 钉死）。**不要用 `deadsnakes` PPA —— 那是 Ubuntu 的，trixie 用不了。**
+- **钉死 3.13**（2026-10-16 从 3.14 降级）。**降级理由（硬约束）**：`openhands-ai`
+  全系（1.3.0 ~ 1.11.0）的 `requires_python` 都是 **`<3.14,>=3.12`**，作为库在 3.14 上
+  装不进来；决赛架构的控制平面要引入 OpenHands，故让出 3.14。
+- **代价**：弃用 **PEP 758 无括号 `except A, B:`**（3.14 新语法）。全仓 12 处已改写为
+  `except (A, B):`，ruff `target-version = "py313"`。写新代码不要用 3.14 专有语法。
+- **顺带收益**：3.13 是 Debian trixie 自带版本，镜像内**不再需要 `python-build-standalone`
+  预编译包**（原先 3.14 非自带，需按 tag + sha256 钉死安装），少一个构建期联网面与版本风险。
+- **排除 3.15**：3.15.0 于 2026-10-09 发布（本设计定稿前一天），`cp315` wheel 生态为零，
+  pwntools / z3-solver / gmpy2 / cryptography / pycryptodome 全部需源码编译 —— 3GB 镜像 +
+  4 天窗口不可接受。PEP 810 惰性导入是 opt-in 特性，不构成理由（§9）。
+- 注：参考项目 `ctf-agent` 的 `requires-python = ">=3.14"` 是**它的**约束，不是我们的；
+  我们只读它的结构，不引用它的代码（§9.2 已记两个硬阻塞）。
 - 编排器约 1000~1500 行；`asyncio.create_subprocess_exec` + `start_new_session=True` + `os.killpg` 足以做进程组管理与硬超时（§5.2）。
 - **性能相关的约束**：GIL 使单进程内无法并行 CPU 工作，因此 **L0 绝不做重计算** —— 所有 CPU 密集活推给 L2。L0 只做 IO 与状态迁移，asyncio 在该用途上开销足够低。
 - 内层 agent 为**自研 Python 薄壳**（借鉴 ARTEMIS / ctf-agent / ARTEX / BreachWeave），被 Solver Adapter 契约隔离；不整体移植任何现成框架，理由见 §2.5。
@@ -857,7 +866,7 @@ token 尚未生效，以下除「端到端」外全部可以立刻做。
 |---|---|---|
 | `prior_findings` 自由文本 → 结构化双图 `prior{assets, explored, open_leads}`，新增 `out/prior.json` 输出通道 | ARTEX 双图架构 | §2.1 / §2.2 / §2.5 |
 | `task.json` 新增 `flag_pattern` 字段 | ARTEMIS `configs/tests/ctf_easy.yaml` | §2.1 |
-| Python 3.13 → **3.14** | ctf-agent `requires-python = ">=3.14"`；3.14 已满一年 | §1 |
+| Python 3.13 → ~~3.14~~ → **3.13** | 曾因 ctf-agent 硬限升到 3.14；2026-10-16 因 OpenHands 全系 `requires_python <3.14` 降回 3.13（PEP 758 无括号 except 全仓改写） | §1 |
 | Node 从「必要时引入」→ **必需** | REA `engines.node` 硬要求 | §1 |
 | Rust 用途明确为高速暴力枚举，且**优先用 `feroxbuster`** 而非自研 | 用户决策 + 现成工具优先 | §1 / [image-spec.md](image-spec.md) §3 |
 | API Client 默认自我限速 ≤3 req/s | 上届限频规则 | §5.1 |

@@ -74,7 +74,7 @@ def parse_json_config(text: str) -> dict[str, str] | None:
     """JSON 配置：递归展平成键值；解析失败返回 None（交给下一级分类）。"""
     try:
         data = json.loads(text)
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(data, dict):
         return None

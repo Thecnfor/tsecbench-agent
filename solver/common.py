@@ -214,7 +214,7 @@ def load_task() -> dict:
     """读 task.json（编排器模式）。损坏时降级为空任务，不崩。"""
     try:
         return json.loads(Path(SOLVER_TASK_PATH).read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -344,7 +344,7 @@ def setup_orch_mode() -> None:
     if deadline_epoch:
         try:
             DEADLINE_EPOCH = float(deadline_epoch)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             DEADLINE_EPOCH = None
         if DEADLINE_EPOCH is not None:
             MAX_MINUTES = max(0.5, min(MAX_MINUTES, (DEADLINE_EPOCH - time.time()) / 60))

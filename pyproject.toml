@@ -7,7 +7,7 @@
 name = "tsecbench-workspace"
 version = "0.0.1"
 description = "TSecBench autonomous pentest agent (L0 orchestrator + L1 solver + mock platform)"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 
 [tool.uv]
 package = false
@@ -23,7 +23,7 @@ testpaths = ["orchestrator/tests", "mock/tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py313"
 # exp/ 是迁入的历史实验仓库（tcbench 等，独立 .gitignore/风格），不适用本仓库的 lint 契约
 extend-exclude = ["exp"]
 

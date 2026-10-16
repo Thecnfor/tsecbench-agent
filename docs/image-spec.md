@@ -153,7 +153,7 @@ MCP 层的取舍原则：**能用 CLI 直接 spawn 的就不套 MCP**。MCP 的�
 | 层 | 压缩后估算 |
 |---|---|
 | `debian:trixie-slim` 基座 | ~30 MB |
-| apt 系统工具 + build-essential + **Python 3.14（standalone tarball）** + Node 26.8.1 + lua5.4 + redis-tools | ~300 MB |
+| apt 系统工具 + build-essential + **Python 3.13（trixie 自带）** + Node 26.8.1 + lua5.4 + redis-tools | ~300 MB |
 | **JDK 21（headless）** | ~120 MB |
 | **Ghidra 12.1.x** | ~300 MB |
 | Go/Rust 静态工具（nuclei/naabu/httpx/katana/ffuf/gobuster/subfinder/dalfox/**feroxbuster**/**ripgrep**）+ **自研 `recorder`** | ~130 MB |

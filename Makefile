@@ -4,7 +4,7 @@ UV ?= uv
 
 .PHONY: bootstrap test lint fmt check run mock image build-recorder build-mcp build-ts-workflow ui clean
 
-## bootstrap: 安装 Python 3.14 并解析全部 workspace 依赖
+## bootstrap: 安装 Python 3.13 并解析全部 workspace 依赖
 bootstrap:
 	$(UV) sync --all-packages
 

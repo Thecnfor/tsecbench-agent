@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/recorder ./cmd/rec
 # TODO(image build): 按 tag+sha256 下载 naabu / httpx / subfinder / nuclei / katana 静态二进制
 
 # ---- L3：Node 能力面 --------------------------------------------------------
-FROM node:26.8.1-slim AS node-builder
+FROM node:26.11.1-trixie-slim AS node-builder
 WORKDIR /src
 # builder 阶段要装 devDeps（typescript）；产出只取 dist/，运行期不进 node_modules
 # TODO(image build): REA@6.3.0 走 npm ci + lockfile；运行期禁 npx
@@ -31,7 +31,7 @@ RUN npm run build   # TS → 纯 JS（dist/），运行期不依赖原生 TS 直
 # ---- L1 执行内核：pi vendored（运行期离线，禁 npx）---------------------------
 # 版本取 toolchain.env（PI_PACKAGE / PI_VERSION，版本唯一真值源）；此处 ARG 默认
 # 值仅为可读性，构建脚本必须以 --build-arg 传 toolchain.env 的值。
-FROM node:26.8.1-slim AS pi-vendor
+FROM node:26.11.1-trixie-slim AS pi-vendor
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
 ARG PI_VERSION=1.1.0
 WORKDIR /opt/tsecbench/pi
@@ -39,7 +39,7 @@ RUN npm install --omit=dev "${PI_PACKAGE}@${PI_VERSION}" \
     && node ./node_modules/.bin/pi --version   # 装上即可执行，失败即断构建
 
 # ---- L1.5：TS 手动工作流 solver（Mastra，版本钉 toolchain.env）--------------
-FROM node:26.8.1-slim AS ts-workflow-builder
+FROM node:26.11.1-trixie-slim AS ts-workflow-builder
 ARG MASTRA_VERSION=1.75.0
 ARG ZOD_VERSION=4.6.5
 WORKDIR /src

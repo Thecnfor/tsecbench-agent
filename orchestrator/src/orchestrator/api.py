@@ -141,7 +141,7 @@ class PlatformClient:
             if status == 200:
                 try:
                     return json.loads(text)
-                except json.JSONDecodeError, ValueError:
+                except (json.JSONDecodeError, ValueError):
                     # 畸形响应体（mock garbage 注入）视为瞬时故障
                     await self._sleep(self.delay_network)
                     continue
@@ -195,7 +195,7 @@ class PlatformClient:
         """兼容两种响应体结构：业务 {code,message,detail} 与框架 {"detail":[...]}。"""
         try:
             return json.loads(text)
-        except json.JSONDecodeError, ValueError:
+        except (json.JSONDecodeError, ValueError):
             return {"code": None, "message": text[:200]}
 
     async def _sleep(self, base: float) -> None:

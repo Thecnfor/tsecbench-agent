@@ -36,9 +36,9 @@ Docker镜像(限制3G)
 | 决策 | 结论 | 详见 |
 |---|---|---|
 | 架构路线 | **混合**：自研确定性编排层 + 自研薄壳作解题执行体 | [architecture.md](architecture.md) |
-| **五栈分层** | **按执行位置分层，不按「哪个语言更先进」分**：L0/L1 **Python 3.14**（编排 + 解题）· L2 **Go 1.26 + Rust**（静态二进制工具面）· L3 **Node 26**（MCP / REA 能力面）· **L4 Lua（跑在目标进程里的注入面）** | [architecture.md](architecture.md) §1.0 |
-| 编排器语言 / 解题脚本 | **Python 3.14 + asyncio** / **Python 3.14**（原推荐 Rust，2026-10-10 翻转） | [architecture.md](architecture.md) §1.1 |
-| Python 版本 | **钉死 3.14**（trixie 自带 3.13，需 standalone 包；**deadsnakes 是 Ubuntu 的用不了**）。3.15 发布仅一天，`cp315` wheel 为零。**下限由 `ctf-agent` 的 `requires-python ">=3.14"` 硬定** | [architecture.md](architecture.md) §1.1、§10.5 |
+| **五栈分层** | **按执行位置分层，不按「哪个语言更先进」分**：L0/L1 **Python 3.13**（编排 + 解题）· L2 **Go 1.26 + Rust**（静态二进制工具面）· L3 **Node 26**（MCP / REA 能力面）· **L4 Lua（跑在目标进程里的注入面）** | [architecture.md](architecture.md) §1.0 |
+| 编排器语言 / 解题脚本 | **Python 3.13 + asyncio** / **Python 3.13**（原推荐 Rust，2026-10-10 翻转） | [architecture.md](architecture.md) §1.1 |
+| Python 版本 | **钉死 3.13**（trixie 自带，**不再需要 standalone 包**）。2026-10-16 从 3.14 降级：`openhands-ai` 全系 `requires_python <3.14`，作为库装不进来；代价是弃用 PEP 758 无括号 except（全仓 12 处已改写）。3.15 发布仅一天，`cp315` wheel 为零 | [architecture.md](architecture.md) §1.1、§10.5 |
 | **Go 1.26** | **不只用现成件（naabu/httpx/nuclei/katana），还承担唯一自研二进制 `recorder`** —— 每题一个流量录制/重放 sidecar。它是 §2.3「不信任模型自述」**唯一能落地的形态**：`prior.assets` 来自客观录制而非 LLM 自报，并给 Flag Harvester 多一条通道、支撑探测去重。选 Go 的理由是**打包形态**（单静态二进制、运行期零依赖），不是「比 Python 快」 | [architecture.md](architecture.md) §1.2 |
 | **Node 运行时** | **26.8.1，精确小版本钉死**；非 Bun。承载 REA + 自研 TS MCP server。<br>⚠️ **Node 26 到 2026-10-28 才进 Active LTS，即初赛之后** —— 官方要求生产只用 LTS，这是**已知未消除**的风险。对冲：MCP server 构建期编译成纯 JS，不把原生 TS 直跑当运行前提 → **切 24 LTS 只是一行改动** | [architecture.md](architecture.md) §1.3、[open-questions.md](open-questions.md) B12 |
 | **Rust** | **角色是「消费 Rust 生态」不是「写 Rust」**：`feroxbuster`（高速爆破）+ **`ripgrep`（收割热路径 —— 因 recorder 产出数百 MB~GB 级 JSONL 而新增的真实需求）**。自研默认不做；**绝不做 PyO3/napi-rs FFI**（摧毁崩溃隔离，且无热路径） | [architecture.md](architecture.md) §1.4 |
