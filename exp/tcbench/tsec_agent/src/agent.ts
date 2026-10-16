@@ -490,8 +490,13 @@ export async function solveTask(
   const corelog = multiOn ? rec().corelog(code) : null;
   const ledger = new FlagLedger();
   if (opts.flagTotal) ledger.setTotal(opts.flagTotal);
-  const stallSec =
-    (opts.taskClass ?? "short") === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
+  const taskClass = opts.taskClass ?? "short";
+  const stallSec = taskClass === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
+  // 思考档位分档：短题 low 省 thinking（实测占成本 37-69%），长题不发=模型默认档；
+  // 空值=该档不发（AGENT_REASONING_EFFORT_SHORT/LONG，空即关）。
+  const effort = (
+    taskClass === "long" ? CFG.reasoning_effort_long : CFG.reasoning_effort_short
+  ).trim();
 
   // 工具集：shell 恒在；fork/broadcast 仅 fork 开；core_log 两者任一开
   const tools: unknown[] = [SHELL_TOOL_SCHEMA];
@@ -715,7 +720,7 @@ export async function solveTask(
     let resp: ChatResponse | null = null;
     let err: unknown = null;
     try {
-      resp = await callLlm(client, br.messages, true, { tools });
+      resp = await callLlm(client, br.messages, true, { tools, effort: effort || undefined });
     } catch (e) {
       err = e;
       // 多模态降级：网关拒收图片 → 剥掉 image part 改发纯文本，本会话后续不再附图
@@ -737,7 +742,7 @@ export async function solveTask(
           error: `${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`.slice(0, 400),
         });
         try {
-          resp = await callLlm(client, br.messages, true, { tools });
+          resp = await callLlm(client, br.messages, true, { tools, effort: effort || undefined });
         } catch (e2) {
           err = e2;
         }

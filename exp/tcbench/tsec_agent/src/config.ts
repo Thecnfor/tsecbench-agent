@@ -178,6 +178,9 @@ export interface Config {
   // core_log 轮级轻推（执行层兜底）
   core_log_nudge_rounds: number;
   core_log_nudge_max: number;
+  // 思考档位分档（空=不发=模型默认档）
+  reasoning_effort_short: string;
+  reasoning_effort_long: string;
   extra_env: Record<string, string>;
   llm_base_url: string;
   llm_api_key: string;
@@ -255,6 +258,12 @@ export const CFG: Config = {
   // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给旁观者。
   core_log_nudge_rounds: num("AGENT_CORE_LOG_NUDGE_ROUNDS", "3"),
   core_log_nudge_max: num("AGENT_CORE_LOG_NUDGE_MAX", "2"),
+
+  // 思考档位分档（顶层 reasoning_effort；空=不发=模型默认档，空即特性开关）：
+  // 短题（classifyTask：单 flag 且非 hard 且 level<3）默认 low 省 thinking——
+  // thinking 实测占单题成本 37-69%（跨 4 run 归档）；长题不发（保持模型默认档不降质）。
+  reasoning_effort_short: env("AGENT_REASONING_EFFORT_SHORT", "low"),
+  reasoning_effort_long: env("AGENT_REASONING_EFFORT_LONG", ""),
 
   // 追加到 shell 子进程环境的变量
   extra_env: {

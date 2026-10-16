@@ -40,6 +40,7 @@ export class FetchLlmClient implements LlmClient {
     temperature?: number;
     max_tokens?: number;
     thinking?: { type: "disabled" } | { type: "enabled"; [k: string]: unknown };
+    reasoning_effort?: string;
     signal?: AbortSignal;
   }): Promise<ChatResponse> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -55,6 +56,7 @@ export class FetchLlmClient implements LlmClient {
     }
     if (opts.max_tokens !== undefined) body.max_tokens = opts.max_tokens;
     if (opts.thinking) body.thinking = opts.thinking; // 轻调用关思考省 completion
+    if (opts.reasoning_effort) body.reasoning_effort = opts.reasoning_effort; // 思考档位
 
     const timeoutSig = AbortSignal.timeout(this.timeout * 1000);
     // AbortSignal.any 需 Node ≥20.3；Kali apt 的 nodejs 可能更旧 → 降级为只用超时信号
@@ -241,6 +243,13 @@ export async function tryReauth(e: unknown): Promise<LlmClient | null> {
   return await discoverGatewayKey("reauth", new Set([CFG.llm_api_key]), false);
 }
 
+// reasoning_effort 降级：网关（尤其 hosted 转写）若 400 拒绝该参数 → 永久去掉重试，
+// 主对话绝不因档位参数挂掉（一次机会，置位后全程不再发送）。
+export let EFFORT_UNSUPPORTED = false;
+export function resetEffortState(): void {
+  EFFORT_UNSUPPORTED = false;
+}
+
 // remainingSec 在 agent.ts（依赖 START_TS）；这里通过注入避免循环依赖
 let _remainingSec: () => number | null = () => null;
 export function setRemainingSec(fn: () => number | null): void {
@@ -267,7 +276,12 @@ export async function callLlm(
   client: LlmClient,
   messages: ChatMessage[],
   useTools = true,
-  extra: { signal?: AbortSignal; tools?: unknown[]; thinking?: { type: "disabled" } } = {},
+  extra: {
+    signal?: AbortSignal;
+    tools?: unknown[];
+    thinking?: { type: "disabled" };
+    effort?: string; // 思考档位（按题目分档：短题 low / 长题不发=模型默认）
+  } = {},
 ): Promise<ChatResponse> {
   let delayMs = 2000;
   let attempt = 0;
@@ -287,6 +301,7 @@ export async function callLlm(
         opts.tool_choice = "auto";
       }
       if (extra.thinking) opts.thinking = extra.thinking; // 轻调用关思考
+      if (extra.effort && !EFFORT_UNSUPPORTED) opts.reasoning_effort = extra.effort;
       if (extra.signal) opts.signal = extra.signal; // 限时调用（通关总结）的中止信号
       return await active.create(opts);
     } catch (e) {
@@ -295,6 +310,23 @@ export async function callLlm(
       // 与 Python call_llm 一致：只对 API/网络类错误重试（openai APIError 家族）；
       // 其他异常（断言、编程错误）原样抛出，由 worker 落 task_error——绝不静默死循环。
       if (!(e instanceof LlmHttpError)) throw e;
+      // reasoning_effort 被拒（400 且报文指认该参数）→ 永久降级去掉参数立即重试
+      const ebody = e instanceof LlmHttpError ? e.body : "";
+      const estatus = e instanceof LlmHttpError ? e.status : null;
+      if (
+        estatus === 400 &&
+        !EFFORT_UNSUPPORTED &&
+        extra.effort &&
+        /reasoning[_ ]effort/i.test(ebody)
+      ) {
+        EFFORT_UNSUPPORTED = true;
+        log(
+          `LLM rejected reasoning_effort=${extra.effort}; disabling effort param for this run ` +
+            `(gateway 不支持思考档位，回退模型默认档)`,
+        );
+        rec().event("effort_param_unsupported", { effort: extra.effort });
+        continue; // 立即重试（不退避：参数问题非限流）
+      }
       // 401 热切换：转写网关透传 key 给上游，内置 key 被拒时按候选 key 试并重试本轮
       const newClient = await tryReauth(e);
       if (newClient) {
