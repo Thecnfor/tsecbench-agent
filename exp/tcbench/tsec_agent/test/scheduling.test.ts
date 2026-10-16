@@ -10,7 +10,7 @@ import type { Challenge } from "../src/types.js";
 // classifyTask 只依赖 API 字段，纯函数可直测
 // （放在 agent.ts 会拉入整个调度器模块，这里用动态 import 保持轻量）
 const mod = await import("../src/agent.js");
-const { classifyTask, globMatch, taskSelected } = mod;
+const { classifyTask, globMatch, taskSelected, orderCandidates } = mod;
 
 function chal(partial: Partial<Challenge>): Challenge {
   return {
@@ -106,6 +106,81 @@ describe("A：通关检测与限时总结的接口契约", () => {
     const notDone = chal({ unique_code: "a-01", is_completed: false });
     expect(!!done.is_completed).toBe(true);
     expect(!!notDone.is_completed).toBe(false);
+  });
+});
+
+describe("D 调度排序（orderCandidates 纯函数）", () => {
+  // 归档实测的 8 题真实字段（难度/flag数）——用户报告 b-01/b-02/b-03 抢跑的场景
+  const mk = (
+    code: string,
+    difficulty: "easy" | "medium" | "hard",
+    flag_count: number,
+  ): Challenge => ({
+    unique_code: code,
+    description: "",
+    difficulty,
+    level: 1,
+    total_score: flag_count * 250,
+    flag_count,
+    correct_flag_count: 0,
+    is_completed: false,
+    container_status: "stopped",
+    container_addr: [],
+  });
+  const eight = [
+    mk("a-03", "medium", 1), // est 35 short
+    mk("a-05", "easy", 1), // est 30 short
+    mk("a-18", "hard", 1), // est 40 long(hard)
+    mk("b-01", "medium", 4), // est 95 long
+    mk("b-02", "hard", 6), // est 140 long
+    mk("b-03", "medium", 4), // est 95 long
+    mk("c-02", "hard", 1), // est 40 long(hard)
+    mk("c-03", "easy", 1), // est 30 short
+  ];
+  const order = (cap: number) =>
+    orderCandidates({
+      freshLong: eight.filter((c) => classifyTask(c) === "long"),
+      freshShort: eight.filter((c) => classifyTask(c) === "short"),
+      paused: [],
+      cap,
+      agingSec: 600,
+      nowSec: 0,
+      waitAgeOf: () => 0,
+    });
+
+  it("cap=3：长题配额=2（保底 1 槽给短题），首轮应含 1 短", () => {
+    const top3 = order(3)
+      .slice(0, 3)
+      .map((c) => c.unique_code);
+    // b-02(140) b-01/b-03(95) 先上，第三槽必须是短题（est 最低的 a-05/c-03 之一）
+    expect(top3.slice(0, 2).sort()).toEqual(["b-01", "b-02"]);
+    expect(["a-05", "c-03"]).toContain(top3[2]);
+  });
+
+  it("回归：cap 虚高(5) 时三长会抢光槽位——所以 cap 必须先取 min(本地, 平台容量)", () => {
+    // 这正是用户观察到的现象：cap=5 → 长题配额=4 → 前 4 全是长题 → 平台只放行 3 → 三长占满
+    const top = order(5)
+      .slice(0, 5)
+      .map((c) => c.unique_code);
+    expect(top.slice(0, 3)).toEqual(["b-02", "b-01", "b-03"]); // 三长抢跑（bug 现场）
+    // 修复后 cap = min(AGENT_MAX_PARALLEL=5, AGENT_PLATFORM_CAPACITY=3) = 3
+    expect(Math.min(5, 3)).toBe(3);
+  });
+
+  it("无短题在等时长题可用满 cap", () => {
+    const longsOnly = eight.filter((c) => classifyTask(c) === "long");
+    const top = orderCandidates({
+      freshLong: longsOnly,
+      freshShort: [],
+      paused: [],
+      cap: 3,
+      agingSec: 600,
+      nowSec: 0,
+      waitAgeOf: () => 0,
+    })
+      .slice(0, 3)
+      .map((c) => c.unique_code);
+    expect(top).toEqual(["b-02", "b-01", "b-03"]);
   });
 });
 

@@ -142,6 +142,10 @@ export interface Config {
   // 暂停题续跑 aging（秒）：排队超过此时长的暂停题提权，防止 fresh 无限插队
   //（实测曾有题暂停后等 118 分钟才续跑）。
   resume_aging_sec: number;
+  // 平台 max-active 硬上限（平台文档值 3）：并发上限取 min(AGENT_MAX_PARALLEL, 本值)。
+  // 教训：本地意愿(5) 虚高时首轮长题配额按 cap-1=4 发 start，平台只放行 3 个 →
+  // b-01/b-02/b-03 三长占满全部槽，短题一个没轮到（用户实测）。
+  platform_capacity: number;
   pause_max: number;
   giveup_max: number;
   max_failures: number;
@@ -185,6 +189,7 @@ export const CFG: Config = {
   segment_long_sec: num("AGENT_TASK_SEGMENT_LONG_SEC", "1800"),
   summary_timeout_sec: num("AGENT_SUMMARY_TIMEOUT_SEC", "300"),
   resume_aging_sec: num("AGENT_RESUME_AGING_SEC", "600"),
+  platform_capacity: num("AGENT_PLATFORM_CAPACITY", "3"),
   pause_max: num("AGENT_PAUSE_MAX", "0"), // 每题最多暂停续跑次数，0=不限
   giveup_max: num("AGENT_GIVEUP_MAX", "3"), // 连续"未通关就收尾"上限，0=不限
   max_failures: num("AGENT_MAX_FAILURES", "2"), // 真失败放弃上限（≥1，0 按 1）

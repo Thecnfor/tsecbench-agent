@@ -779,6 +779,43 @@ export function classifyTask(c: Challenge): "long" | "short" {
   return c.flag_count >= 2 || c.difficulty === "hard" || (c.level ?? 0) >= 3 ? "long" : "short";
 }
 
+/** D 策略估算（只用公开字段，越大越"长/值钱"先启动）：flag 数主导，level 与难度加权。 */
+export function estLong(c: Challenge): number {
+  return c.flag_count * 20 + (c.level ?? 0) * 10 + (bench.DIFF_RANK[c.difficulty] ?? 9) * 5;
+}
+
+/** D 调度排序（纯函数，可单测）。给定一组候选，返回启动顺序：
+ *  1) 长题早启动——开局就把长题顶上去跑（不能最后才启动），但有短题在等时最多占 cap-1 槽
+ *     （保底 1 槽给短题，防饿死）；
+ *  2) 短题最短优先（est 升序）；
+ *  3) 暂停题 aging——排队超过 agingSec 的提权插到新题前（防 fresh 无限插队，
+ *     实测曾有题暂停后等 118 分钟才续跑），组内按等待时长降序。
+ *  历史基线不进策略（正式比赛题目必变，只能当参考）。 */
+export function orderCandidates(opts: {
+  freshLong: Challenge[];
+  freshShort: Challenge[];
+  paused: Challenge[]; // 已按等待时长降序排好
+  cap: number;
+  agingSec: number;
+  nowSec: number;
+  waitAgeOf: (c: Challenge) => number; // 暂停题已等秒数
+}): Challenge[] {
+  const { freshLong, freshShort, paused, cap, agingSec, nowSec, waitAgeOf } = opts;
+  const waitingShort = freshShort.length + paused.filter((c) => classifyTask(c) === "short").length;
+  const longQuota = waitingShort > 0 ? Math.max(1, cap - 1) : cap;
+  const longOrdered = [...freshLong].sort((a, b) => estLong(b) - estLong(a));
+  const shortOrdered = [...freshShort].sort((a, b) => estLong(a) - estLong(b));
+  const agedPaused = paused.filter((c) => nowSec - waitAgeOf(c) >= agingSec);
+  const freshPaused = paused.filter((c) => nowSec - waitAgeOf(c) < agingSec);
+  return [
+    ...longOrdered.slice(0, longQuota),
+    ...shortOrdered,
+    ...agedPaused, // aging 提权：暂停够久的插队到新题前
+    ...longOrdered.slice(longQuota),
+    ...freshPaused,
+  ];
+}
+
 /** 每题独立工作目录（async 局部 cwd 的落点），避免并行读写冲突。
  * 基目录派生自 RECORDS_DIR——保证 `tasks/<code>/` 里 conversation.jsonl 与 shell 产物
  * 永远同居一处（若这里另用 /work 判断，RECORDS_DIR 被显式改指别处时两者会分家）。 */
@@ -802,7 +839,12 @@ async function runParallel(
   // 收尾 join 要等的是 Promise 本身而不是槽位，所以另存全量清单，否则 run 结束会掐掉
   // 正在进行的总结。
   const allWorkers: Promise<void>[] = [];
-  let cap = Number(env("AGENT_MAX_PARALLEL", "5"));
+  // 并发上限 = min(本地意愿, 平台 max-active 硬上限)。
+  // 教训（用户实测 a-03…c-03 八题）：本地意愿默认 5 虚高于平台的 3，首轮长题配额按
+  // cap-1=4 发 start → 平台只放行 3 个、全被长题（b-01/b-02/b-03）占满，短题一个没轮到；
+  // 被 max-active 打回后 cap 才收缩，但槽已经被占死。所以一开始就取两者较小值，
+  // 平台后续再拒绝（容量变化）时照旧收缩。
+  let cap = Math.min(Number(env("AGENT_MAX_PARALLEL", "5")), CFG.platform_capacity);
   let checkedSelection = false; // 首次快照时核对一次题目选择是否命中（打错字要出声）
 
   // VPN 守卫：auto=模式感知（hosted 强制；local 关），1/0 显式开关。
@@ -1227,17 +1269,6 @@ async function runParallel(
       if ((failures[c.unique_code] ?? 0) >= Math.max(CFG.max_failures, 1)) return false;
       return taskSelected(c.unique_code, taskFilter);
     };
-    // D 策略排序（bench 60 seeds×5 场景验证：完成数不降、短题零饿死、allLong 打断 43→0.1）：
-    // 1) 长题早启动——开局就把长题顶上去跑（不能最后才启动），但有短题在等时最多占 cap-1 槽
-    //    （保底 1 槽给短题，防饿死）；2) 短题最短优先；3) 暂停题 aging——等最久的先续
-    //    （防 fresh 无限插队：实测曾有题暂停后等 118 分钟才续跑）。
-    // 估算只用公开字段（flag_count/difficulty/level），不依赖历史基线（正式比赛题目必变）。
-    const est = (c: Challenge): number =>
-      c.flag_count * 20 + (c.level ?? 0) * 10 + (bench.DIFF_RANK[c.difficulty] ?? 9) * 5;
-    const waitAge = (c: Challenge): number => {
-      const at = resumeMeta[c.unique_code]?.pausedAt;
-      return typeof at === "number" ? Date.now() / 1000 - at : 0;
-    };
     const eligibleTasks = items.filter(eligible);
     const freshLong = eligibleTasks.filter(
       (c) => !(c.unique_code in resumeMeta) && cls(c) === "long",
@@ -1245,21 +1276,26 @@ async function runParallel(
     const freshShort = eligibleTasks.filter(
       (c) => !(c.unique_code in resumeMeta) && cls(c) === "short",
     );
-    const pausedTasks = eligibleTasks.filter((c) => c.unique_code in resumeMeta);
-    const waitingShort = freshShort.length + pausedTasks.filter((c) => cls(c) === "short").length;
-    const longQuota = waitingShort > 0 ? Math.max(1, cap - 1) : cap;
-    const longOrdered = [...freshLong].sort((a, b) => est(b) - est(a));
-    const shortOrdered = [...freshShort].sort((a, b) => est(a) - est(b));
-    const pausedOrdered = [...pausedTasks].sort((a, b) => waitAge(b) - waitAge(a));
-    const agedPaused = pausedOrdered.filter((c) => waitAge(c) >= CFG.resume_aging_sec);
-    const freshPaused = pausedOrdered.filter((c) => waitAge(c) < CFG.resume_aging_sec);
-    const candidates = [
-      ...longOrdered.slice(0, longQuota),
-      ...shortOrdered,
-      ...agedPaused, // aging 提权：暂停够久的插队到新题前
-      ...longOrdered.slice(longQuota),
-      ...freshPaused,
-    ];
+    // 暂停题按等待时长降序（aging 组内最老先续）
+    const pausedTasks = eligibleTasks
+      .filter((c) => c.unique_code in resumeMeta)
+      .sort((a, b) => {
+        const at = resumeMeta[b.unique_code]?.pausedAt;
+        const bt = resumeMeta[a.unique_code]?.pausedAt;
+        return (typeof at === "number" ? at : 0) - (typeof bt === "number" ? bt : 0);
+      });
+    const candidates = orderCandidates({
+      freshLong,
+      freshShort,
+      paused: pausedTasks,
+      cap,
+      agingSec: CFG.resume_aging_sec,
+      nowSec: Date.now() / 1000,
+      waitAgeOf: (c) => {
+        const at = resumeMeta[c.unique_code]?.pausedAt;
+        return typeof at === "number" ? Date.now() / 1000 - at : 0;
+      },
+    });
 
     if (!candidates.length && !running.size) break; // 全部完成或全部结束
 
