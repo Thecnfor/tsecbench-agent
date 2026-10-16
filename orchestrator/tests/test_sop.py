@@ -145,6 +145,12 @@ class TestProgressiveDisclosure:
         assert sop.load(tmp_path, "ghost") is None
         assert sop.catalog(tmp_path) == []
 
+    def test_load_rejects_lowercase_generic_flag(self, tmp_path):
+        """GENERIC_FLAG_PATTERN 覆盖小写/非具名 flag 形态（读闸 fail-closed）。"""
+        base = self._make_store(tmp_path, "sneaky", "got flag{aabbccddeeff} here\n")
+        assert sop.load(base, "sneaky") is None
+        assert sop.catalog(base) == []
+
     def test_catalog_summary_sanitized_and_truncated(self, tmp_path):
         long = "1. nmap -sV 10.0.0.9 -p " + "a" * 200
         base = self._make_store(tmp_path, "recon", f"{long}\n")

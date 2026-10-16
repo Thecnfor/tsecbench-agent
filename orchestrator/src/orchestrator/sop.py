@@ -20,7 +20,7 @@ import re
 import time
 from pathlib import Path
 
-from .harvester import NAMED_FLAG_PATTERNS
+from .harvester import GENERIC_FLAG_PATTERN, NAMED_FLAG_PATTERNS
 
 SOP_DIR_NAME = "sops"
 MAX_STEPS = 6  # 单条 SOP 最多保留的步骤数（§4.2 尺寸预算）
@@ -67,7 +67,9 @@ def _steps(events: list[dict]) -> list[str]:
 
 
 def _contains_flag(text: str) -> bool:
-    return any(p.search(text) for p in NAMED_FLAG_PATTERNS)
+    # 具名 + 通用双模式：GENERIC 覆盖小写 flag{...} 等非具名形态（fail-closed）。
+    # 残余缺口：GENERIC 要求内层 ≥4 字符，`flag{xyz}`（3 字符）不命中（harvester 边界，不在此改）。
+    return any(p.search(text) for p in (*NAMED_FLAG_PATTERNS, GENERIC_FLAG_PATTERN))
 
 
 def store_dir(base: Path) -> Path:
