@@ -169,10 +169,11 @@ def main() -> int:
     sess = gov_session.Session(out_dir)
     sess.log("meta", solver="dual_main", model=os.environ.get("LLM_MODEL", "deepseek-chat"))
 
-    deadline_epoch = os.environ.get("SOLVER_DEADLINE_EPOCH")
+    deadline_raw = os.environ.get("SOLVER_DEADLINE_EPOCH")
+    deadline_epoch = float(deadline_raw) if deadline_raw else None
     budget_s = common.MAX_MINUTES * 60
     if deadline_epoch:
-        budget_s = max(60.0, min(budget_s, float(deadline_epoch) - time.time()))
+        budget_s = max(60.0, min(budget_s, deadline_epoch - time.time()))
 
     # 治理层：profile 选择（确定性）+ planner 规划（全程唯一一次额外 LLM 调用）
     task = common.load_task()

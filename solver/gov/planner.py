@@ -45,8 +45,15 @@ def plan(task: dict, deadline_epoch: float | None) -> dict | None:
     """返回 {"category","strategy"} 或 None（跳过）。永不抛异常。"""
     if not (os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")):
         return None
-    if deadline_epoch is not None and deadline_epoch - time.time() < MIN_REMAINING_S:
-        return None
+    # deadline 检查自身也不得抛（本函数契约：任何路径失败 → 静默跳过）。
+    # SOLVER_DEADLINE_EPOCH 是字符串环境变量，先显式转 float。
+    try:
+        if deadline_epoch is not None:
+            deadline_epoch = float(deadline_epoch)  # noqa: F811 - 归一化入参类型
+            if deadline_epoch - time.time() < MIN_REMAINING_S:
+                return None
+    except TypeError, ValueError:
+        deadline_epoch = None
     try:
         from openai import OpenAI  # 与 main.py 同款惰性导入
 
