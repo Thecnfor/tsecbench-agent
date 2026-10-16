@@ -454,6 +454,7 @@ export async function solveTask(
     branches?: BranchLite[]; // 续段恢复的分支状态
     taskClass?: "long" | "short"; // 旁观者停滞阈值分档
     flagTotal?: number; // flag 索引账本总数
+    taskStartTs?: number; // 题起始 epoch（跨段持久的时钟锚）
   } = {},
 ): Promise<SolveResult> {
   const forkOn = CFG.fork_enabled;
@@ -490,6 +491,26 @@ export async function solveTask(
   };
   const bm = new BranchManager(branchCfgFromConfig(), messages, nowSec(), workdir);
   if (opts.branches?.length) bm.restore(opts.branches, nowSec());
+  // 跨段时钟恢复（关键修复）：flag/停滞时钟锚在「题起点+corelog 最后事件」，不随段重建归零——
+  // arena 实测段被 rem/6 压到 192s 时，段级时钟使 900s flag 主时钟/600s 停滞永不可达。
+  if (multiOn) {
+    const anchor = opts.taskStartTs ?? nowSec();
+    bm.lastFlagTs = anchor;
+    const cl = rec().corelog(code);
+    try {
+      for (const e of readCorelog(cl.path)) {
+        const epoch = Date.parse(String(e.ts).replace(" ", "T")) / 1000;
+        if (!Number.isFinite(epoch)) continue;
+        if (e.kind === "flag" && epoch > bm.lastFlagTs) bm.lastFlagTs = epoch;
+        const b = bm.branches.get(e.branch);
+        if (b && (e.kind === "core" || e.kind === "flag") && epoch > b.lastCoreTs) {
+          b.lastCoreTs = epoch; // 分支停滞时钟同样跨段持久（最后一张卡起算）
+        }
+      }
+    } catch {
+      /* corelog 不可读 → 用题起点锚 */
+    }
+  }
   const corelog = multiOn ? rec().corelog(code) : null;
   const ledger = new FlagLedger();
   if (opts.flagTotal) ledger.setTotal(opts.flagTotal);
@@ -574,6 +595,8 @@ export async function solveTask(
   };
 
   // 旁观者：组合信号任二成立 → 独立短上下文调用 → 尾部插嘴（限频在 bm）
+  let flagStallArmedLogged = false;
+  let bystanderSkipLogged = false;
   const maybeBystander = async (): Promise<void> => {
     if (!CFG.bystander_enabled) return;
     const t = nowSec();
@@ -594,6 +617,12 @@ export async function solveTask(
       });
       return { b, sig };
     });
+    if (!flagStallArmedLogged && sigs.some((x) => x.sig.flagStall)) {
+      flagStallArmedLogged = true;
+      log(
+        `[${code}] flag-stall ARMED (since ${Math.round(flagSince)}s >= ${flagStallSec}s, taskClass=${taskClass})`,
+      );
+    }
     const need = sigs.filter((x) => bystanderShouldFire(x.sig));
     if (!need.length) return;
     // 目标选择（可介入任何分支）：有停滞分支 → 救卡最死的（lastCoreTs 最老）；
@@ -617,7 +646,14 @@ export async function solveTask(
     );
     const target = chosen.b;
     const sig = chosen.sig;
-    if (!target || !bm.bystanderAvailable(target.id, t)) return;
+    if (!target) return;
+    if (!bm.bystanderAvailable(target.id, t)) {
+      if (!bystanderSkipLogged) {
+        bystanderSkipLogged = true;
+        log(`[${code}] bystander SKIPPED (branch ${target.id}: quota/cooldown)`);
+      }
+      return;
+    }
     const entries = corelog ? readCorelog(corelog.path) : [];
     const input = buildBystanderInput({
       entries,
@@ -1371,6 +1407,8 @@ async function runParallel(
           branches: branches.length ? branches : undefined,
           taskClass: cls(task),
           flagTotal: task.flag_count,
+          // 题起始 epoch（跨段不重置）：flag/停滞时钟的锚——见 solveTask 时钟恢复
+          taskStartTs: TASK_START_TS.get(code),
         });
         status = r.status;
         last = r.lastContent;

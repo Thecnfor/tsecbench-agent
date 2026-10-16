@@ -91,6 +91,12 @@
 - **目标（可介入任何分支）**：存在停滞分支 → 救**卡最死的**（lastCoreTs 最老）；
   仅 flag 时钟触发（分支在干活但没 flag，如记卡型空转）→ 盯**最新鲜推进线**
   （lastCoreTs 最新）；无可选 → trunk
+- **时钟必须跨段持久（2026-10-16 run4 实测修复）**：flag/停滞时钟锚在
+  **题起点（TASK_START_TS，跨段不重置）+ corelog 最后事件**，solveTask 启动时恢复——
+  旧实现锚在 BranchManager 构造（每段归零），而段墙钟 = min(段上限, 剩余时限/6)
+  会被短限时压到 ~192s（arena 2400s 实测），900s flag 主时钟与 600s 停滞在段内
+  **数学上永不可达**（run4 旁观者全程静默的真相）。诊断日志：`flag-stall ARMED` /
+  `bystander SKIPPED` 各每段一条，定位时钟与限频问题。
 - **输入构建（处理交错，按分支分组）**：分支 A corelog（时序）→ 分支 B corelog（时序）
   → 全局进度（**flag 索引账本** `2/5 (idx:1,3)` + 耗时/分支数）→ 卡塞分支最近 10 条消息摘要
 - **本体**：同款 deepseek-flash 换 system（抽象全局视角；hosted 已验证可用）；
