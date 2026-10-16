@@ -126,6 +126,9 @@ def build_agent_dir(agent_dir: Path, strategy: str = "") -> None:
     )
     if strategy:
         append += "\n\n" + strategy
+    node_directive = os.environ.get("SOLVER_NODE_DIRECTIVE", "").strip()
+    if node_directive:
+        append += f"\n\n# NODE FOCUS（本次委派目标，最高优先）\n{node_directive}"
     (agent_dir / "APPEND_SYSTEM.md").write_text(append, encoding="utf-8")
     # 注入快照（debug-ui 观测台展示「动态提示词注入」用；失败不影响解题）
     try:
