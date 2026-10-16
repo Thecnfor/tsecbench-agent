@@ -1,0 +1,3 @@
+# vitest 依赖 esbuild，其安装脚本需要被放行（与 tsec_agent 同口径）
+allowBuilds:
+  esbuild: true

@@ -24,3 +24,5 @@ tsec_agent/tasks
 tsec_agent/node_modules
 tsec_agent/.pnpm-store
 **/pnpm-debug.log*
+# 内部本地跑分题场：challenges/ 含 flag 字面量（题目答案），**绝不进镜像层**（红线）。
+arena/

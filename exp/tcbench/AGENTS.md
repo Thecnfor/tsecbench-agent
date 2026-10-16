@@ -165,6 +165,7 @@
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
 | `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
 | `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
+| `arena/` | 内部本地跑分题场：官方 Challenges API 线格式兼容的计分服务 + **docker 真靶机驱动**（题包在 `arena/challenges/`，含 flag 字面量——`.dockerignore` 已排除 `arena/`，**红线别删**）；行为契约见 `arena/README.md`，接入只改 `BENCHMARK_BASE_URL`/`BENCHMARK_TOKEN` | 内部本地跑分、加题 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
 | `docker/entrypoint.sh` | 容器入口：VPN → 预检 → DNS → 冒烟 → 跑分 | 接入流程变化 |
 | `docker/run.sh` | 一键启动（选最新 vpn 配置、挂卷、环境变量） | 启动参数变化 |
@@ -191,6 +192,11 @@ cd tsec_agent && pnpm typecheck && pnpm build
 
 # 观察面板（React；读最新 runs/<TOKEN>，浏览器打开 127.0.0.1:8791）
 cd tsec_agent && pnpm serve
+
+# 内部本地跑分题场（官方 API 线格式 + docker 真靶机；agent 侧把
+# BENCHMARK_BASE_URL 指到 http://<宿主机>:8899、BENCHMARK_TOKEN 对上 ARENA_TOKEN 即可）
+cd arena && pnpm install && pnpm check   # typecheck + 22 用例（离线，FakeDriver）
+cd arena && pnpm dev                     # 起 127.0.0.1:8899（真 docker 驱动，预热构建靶机镜像）
 
 # 构建镜像（上下文 = 项目根，`-f Dockerfile` 指向本目录的 Dockerfile；根 .dockerignore 排除凭证/记录）
 cd docker && newgrp docker -c "docker build -f Dockerfile -t tsec-agent:latest .."
