@@ -13,3 +13,17 @@
 | OpenHands `src/api/`（conversation / event-stream / agent-profiles services）、`docs/ACP_AGENTS.md` | MIT | solver/gov/ 治理薄版结构、dual_main 动态提示词注入位 | 架构参照 |
 
 自创（无外部来源）：solver/kb/*.md cheatsheet、solver/recon_recipe.py、solver/gov/prior.py、solver/kb/index.py。
+
+## 本地补丁（.pi-vendor 重装后需重打，2026-10-17）
+pi-ai dist/api/openai-completions.js convertMessages() 尾部：新增"悬空 tool_calls 消毒"——
+assistant 消息带 tool_calls 但下一条不是 tool 结果时（连接中断的残缺轮次），剥离该消息并
+注入 user 提示 "[system] previous tool call was interrupted"。否则 deepseek 400
+"must be followed by tool messages" 死循环烧掉整个时间片（实测 3/12 片）。
+补丁位置 2（同日）：pi-coding-agent dist/bundle/chunks/openai-completions-WWQW7S3V.js 的
+convertMessages return 前同款消毒（bundle 内联版才是实际生效路径；pi-ai 包版本是死代码路径）。
+补丁 v3（2026-10-17 06:2x）：消毒逻辑升级为"合成缺失 tool 结果"——逐 call_id 校验，
+缺失则注入 {role:"tool",tool_call_id,content:"[system] tool call was interrupted..."}。
+仅剥消息不够：deepseek 对多 tool_calls 部分覆盖同样 400（c-01 实测）。两处文件均已打。
+补丁 v4（07:2x）：消毒升级为共享 __tsecSanitize——向前扫描到下一个 assistant/user 收集
+已答 call_id，两侧 id 做 "|" 前缀归一化（OpenAI Responses 格式），缺失即合成 tool 结果。
+（v3 仅查紧邻，d-04 实测仍 400 的变体根因。）
