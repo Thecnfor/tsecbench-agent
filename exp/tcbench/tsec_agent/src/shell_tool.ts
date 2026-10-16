@@ -1,4 +1,6 @@
 /** shell 工具的 schema、参数容错与路由（dispatch）。 */
+
+import { attachPyLint } from "./py_lint.js";
 import { IMAGE_EXT, ShellManager } from "./shell.js";
 import type { ContentPart } from "./types.js";
 
@@ -280,7 +282,7 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
     if (action === "run") {
       const command = args.command;
       if (!command) return "error: `command` is required for action=run";
-      return await SHELL.run({
+      const out = await SHELL.run({
         command: String(command),
         cwd: (args.cwd as string) ?? null,
         timeout: toFloat(args.timeout_sec, null), // 缺省→配置默认 1800s
@@ -288,6 +290,8 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
         wait_sec: toFloat(args.wait_sec, null),
         out_file: (args.out_file as string) ?? null,
       });
+      // py 脚本自动 lint（heredoc 形态）：[py-lint] 附结果尾，模型下轮即见（见 py_lint.ts）
+      return attachPyLint(String(command), out);
     }
     if (action === "wait") {
       const jobId = args.job_id;

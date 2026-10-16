@@ -79,6 +79,11 @@ RUN pip3 install --break-system-packages --no-cache-dir \
         requests flask itsdangerous flask-unsign pydash cryptography pyjwt scapy \
     || pip3 install --no-cache-dir requests flask itsdangerous flask-unsign pydash cryptography pyjwt scapy
 
+# ── python 脚本运行时 lint（tsec_agent/src/py_lint.ts 检测 ruff，缺失时 stdlib ast 兜底）──
+# 宽松安装（版本实际值落 toolchain.lock，机制见文件头；不编造钉死号防构建断）
+RUN pip3 install --break-system-packages --no-cache-dir ruff \
+    || pip3 install --no-cache-dir ruff
+
 # ── 出站白名单防火墙（限网模式 entrypoint 下发规则用；独立层保前面缓存）──
 RUN apt-get update && apt-get install -y --no-install-recommends iptables \
     && rm -rf /var/lib/apt/lists/*
