@@ -212,3 +212,53 @@ def select(base: Path, text: str, *, top_k: int = 2) -> list[str]:
     if used:
         mark_used(base, used)
     return out
+
+
+_SUMMARY_CHARS = 80
+
+
+def _read_body(base: Path, slug: str) -> str | None:
+    """按 index 里登记的 file 读正文；缺失/索引无条目 → None。"""
+    entry = _read_index(base).get(slug)
+    if entry is None:
+        return None
+    try:
+        return (store_dir(base) / str(entry.get("file", f"{slug}.md"))).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.strip().splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def catalog(base: Path, *, top_k: int = 8) -> list[tuple[str, str]]:
+    """目录注入（harness-v2-openhands.md §5）：[(slug, 一行脱敏摘要)]。
+
+    摘要 = 正文第一行截断 80 字符，经 _sanitize；正文缺失或 flag 形态
+    命中 → 整条跳过（fail-closed，与 load 同位）。
+    """
+    out: list[tuple[str, str]] = []
+    for slug in _read_index(base):
+        text = _read_body(base, slug)
+        if not text or _contains_flag(text):
+            continue
+        summary = _sanitize(_first_nonempty_line(text))[:_SUMMARY_CHARS]
+        if summary:
+            out.append((slug, summary))
+        if len(out) >= top_k:
+            break
+    return out
+
+
+def load(base: Path, slug: str) -> str | None:
+    """按需注入全文；正文缺失或 flag 形态命中 → None（fail-closed，§4.2 同位）。"""
+    text = _read_body(base, slug)
+    if not text or _contains_flag(text):
+        return None
+    return _sanitize(text)

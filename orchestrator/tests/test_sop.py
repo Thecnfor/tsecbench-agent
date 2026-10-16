@@ -105,3 +105,50 @@ def test_distill_empty_session_returns_none(tmp_path):
     make_session(ws, ["plain output without commands"])
     assert sop.distill(ws, tmp_path) is None
     assert sop.distill(tmp_path / "missing", tmp_path) is None
+
+
+class TestProgressiveDisclosure:
+    """catalog/load（harness-v2-openhands.md §5）：目录注入 + 全文按需，读侧 fail-closed。
+
+    fixture 对齐 distill 真实落盘格式：index.json 是 dict（key=slug，条目含
+    file 字段），正文在 base/sops/{slug}.md。
+    """
+
+    @staticmethod
+    def _make_store(tmp_path: Path, slug: str, body: str) -> Path:
+        d = tmp_path / "sops"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{slug}.md").write_text(body, encoding="utf-8")
+        (d / "index.json").write_text(
+            json.dumps({slug: {"slug": slug, "file": f"{slug}.md", "wins": 1, "uses": 0}}),
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_catalog_and_load(self, tmp_path):
+        base = self._make_store(
+            tmp_path,
+            "web-sqli",
+            "# SOP: web-sqli (distilled, de-identified)\n\n1. curl <TARGET>\n2. sqlmap 批处理\n",
+        )
+        cat = sop.catalog(base)
+        assert cat and cat[0][0] == "web-sqli"
+        full = sop.load(base, "web-sqli")
+        assert full is not None and "sqlmap" in full
+
+    def test_load_rejects_flag_body(self, tmp_path):
+        base = self._make_store(tmp_path, "dirty", "FLAG{leak}\n")
+        assert sop.load(base, "dirty") is None
+        assert sop.catalog(base) == []
+
+    def test_load_missing_slug_none(self, tmp_path):
+        assert sop.load(tmp_path, "ghost") is None
+        assert sop.catalog(tmp_path) == []
+
+    def test_catalog_summary_sanitized_and_truncated(self, tmp_path):
+        long = "1. nmap -sV 10.0.0.9 -p " + "a" * 200
+        base = self._make_store(tmp_path, "recon", f"{long}\n")
+        (slug, summary) = sop.catalog(base)[0]
+        assert slug == "recon"
+        assert len(summary) <= 80
+        assert "10.0.0.9" not in summary and "<TARGET>" in summary
