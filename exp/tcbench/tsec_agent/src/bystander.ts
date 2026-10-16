@@ -20,6 +20,9 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 2. **全局调度**：日志里哪些方向重复了？哪些已确认走不通该放弃？不同分支的日志
    之间有没有可以组合起来的线索（A 分支的入口 + B 分支的凭据）？
 3. **止损判断**：如果同一思路已消耗大量轮次，明确说"这条路放弃，改攻 X"。
+4. **幻觉与错误前提核对**：对照各卡与进度找矛盾——声称拿到的证据在别处被自己证伪、
+   连续提交都 correct:false 仍坚持、反复连接同一个不存在的目标（Connection refused 刷屏）。
+   指出"你可能在臆测/打错目标"，并要求回到有工具结果支撑的事实。
 
 要求：
 - 只输出**一段简短中文**（≤120 字），直接给指引，不要客套、不要复述日志、不要输出命令块。
@@ -27,13 +30,15 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 - 你只读运行时派生的核心日志——不要猜测题目答案，不要编造日志里没有的事实。`;
 
 export interface StallSignals {
-  stall: boolean; // 距上次 core_log/flag 停滞超阈值
-  repeat: boolean; // 近期同一命令 ≥3 次
-  budget: boolean; // 段预算过半仍零核心事件
+  stall: boolean; // ① 距上次 core_log/flag 停滞超阈值
+  repeat: boolean; // ② 近期同一命令 ≥3 次
+  budget: boolean; // ③ 段过半且超半段无核心事件
+  hardFail: boolean; // ④ 近期反复连接/解析/命令缺失失败=对幻觉目标空转
+  hallucSubmit: boolean; // ⑤ 连续 correct:false=幻觉/错误提交
   count: number; // 成立数（≥2 触发）
 }
 
-/** 三信号评估（任二成立）。纯函数，可离线单测。
+/** 五信号评估（任二成立）。④⑤为幻觉/无用功的事实维度（零 LLM 成本）。纯函数可单测。
  * budget 语义（2026-01-16 修正）：段过半 + **距上次核心事件也超半段**——
  * 旧条件「段内零核心事件」会被段首的一张卡永久作废（arena 实测：08:00 记首卡后
  * 旁观者整段失明 15+ 分钟，nudge 额度同时耗尽）。 */
@@ -43,6 +48,8 @@ export function evaluateStall(input: {
   recentCmds: string[]; // 分支近期命令（已归一化）
   segElapsedSec: number;
   segBudgetSec: number;
+  recentHardFails?: boolean[]; // 近期工具结果硬失败标记（滚动，信号④）
+  wrongSubmits?: number; // 连续 correct:false 次数（信号⑤）
 }): StallSignals {
   const stall = input.sinceCoreSec >= input.stallSec;
   const counts = new Map<string, number>();
@@ -52,8 +59,11 @@ export function evaluateStall(input: {
   const half = input.segBudgetSec * 0.5;
   const budget =
     input.segBudgetSec > 0 && input.segElapsedSec >= half && input.sinceCoreSec >= half;
-  const count = [stall, repeat, budget].filter(Boolean).length;
-  return { stall, repeat, budget, count };
+  // ④ 近8次连接/解析/命令缺失类硬失败≥3（幻觉端口/错误前提空转）；⑤ 连续错提交≥2
+  const hardFail = (input.recentHardFails ?? []).slice(-8).filter(Boolean).length >= 3;
+  const hallucSubmit = (input.wrongSubmits ?? 0) >= 2;
+  const count = [stall, repeat, budget, hardFail, hallucSubmit].filter(Boolean).length;
+  return { stall, repeat, budget, hardFail, hallucSubmit, count };
 }
 
 /** 旁观者输入（corelog 分组视图 + flag 账本 + 卡塞分支近况）。 */
@@ -76,7 +86,8 @@ export function buildBystanderInput(args: {
     `${args.branchId === 0 ? "主分支" : `分支 ${args.branchId}`}` +
     `${args.branchLabel ? `（${args.branchLabel}）` : ""}\n` +
     `- 触发信号：停滞${args.signals.stall ? "✓" : "✗"} 重复${args.signals.repeat ? "✓" : "✗"} ` +
-    `预算${args.signals.budget ? "✓" : "✗"}\n`;
+    `预算${args.signals.budget ? "✓" : "✗"} 连接空转${args.signals.hardFail ? "✓" : "✗"} ` +
+    `错提交${args.signals.hallucSubmit ? "✓" : "✗"}\n`;
   parts.push(head);
   parts.push(
     `# 各分支核心日志（按分支分组）\n${buildBystanderLogView(args.entries, { branches: args.branchNames }) || "（暂无）"}\n`,

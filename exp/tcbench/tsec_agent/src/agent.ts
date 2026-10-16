@@ -586,6 +586,8 @@ export async function solveTask(
           recentCmds: b.recentCmds,
           segElapsedSec: t - segStartTs,
           segBudgetSec: budgetSec,
+          recentHardFails: b.recentHardFails,
+          wrongSubmits: b.wrongSubmits,
         }).count >= 2,
     );
     if (!stalled.length) return;
@@ -598,6 +600,8 @@ export async function solveTask(
       recentCmds: target.recentCmds,
       segElapsedSec: t - segStartTs,
       segBudgetSec: budgetSec,
+      recentHardFails: target.recentHardFails,
+      wrongSubmits: target.wrongSubmits,
     });
     const entries = corelog ? readCorelog(corelog.path) : [];
     const input = buildBystanderInput({
@@ -830,6 +834,18 @@ export async function solveTask(
             result = await dispatchShell(args);
           }
           if (typeof args.command === "string") bm.pushCmd(br.id, args.command);
+          // 信号④/⑤数据源：硬失败（连接/解析/命令缺失——对幻觉目标空转）与连续错提交
+          {
+            const txt = firstText(result);
+            bm.recordShellOutcome(
+              br.id,
+              /Connection refused|Connection timed out|Could not resolve|Name or service not known|command not found|No route to host/i.test(
+                txt,
+              ),
+            );
+            if (/"correct"\s*:\s*false/.test(txt)) bm.recordSubmitResult(br.id, false);
+            else if (/"correct"\s*:\s*true/.test(txt)) bm.recordSubmitResult(br.id, true);
+          }
           // flag 事件（权威之一）：submit 响应的 matched_flag_index 作稳定 ID 进账本
           const idx = extractFlagIndex(firstText(result));
           if (idx !== null && ledger.add(idx, br.id)) {

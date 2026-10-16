@@ -37,6 +37,8 @@ export interface BranchState {
   lastBystanderAt: number;
   lastCoreTs: number; // 最近一次 core_log / flag 事件（剪枝与停滞信号共用）
   recentCmds: string[]; // 最近 shell 命令（重复模式信号）
+  recentHardFails: boolean[]; // 最近 shell 结果是否「连接/解析/命令缺失」类硬失败（信号④）
+  wrongSubmits: number; // 连续 correct:false 次数（信号⑤ 幻觉提交）
   roundsSinceCore: number; // 连续无 core_log/flag 的轮数（轮级轻推信号）
   nudgesUsed: number; // 本段 core_log 轻推次数
 }
@@ -94,6 +96,8 @@ export class BranchManager {
       lastBystanderAt: 0,
       lastCoreTs: now,
       recentCmds: [],
+      recentHardFails: [],
+      wrongSubmits: 0,
       roundsSinceCore: 0,
       nudgesUsed: 0,
     });
@@ -118,6 +122,8 @@ export class BranchManager {
         lastBystanderAt: 0,
         lastCoreTs: now, // 恢复后给一个剪枝宽限期
         recentCmds: [],
+        recentHardFails: [],
+        wrongSubmits: 0,
         roundsSinceCore: 0,
         nudgesUsed: 0,
       });
@@ -221,6 +227,8 @@ export class BranchManager {
       lastBystanderAt: 0,
       lastCoreTs: now,
       recentCmds: [],
+      recentHardFails: [],
+      wrongSubmits: 0,
       roundsSinceCore: 0,
       nudgesUsed: 0,
     };
@@ -297,6 +305,22 @@ export class BranchManager {
       b.lastCoreTs = now;
       b.roundsSinceCore = 0;
     }
+  }
+
+  /** 记录 shell 结果的硬失败（连接/解析/命令缺失=幻觉目标空转信号④，滚动12次）。 */
+  recordShellOutcome(id: number, hardFail: boolean): void {
+    const b = this.branches.get(id);
+    if (!b) return;
+    b.recentHardFails.push(hardFail);
+    if (b.recentHardFails.length > 12) b.recentHardFails.shift();
+  }
+
+  /** 幻觉提交计数（信号⑤）：correct:false 连增、correct:true 清零。 */
+  recordSubmitResult(id: number, correct: boolean): void {
+    const b = this.branches.get(id);
+    if (!b) return;
+    if (correct) b.wrongSubmits = 0;
+    else b.wrongSubmits++;
   }
 
   /** 记录 shell 命令（重复模式信号）。 */

@@ -244,7 +244,9 @@ export const CFG: Config = {
   max_branches: num("AGENT_MAX_BRANCHES", "3"), // 存活分支上限（含 trunk）
   fork_max: num("AGENT_FORK_MAX", "5"), // 每题 fork 总数硬上限
   fork_cooldown_sec: num("AGENT_FORK_COOLDOWN_SEC", "180"),
-  branch_prune_sec: num("AGENT_BRANCH_PRUNE_SEC", "600"), // corelog/flag 双停滞剪枝
+  // 1200（B 方案）：长题停滞 600s+二信号 900s 触发旁观者后仍留 300s 救治窗，
+  // 救不活才剪——两阈值曾同为 600（剪枝先执行=分支旁观者窗口为 0，靠巧合而非设计）
+  branch_prune_sec: num("AGENT_BRANCH_PRUNE_SEC", "1200"), // corelog/flag 双停滞剪枝
   broadcast_max: num("AGENT_BROADCAST_MAX", "8"), // 每段每分支广播上限
 
   // --- 旁观者（默认关；依赖 core_log 工具，可单独于 fork 打开） ---

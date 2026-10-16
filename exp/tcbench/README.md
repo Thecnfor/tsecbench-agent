@@ -236,7 +236,7 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_MAX_BRANCHES` | 活跃分支上限（含 trunk） | `3` |
 | `AGENT_FORK_MAX` | 每题 fork 总数硬上限（含分支再分叉） | `5` |
 | `AGENT_FORK_COOLDOWN_SEC` | fork 冷却秒 | `180` |
-| `AGENT_BRANCH_PRUNE_SEC` | 分支 corelog/flag 双停滞剪枝阈值秒 | `600` |
+| `AGENT_BRANCH_PRUNE_SEC` | 分支 corelog/flag 双停滞剪枝阈值秒（B 方案：给长题分支留旁观者 900s 触发后的救治窗，救不活 1200s 才剪） | `1200` |
 | `AGENT_BROADCAST_MAX` | 每段每分支广播上限 | `8` |
 | `AGENT_BYSTANDER_MAX` | 每段每分支旁观者注入上限 | `2` |
 | `AGENT_BYSTANDER_COOLDOWN_SEC` | 旁观者冷却秒 | `400` |

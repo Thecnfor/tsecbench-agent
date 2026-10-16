@@ -285,6 +285,19 @@ describe("旁观者信号与输入", () => {
       recentCmds: ["a", "a", "a"],
     });
     expect(three.count).toBe(3);
+    // 信号④：近8次连接类硬失败≥3（幻觉目标空转）——与停滞无关可独立凑数
+    const hf = evaluateStall({ ...base, recentHardFails: [false, true, true, true] });
+    expect(hf.hardFail).toBe(true);
+    expect(hf.count).toBe(1);
+    expect(evaluateStall({ ...base, recentHardFails: [true, true] }).hardFail).toBe(false); // 仅2次不成立
+    // 信号⑤：连续 correct:false ≥2（幻觉提交）
+    const hs = evaluateStall({ ...base, wrongSubmits: 2 });
+    expect(hs.hallucSubmit).toBe(true);
+    expect(evaluateStall({ ...base, wrongSubmits: 1 }).hallucSubmit).toBe(false);
+    // 组合：错提交+连接空转（无时间信号也触发）
+    expect(
+      evaluateStall({ ...base, wrongSubmits: 2, recentHardFails: [true, true, true] }).count,
+    ).toBe(2);
     // 段过半但半段内刚记过卡（sinceCore=240 < 半段 300）→ 预算不成立，且未过停滞阈值
     // ——证伪「只段过半就触发」，证明新语义看的是距核心事件的窗口
     expect(evaluateStall({ ...base, sinceCoreSec: 240, segElapsedSec: 400 }).count).toBe(0);
@@ -318,7 +331,14 @@ describe("旁观者信号与输入", () => {
       recentDigest: "- assistant: 继续注",
       recentCmds: ["sqlmap -u http://x"],
       segElapsedSec: 400,
-      signals: { stall: true, repeat: false, budget: true, count: 2 },
+      signals: {
+        stall: true,
+        repeat: false,
+        budget: true,
+        hardFail: false,
+        hallucSubmit: false,
+        count: 2,
+      },
     });
     expect(input).toContain("1/3 (idx:1)");
     expect(input).toContain("SQLi 疑似");
