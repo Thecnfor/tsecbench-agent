@@ -8,6 +8,7 @@ import { type BranchCfg, BranchManager, normalizeNote } from "../src/branch.js";
 import {
   buildBystanderInput,
   bystanderMessage,
+  bystanderShouldFire,
   evaluateStall,
   recentDigest,
 } from "../src/bystander.js";
@@ -258,58 +259,51 @@ describe("corelog", () => {
 });
 
 describe("旁观者信号与输入", () => {
-  it("evaluateStall 任二成立", () => {
+  it("evaluateStall 五信号：flag 主时钟一票 + 分支级任二", () => {
     const base = {
       sinceCoreSec: 0,
       stallSec: 300,
+      flagSinceSec: 0,
+      flagStallSec: 900,
       recentCmds: [] as string[],
-      segElapsedSec: 0,
-      segBudgetSec: 600,
     };
     expect(evaluateStall(base).count).toBe(0);
-    // 只停滞 → 1
-    expect(evaluateStall({ ...base, sinceCoreSec: 301 }).count).toBe(1);
-    // 停滞+重复 → 2 触发
-    const two = evaluateStall({
+    expect(bystanderShouldFire(evaluateStall(base))).toBe(false);
+    // ⓪ flag 主时钟：长时间没 flag 一票触发（以 flag 为核心的介入锚；
+    //    即使分支刚记过卡——run3 记卡型空转靠它抓）
+    const fs0 = evaluateStall({ ...base, flagSinceSec: 901 });
+    expect(fs0.flagStall).toBe(true);
+    expect(bystanderShouldFire(fs0)).toBe(true);
+    expect(evaluateStall({ ...base, flagSinceSec: 800 }).flagStall).toBe(false);
+    // ① 只停滞 → 1（不触发）
+    const s1 = evaluateStall({ ...base, sinceCoreSec: 301 });
+    expect(s1.count).toBe(1);
+    expect(bystanderShouldFire(s1)).toBe(false);
+    // ①+② 停滞+重复 → 触发
+    const s12 = evaluateStall({
       ...base,
       sinceCoreSec: 301,
       recentCmds: ["nmap -sT x", "nmap -sT x", "nmap -sT x"],
     });
-    expect(two.count).toBe(2);
-    expect(two.repeat).toBe(true);
-    // 预算信号 = 段过半 && 距上次核心事件也超半段（旧「段内零事件」会被首卡作废）
-    const three = evaluateStall({
-      ...base,
-      sinceCoreSec: 301,
-      segElapsedSec: 301,
-      recentCmds: ["a", "a", "a"],
-    });
-    expect(three.count).toBe(3);
-    // 信号④：近8次连接类硬失败≥3（幻觉目标空转）——与停滞无关可独立凑数
+    expect(s12.count).toBe(2);
+    expect(bystanderShouldFire(s12)).toBe(true);
+    // ③ 近8次连接类硬失败≥3（幻觉目标空转）
     const hf = evaluateStall({ ...base, recentHardFails: [false, true, true, true] });
     expect(hf.hardFail).toBe(true);
     expect(hf.count).toBe(1);
-    expect(evaluateStall({ ...base, recentHardFails: [true, true] }).hardFail).toBe(false); // 仅2次不成立
-    // 信号⑤：连续 correct:false ≥2（幻觉提交）
-    const hs = evaluateStall({ ...base, wrongSubmits: 2 });
-    expect(hs.hallucSubmit).toBe(true);
+    expect(evaluateStall({ ...base, recentHardFails: [true, true] }).hardFail).toBe(false);
+    // ④ 连续 correct:false ≥2（幻觉提交）
+    expect(evaluateStall({ ...base, wrongSubmits: 2 }).hallucSubmit).toBe(true);
     expect(evaluateStall({ ...base, wrongSubmits: 1 }).hallucSubmit).toBe(false);
-    // 组合：错提交+连接空转（无时间信号也触发）
+    // ③+④：错提交+连接空转（无任何时间信号也触发）
     expect(
-      evaluateStall({ ...base, wrongSubmits: 2, recentHardFails: [true, true, true] }).count,
-    ).toBe(2);
-    // 段过半但半段内刚记过卡（sinceCore=240 < 半段 300）→ 预算不成立，且未过停滞阈值
-    // ——证伪「只段过半就触发」，证明新语义看的是距核心事件的窗口
-    expect(evaluateStall({ ...base, sinceCoreSec: 240, segElapsedSec: 400 }).count).toBe(0);
-    // 段首记过卡（旧语义下预算信号永假的回归）：段过半 + 半段无卡 → 预算成立
-    const afterFirstCard = evaluateStall({
-      ...base,
-      sinceCoreSec: 301,
-      segElapsedSec: 400,
-    });
-    expect(afterFirstCard.budget).toBe(true);
+      bystanderShouldFire(
+        evaluateStall({ ...base, wrongSubmits: 2, recentHardFails: [true, true, true] }),
+      ),
+    ).toBe(true);
+    // 新 flag 后主时钟由调用方刷新（flagSinceSec 归零 → 不再一票）
+    expect(bystanderShouldFire(evaluateStall({ ...base, flagSinceSec: 0 }))).toBe(false);
   });
-
   it("buildBystanderInput 组装完整要素", () => {
     const led = new FlagLedger();
     led.setTotal(3);
@@ -332,19 +326,19 @@ describe("旁观者信号与输入", () => {
       recentCmds: ["sqlmap -u http://x"],
       segElapsedSec: 400,
       signals: {
+        flagStall: true,
         stall: true,
         repeat: false,
-        budget: true,
         hardFail: false,
         hallucSubmit: false,
-        count: 2,
+        count: 1,
       },
     });
     expect(input).toContain("1/3 (idx:1)");
     expect(input).toContain("SQLi 疑似");
     expect(input).toContain("sqlmap");
-    expect(input).toContain("停滞✓");
-    expect(input).toContain("预算✓");
+    expect(input).toContain("分支停滞✓");
+    expect(input).toContain("无flag✓");
   });
 
   it("recentDigest 截断并标注 tool_calls", () => {

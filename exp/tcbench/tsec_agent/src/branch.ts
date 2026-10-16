@@ -75,12 +75,14 @@ export class BranchManager {
   branches = new Map<number, BranchState>();
   forkCount = 0;
   lastForkAt = 0;
+  lastFlagTs: number; // 题级 flag 时钟（旁观者核心：距上个新 flag 的分母；非分支级）
   private nextId = 1;
   private rr = -1;
   private recentBroadcasts: string[] = [];
 
   constructor(cfg: BranchCfg, trunkMessages: ChatMessage[], now: number, trunkCwd = "") {
     this.cfg = cfg;
+    this.lastFlagTs = now;
     this.branches.set(0, {
       id: 0,
       parent: null,
@@ -296,6 +298,11 @@ export class BranchManager {
     b.pruned = true;
     b.active = false;
     return b;
+  }
+
+  /** 新 flag 到达 → 刷新题级 flag 时钟（旁观者主信号的分母）。 */
+  recordFlag(now: number): void {
+    this.lastFlagTs = now;
   }
 
   /** core_log / flag 事件到达 → 刷新停滞时钟 + 轮级轻推计数。 */

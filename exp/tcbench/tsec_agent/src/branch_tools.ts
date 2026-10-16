@@ -143,7 +143,11 @@ export function dispatchBranchTool(
     // flag idx=N 的自述也进账本（权威仍以 watcher 快照 + submit 响应对账）
     const m = /flag\s+idx\s*=?\s*(\d+)/i.exec(note);
     if (m && ledger) ledger.add(Number(m[1]), branchId);
-    return { result: `logged to core log (branch ${branchId}): ${note.slice(0, 120)}` };
+    return {
+      result:
+        `logged to core log (branch ${branchId}): ${note.slice(0, 120)}\n` +
+        `(黑板文件全分支可读：tasks/<题目编号>/corelog.jsonl，可 shell cat 看全局进展)`,
+    };
   }
   if (name === "broadcast") {
     const note = String(args.note ?? "").trim();

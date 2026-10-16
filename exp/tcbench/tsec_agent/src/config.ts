@@ -175,6 +175,8 @@ export interface Config {
   bystander_cooldown_sec: number;
   stall_short_sec: number;
   stall_long_sec: number;
+  flag_stall_short_sec: number;
+  flag_stall_long_sec: number;
   // core_log 轮级轻推（执行层兜底）
   core_log_nudge_rounds: number;
   core_log_nudge_max: number;
@@ -256,6 +258,9 @@ export const CFG: Config = {
   // 组合信号（任二成立触发）的分档阈值：停滞时长按题目分类取值
   stall_short_sec: num("AGENT_STALL_SHORT_SEC", "300"),
   stall_long_sec: num("AGENT_STALL_LONG_SEC", "600"),
+  // flag 主时钟（题级，旁观者核心信号）：长时间没 flag 就介入
+  flag_stall_short_sec: num("AGENT_FLAG_STALL_SHORT_SEC", "400"),
+  flag_stall_long_sec: num("AGENT_FLAG_STALL_LONG_SEC", "900"),
   // core_log 执行层兜底（轮级轻推，零 LLM 调用）：连续 N 轮无 core_log →
   // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给旁观者。
   core_log_nudge_rounds: num("AGENT_CORE_LOG_NUDGE_ROUNDS", "3"),

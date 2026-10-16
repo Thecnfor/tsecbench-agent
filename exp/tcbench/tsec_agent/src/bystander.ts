@@ -30,11 +30,11 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 - 你只读运行时派生的核心日志——不要猜测题目答案，不要编造日志里没有的事实。`;
 
 export interface StallSignals {
-  stall: boolean; // ① 距上次 core_log/flag 停滞超阈值
+  flagStall: boolean; // ⓪ 题级主信号：长时间没 flag（以 flag 为核心的介入锚）
+  stall: boolean; // ① 分支距上次 core_log/flag 停滞超阈值
   repeat: boolean; // ② 近期同一命令 ≥3 次
-  budget: boolean; // ③ 段过半且超半段无核心事件
-  hardFail: boolean; // ④ 近期反复连接/解析/命令缺失失败=对幻觉目标空转
-  hallucSubmit: boolean; // ⑤ 连续 correct:false=幻觉/错误提交
+  hardFail: boolean; // ③ 近期反复连接/解析/命令缺失失败=对幻觉目标空转
+  hallucSubmit: boolean; // ④ 连续 correct:false=幻觉/错误提交
   count: number; // 成立数（≥2 触发）
 }
 
@@ -43,27 +43,33 @@ export interface StallSignals {
  * 旧条件「段内零核心事件」会被段首的一张卡永久作废（arena 实测：08:00 记首卡后
  * 旁观者整段失明 15+ 分钟，nudge 额度同时耗尽）。 */
 export function evaluateStall(input: {
-  sinceCoreSec: number; // 距上次 core_log/flag 的秒数
-  stallSec: number; // 阈值（短题/长题分档）
+  sinceCoreSec: number; // 分支距上次 core_log/flag 的秒数
+  stallSec: number; // 分支停滞阈值（短题/长题分档）
+  flagSinceSec: number; // 题级：距上一个新 flag 的秒数
+  flagStallSec: number; // flag 主时钟阈值（短题/长题分档）
   recentCmds: string[]; // 分支近期命令（已归一化）
-  segElapsedSec: number;
-  segBudgetSec: number;
-  recentHardFails?: boolean[]; // 近期工具结果硬失败标记（滚动，信号④）
-  wrongSubmits?: number; // 连续 correct:false 次数（信号⑤）
+  recentHardFails?: boolean[]; // 近期工具结果硬失败标记（滚动，信号③）
+  wrongSubmits?: number; // 连续 correct:false 次数（信号④）
 }): StallSignals {
+  // ⓪ flag 主时钟（题级）：黑板一直在记卡≠真进展——run3 盲区（记卡型空转永不触发停滞）
+  const flagStall = input.flagSinceSec >= input.flagStallSec;
   const stall = input.sinceCoreSec >= input.stallSec;
   const counts = new Map<string, number>();
   for (const c of input.recentCmds) counts.set(c, (counts.get(c) ?? 0) + 1);
   let repeat = false;
   for (const n of counts.values()) if (n >= 3) repeat = true;
-  const half = input.segBudgetSec * 0.5;
-  const budget =
-    input.segBudgetSec > 0 && input.segElapsedSec >= half && input.sinceCoreSec >= half;
-  // ④ 近8次连接/解析/命令缺失类硬失败≥3（幻觉端口/错误前提空转）；⑤ 连续错提交≥2
+  // ③ 近8次连接/解析/命令缺失类硬失败≥3（幻觉端口/错误前提空转）；④ 连续错提交≥2
   const hardFail = (input.recentHardFails ?? []).slice(-8).filter(Boolean).length >= 3;
   const hallucSubmit = (input.wrongSubmits ?? 0) >= 2;
-  const count = [stall, repeat, budget, hardFail, hallucSubmit].filter(Boolean).length;
-  return { stall, repeat, budget, hardFail, hallucSubmit, count };
+  // count 只计分支级四信号（任二）；flagStall 一票独立（长时间没 flag 就介入——
+  // 否则「记卡不停但没 flag」型空转永远凑不齐二信号）
+  const count = [stall, repeat, hardFail, hallucSubmit].filter(Boolean).length;
+  return { flagStall, stall, repeat, hardFail, hallucSubmit, count };
+}
+
+/** 综合触发判定：flag 主时钟一票 或 分支级四信号任二。 */
+export function bystanderShouldFire(sig: StallSignals): boolean {
+  return sig.flagStall || sig.count >= 2;
 }
 
 /** 旁观者输入（corelog 分组视图 + flag 账本 + 卡塞分支近况）。 */
@@ -85,8 +91,8 @@ export function buildBystanderInput(args: {
     `- 段已用：${Math.round(args.segElapsedSec)}s；卡塞对象：` +
     `${args.branchId === 0 ? "主分支" : `分支 ${args.branchId}`}` +
     `${args.branchLabel ? `（${args.branchLabel}）` : ""}\n` +
-    `- 触发信号：停滞${args.signals.stall ? "✓" : "✗"} 重复${args.signals.repeat ? "✓" : "✗"} ` +
-    `预算${args.signals.budget ? "✓" : "✗"} 连接空转${args.signals.hardFail ? "✓" : "✗"} ` +
+    `- 触发信号：无flag${args.signals.flagStall ? "✓" : "✗"} 分支停滞${args.signals.stall ? "✓" : "✗"} ` +
+    `重复${args.signals.repeat ? "✓" : "✗"} 连接空转${args.signals.hardFail ? "✓" : "✗"} ` +
     `错提交${args.signals.hallucSubmit ? "✓" : "✗"}\n`;
   parts.push(head);
   parts.push(

@@ -25,6 +25,7 @@ import {
   BYSTANDER_SYSTEM,
   buildBystanderInput,
   bystanderMessage,
+  bystanderShouldFire,
   evaluateStall,
   recentDigest,
 } from "./bystander.js";
@@ -578,31 +579,45 @@ export async function solveTask(
     const t = nowSec();
     const active = bm.active();
     if (!active.length) return;
-    const stalled = active.filter(
-      (b) =>
-        evaluateStall({
-          sinceCoreSec: t - b.lastCoreTs,
-          stallSec,
-          recentCmds: b.recentCmds,
-          segElapsedSec: t - segStartTs,
-          segBudgetSec: budgetSec,
-          recentHardFails: b.recentHardFails,
-          wrongSubmits: b.wrongSubmits,
-        }).count >= 2,
-    );
-    if (!stalled.length) return;
-    // 全分支停滞 → 插 trunk；否则插第一个停滞分支
-    const target = stalled.length === active.length ? bm.get(0) : stalled[0];
-    if (!target || !bm.bystanderAvailable(target.id, t)) return;
-    const sig = evaluateStall({
-      sinceCoreSec: t - target.lastCoreTs,
-      stallSec,
-      recentCmds: target.recentCmds,
-      segElapsedSec: t - segStartTs,
-      segBudgetSec: budgetSec,
-      recentHardFails: target.recentHardFails,
-      wrongSubmits: target.wrongSubmits,
+    const flagStallSec = taskClass === "long" ? CFG.flag_stall_long_sec : CFG.flag_stall_short_sec;
+    const flagSince = t - bm.lastFlagTs; // 题级 flag 主时钟（以 flag 为核心的介入锚）
+    // 每个活跃分支算一次信号；flag 主时钟一票或分支级任二 → 需介入
+    const sigs = active.map((b) => {
+      const sig = evaluateStall({
+        sinceCoreSec: t - b.lastCoreTs,
+        stallSec,
+        flagSinceSec: flagSince,
+        flagStallSec,
+        recentCmds: b.recentCmds,
+        recentHardFails: b.recentHardFails,
+        wrongSubmits: b.wrongSubmits,
+      });
+      return { b, sig };
     });
+    const need = sigs.filter((x) => bystanderShouldFire(x.sig));
+    if (!need.length) return;
+    // 目标选择（可介入任何分支）：有停滞分支 → 救卡最死的（lastCoreTs 最老）；
+    // 否则（flag 停滞但各分支在干活，如记卡型空转）→ 盯最新鲜推进线（lastCoreTs 最新）。
+    const stalledNow = need.filter((x) => t - x.b.lastCoreTs >= stallSec);
+    const pickFrom =
+      stalledNow.length > 0
+        ? stalledNow
+        : need.map((x) => ({
+            b: active.reduce((a, c) => (a.lastCoreTs >= c.lastCoreTs ? a : c)),
+            sig: need[0].sig,
+          }));
+    const chosen = pickFrom.reduce((a, c) =>
+      stalledNow.length > 0
+        ? a.b.lastCoreTs <= c.b.lastCoreTs
+          ? a
+          : c
+        : a.b.lastCoreTs >= c.b.lastCoreTs
+          ? a
+          : c,
+    );
+    const target = chosen.b;
+    const sig = chosen.sig;
+    if (!target || !bm.bystanderAvailable(target.id, t)) return;
     const entries = corelog ? readCorelog(corelog.path) : [];
     const input = buildBystanderInput({
       entries,
@@ -849,6 +864,7 @@ export async function solveTask(
           // flag 事件（权威之一）：submit 响应的 matched_flag_index 作稳定 ID 进账本
           const idx = extractFlagIndex(firstText(result));
           if (idx !== null && ledger.add(idx, br.id)) {
+            bm.recordFlag(nowSec()); // 新 flag → 刷新题级 flag 主时钟（旁观者核心分母）
             const cfc = /"correct_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
             const tfc = /"total_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
             if (tfc) ledger.setTotal(Number(tfc[1]));
