@@ -51,18 +51,23 @@ def _node_id(key: str) -> int:
 class AttackMemory:
     """一局跑分共享的攻击图记忆。`enabled=False` 时所有方法都是空操作。"""
 
-    def __init__(self, path: Path, *, enabled: bool = True, dim: int = 64) -> None:
+    def __init__(
+        self, path: Path, *, enabled: bool = True, dim: int = 64, _access_mode: str = "read_write"
+    ) -> None:
         self.path = path
         self._dim = dim
         # 无 embedding 来源 → 全部节点写零向量；向量信号留待接上 embedding 再启用。
         self._zero = [0.0] * dim
         self._db = None
         self._indexed = False
+        self._readonly = False
         if not enabled or triviumdb is None:
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._db = triviumdb.TriviumDB(str(path), dim=dim, load_text_index=True)
+            self._db = triviumdb.TriviumDB(
+                str(path), dim=dim, load_text_index=True, access_mode=_access_mode
+            )
         except Exception:
             self._db = None
 
@@ -161,6 +166,42 @@ class AttackMemory:
                 continue
             out.append({"key": payload.get("key"), "challenge": payload.get("challenge")})
         return out
+
+    # ---- v2：单写多读（harness-v2-openhands.md §3）---------------------------
+    @classmethod
+    def open_readonly(cls, path: Path, *, dim: int = 64) -> AttackMemory:
+        """打开只读句柄：引擎级 access_mode='read_only'（写操作被底层拒绝）
+        + 本层 _readonly 守卫（抛 ReadOnlyError）。
+        注意 TriviumDB 文件锁排他：writer 关闭后才能开只读句柄（跨模式也不行）。"""
+        m = cls(path, dim=dim, _access_mode="read_only")
+        m._readonly = True
+        return m
+
+    def record_node(self, key: str, *, parent: str | None, state: str, directive: str = "") -> None:
+        """v2 状态机经桥接层落图的唯一入口：节点 + 父边 + 状态文本一次写。"""
+        if self._db is None:
+            return
+        if self._readonly:
+            raise triviumdb.ReadOnlyError("AttackMemory.open_readonly handle is read-only")
+        text = f"{state} {directive}".strip() or state
+        try:
+            self._db.upsert_with_id(
+                _node_id(key), self._zero, {"key": key, "state": state, "text": text[:500]}
+            )
+            if parent is not None:
+                self._db.link(_node_id(parent), _node_id(key))
+            self._db.flush()
+        except Exception:
+            return
+
+    def reachable_nodes(self) -> int:
+        """图中节点计数（POC 实测：node_count() 是最简可靠的图规模读数）。"""
+        if self._db is None:
+            return 0
+        try:
+            return self._db.node_count()
+        except Exception:
+            return 0
 
     def stats(self) -> dict:
         if self._db is None:

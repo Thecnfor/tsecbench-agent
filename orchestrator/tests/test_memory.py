@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from orchestrator.memory import AttackMemory
+import pytest
+from orchestrator.memory import STATE_DEAD_END, STATE_EXPLORED, STATE_UNEXPLORED, AttackMemory
 
 PRIOR = {
     "assets": ["10.0.0.1:8080"],
@@ -47,6 +48,32 @@ def test_record_then_recall_and_unexplored(tmp_path):
     stats = mem.stats()
     assert stats["enabled"] is True and stats["nodes"] >= 4
     mem.close()
+
+
+class TestReadOnly:
+    """v2 单写多读：open_readonly 句柄写拒绝，record_node 状态机落图入口。"""
+
+    def test_readonly_rejects_write(self, tmp_path):
+        writer = AttackMemory(tmp_path / "a.tdb")
+        if not writer.available:
+            pytest.skip("triviumdb not installed")
+        writer.record_node("root", parent=None, state=STATE_EXPLORED)
+        writer.close()
+        # TriviumDB 文件锁排他（read_write 与 read_only 也不可并存），writer 须先关
+        ro = AttackMemory.open_readonly(tmp_path / "a.tdb")
+        with pytest.raises(RuntimeError):  # ReadOnlyError / 引擎只读拒绝均为 RuntimeError 子类
+            ro.record_node("child", parent="root", state=STATE_UNEXPLORED)
+        assert ro.reachable_nodes() >= 1  # 只读侧能读回
+        ro.close()
+
+    def test_record_node_graph_edges(self, tmp_path):
+        m = AttackMemory(tmp_path / "b.tdb")
+        if not m.available:
+            pytest.skip("triviumdb not installed")
+        m.record_node("root", parent=None, state=STATE_EXPLORED)
+        m.record_node("n1", parent="root", state=STATE_DEAD_END)
+        assert m.reachable_nodes() == 2
+        m.close()
 
 
 def test_record_is_idempotent(tmp_path):
