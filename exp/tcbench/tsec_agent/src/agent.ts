@@ -38,7 +38,7 @@ import {
   setStopCheck,
   tryReauth,
 } from "./llm.js";
-import { initRecords, type RunRecords, rec } from "./records.js";
+import { initRecords, RECORDS_DIR, type RunRecords, rec } from "./records.js";
 import type { Challenge, ChatMessage, ChatResponse, ContentPart, LlmClient } from "./types.js";
 
 const LOG_PATH = "agent.log";
@@ -779,23 +779,14 @@ export function classifyTask(c: Challenge): "long" | "short" {
   return c.flag_count >= 2 || c.difficulty === "hard" || (c.level ?? 0) >= 3 ? "long" : "short";
 }
 
-/** 每题独立工作目录（async 局部 cwd 的落点），避免并行读写冲突。 */
+/** 每题独立工作目录（async 局部 cwd 的落点），避免并行读写冲突。
+ * 基目录派生自 RECORDS_DIR——保证 `tasks/<code>/` 里 conversation.jsonl 与 shell 产物
+ * 永远同居一处（若这里另用 /work 判断，RECORDS_DIR 被显式改指别处时两者会分家）。 */
 function taskWorkdir(code: string): string {
-  const base =
-    env("TASK_WORKDIR", "") ||
-    (isWritable("/work") ? "/work/tasks" : path.join(process.cwd(), "tasks"));
+  const base = env("TASK_WORKDIR", "") || path.join(RECORDS_DIR, "tasks");
   const d = path.join(base, code);
   fs.mkdirSync(d, { recursive: true });
   return d;
-}
-
-function isWritable(p: string): boolean {
-  try {
-    fs.accessSync(p, fs.constants.W_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** 并行调度器：并发解多题，自动扩容直到平台拒绝（max active）。 */

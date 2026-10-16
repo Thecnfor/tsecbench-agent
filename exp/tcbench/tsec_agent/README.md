@@ -6,6 +6,27 @@
 - 运行时**零第三方依赖**：LLM 调用用原生 `fetch`（无 openai SDK），镜像里只带 `pnpm build` 产出的纯 JS（不带 node_modules）
 - 观察面板：**React + Node 服务**（读 `runs/<TOKEN>/` 记录 + 平台 API，浏览器访问）
 
+## 目录模型（排查"面板没数据"先看这里）
+
+```
+docker/runs/<TOKEN>/          ← bench 记录根（= 容器内 /work，agent 的 RECORDS_DIR）
+├── meta.json                 # bench 元信息 + runs[]（每次运行起止/结果）
+├── events.jsonl              # run 级事件
+├── tasks.jsonl               # 题目生命周期（task_start/task_close）
+└── tasks/<code>/             # 每题目录：conversation.jsonl 与该题 shell 工作目录【同居一处】
+docker/work/                  # 遗留目录，当前 run.sh 已不用
+```
+
+- **agent 写哪**（`records.ts: pickRecordsDir`）：显式 `RECORDS_DIR` > 容器内 `/work`
+  （run.sh 把 `runs/<TOKEN>` 挂载为 `/work`；hosted 形态 entrypoint 自建）> 宿主机回退 cwd。
+- **面板读哪**（`panel/data.ts: findLatestRuns`）：从模块/cwd 向上找 `docker/runs`，
+  候选里只认有 `meta.json`/`tasks.jsonl` 的目录，按**记录文件 mtime** 选最新
+  （不看目录 mtime——run.sh 先 mkdir 再跑容器，空目录 mtime 反而最新会抢跑）。
+- `--dir` 两种形态都行：`--dir runs/<TOKEN>` 或 `--dir runs/`（自动挑最新 bench）。
+- 目录为空时面板给出诊断（缺 meta.json/tasks.jsonl 或刚启动还没写 tasks.jsonl），不干显示 0。
+- 每题工作目录基址派生自 `RECORDS_DIR`（`tasks/<code>/`），保证 conversation 与 shell
+  产物永远不因 `RECORDS_DIR` 改指而分家；`TASK_WORKDIR` 可整体覆盖。
+
 ## 命令
 
 ```bash

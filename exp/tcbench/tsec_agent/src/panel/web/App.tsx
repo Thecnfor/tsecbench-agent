@@ -30,6 +30,8 @@ interface PredictItem {
 interface State {
   ts: string;
   dir: string;
+  dir_mtime?: number;
+  diagnostic?: string;
   token_hint: string;
   meta: { mode: string; model: string; run: Record<string, any> };
   counts: { running: number; done: number; fail: number; paused: number };
@@ -238,6 +240,8 @@ export function App() {
       </header>
 
       {err && <div className="err">刷新失败：{err}</div>}
+      {/* 空目录诊断：直接告诉用户为什么没数据（记录根指错等常见坑） */}
+      {st.diagnostic && <div className="err">{st.diagnostic}</div>}
 
       {p && (
         <section className="card prediction">

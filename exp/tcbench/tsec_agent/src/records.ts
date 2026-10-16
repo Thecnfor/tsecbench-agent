@@ -17,13 +17,30 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatMessage, ContentPart, ConvRecord } from "./types.js";
 
-// 记录根目录：默认 /work（= 容器内当前 bench 挂载点）
-function defaultRecordsDir(): string {
-  const env = process.env.RECORDS_DIR;
-  if (env && fs.existsSync(env)) return env;
+/** 记录根目录解析（对应 Python 版 RECORDS_DIR 语义）：
+ *  1. 显式 RECORDS_DIR 环境变量优先；
+ *  2. 容器内 /work（run.sh 挂载的 runs/<TOKEN>；hosted 形态 entrypoint 自建）——
+ *     agent 记录必须落在挂载点，面板/归档才看得到；
+ *  3. 宿主机开发时 /work 通常不存在 → 回退当前目录。
+ * 踩过的坑：重写时曾把兜底直接写成 cwd——容器里 cwd=/agent（源码挂载点），
+ * 记录全写进源码目录，面板对着空的 runs/<TOKEN> 报"没有任务没有监控"。
+ * 目录模型：runs/<TOKEN> 是记录根（=容器内 /work）；runs/<TOKEN>/tasks/<code>/
+ * 既放 conversation.jsonl 也放该题 shell 工作目录（与 Python 版一致）。 */
+export function pickRecordsDir(envVal: string | undefined, workExists: boolean): string {
+  if (envVal && isRealDir(envVal)) return envVal;
+  if (workExists) return "/work";
   return process.cwd();
 }
-export let RECORDS_DIR = defaultRecordsDir();
+
+function isRealDir(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export let RECORDS_DIR = pickRecordsDir(process.env.RECORDS_DIR, isRealDir("/work"));
 export function setRecordsDir(dir: string): void {
   RECORDS_DIR = dir;
 }

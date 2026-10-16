@@ -18,12 +18,15 @@ import {
   findLatestRuns,
   fmtDelta,
   fmtDur,
+  isBenchDir,
   loadBaseline,
   loadMeta,
   loadRecentEvents,
   loadTasks,
   predictVsBaseline,
   readJsonlTail,
+  recordsMtime,
+  resolveRunsDir,
   taskFilterOf,
   taskLiveView,
 } from "./data.js";
@@ -51,9 +54,27 @@ export async function buildState(opts: Pick<PanelOptions, "dir" | "baseUrl">): P
   const failed = list.filter((t) => t.outcome === "fail");
   const paused = list.filter((t) => t.outcome === "paused");
 
+  // 空目录诊断：直接告诉用户"为什么没数据"，而不是干显示 0
+  //（常见坑：面板指向的目录不是 agent 真正写入的记录根）
+  let diagnostic = "";
+  if (!list.length) {
+    if (!isBenchDir(runsDir)) {
+      diagnostic =
+        `${runsDir} 不是 bench 记录目录（缺 meta.json/tasks.jsonl）。` +
+        `agent 的记录根在容器内是 /work（run.sh 挂载 runs/<TOKEN> 为 /work）；` +
+        `检查 agent 是否在跑、RECORDS_DIR 是否指对。`;
+    } else if (!fs.existsSync(path.join(runsDir, "tasks.jsonl"))) {
+      diagnostic = `${runsDir} 有 meta.json 但还没有 tasks.jsonl——agent 可能刚启动（首题 start 后才写）。`;
+    } else {
+      diagnostic = `${runsDir}/tasks.jsonl 存在但解析后为空——检查文件内容是否损坏。`;
+    }
+  }
+
   return {
     ts: new Date().toTimeString().slice(0, 8),
     dir: runsDir,
+    dir_mtime: recordsMtime(runsDir), // 记录文件最新写入时刻（排查"选错目录"用）
+    diagnostic,
     token_hint: path.basename(runsDir.replace(/\/+$/, "")).slice(0, 8),
     meta: {
       mode: meta.mode ?? "?",
@@ -177,10 +198,24 @@ export function parsePanelArgs(argv: string[]): PanelOptions {
     else if (argv[i] === "--port") port = Number(argv[++i]) || port;
   }
   if (!dir) {
+    // 自动发现：向上找 docker/runs，按记录文件 mtime 选最新的 bench 目录
     dir = findLatestRuns() ?? "";
+  } else {
+    // --dir 两种形态都接受：直接给 runs/<TOKEN>，或给 runs/ 父目录（自动挑最新 bench）
+    const resolved = resolveRunsDir(dir);
+    if (!resolved) {
+      console.error(`--dir ${dir} 下没有找到 bench 记录目录（缺 meta.json/tasks.jsonl）`);
+      process.exit(1);
+    }
+    dir = resolved;
   }
   if (!dir || !fs.existsSync(dir)) {
-    console.error("未找到 runs/<TOKEN> 记录目录（用 --dir 指定，或先跑一次 run.sh）");
+    console.error(
+      "未找到 bench 记录目录（自动搜索 docker/runs，按记录文件 mtime 选最新）。\n" +
+        "用 --dir runs/<TOKEN> 或 --dir runs/ 指定；或先跑一次 run.sh 生成记录。\n" +
+        "注意：容器内 agent 记录根是 /work（run.sh 挂载 runs/<TOKEN> 为 /work），" +
+        "面板读的是宿主机侧的 runs/<TOKEN>。",
+    );
     process.exit(1);
   }
   if (!baseUrl) baseUrl = envBaseUrl();

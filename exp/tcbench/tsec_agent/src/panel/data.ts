@@ -410,27 +410,102 @@ export function taskFilterOf(meta: Record<string, any>): string[] {
 }
 
 /** 自动发现最新 runs/<TOKEN>：当前目录、../docker/runs、项目根。 */
-export function findLatestRuns(): string | null {
-  const candidates: string[] = [];
-  for (const base of [
-    "runs",
-    "../docker/runs",
-    "../../docker/runs",
-    "/home/xsf/Projects/tsecbench-agent/exp/tcbench/docker/runs",
-    path.join(fileDir(import.meta.url), "..", "..", "..", "docker", "runs"),
-  ]) {
+/** 该目录是不是一个 bench 记录目录（有 meta.json 或 tasks.jsonl）。 */
+export function isBenchDir(p: string): boolean {
+  try {
+    return (
+      fs.statSync(p).isDirectory() &&
+      (fs.existsSync(path.join(p, "meta.json")) || fs.existsSync(path.join(p, "tasks.jsonl")))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** 目录内记录文件的最新 mtime（ms）——比目录自身 mtime 可靠：
+ *  run.sh 先 mkdir 再跑容器，空目录 mtime 反而最新，按目录 mtime 会选中刚建的空目录；
+ *  记录文件（meta/events/tasks.jsonl）的 mtime 才反映"哪个 bench 真正在写"。 */
+export function recordsMtime(p: string): number {
+  let newest = 0;
+  for (const f of ["meta.json", "events.jsonl", "tasks.jsonl"]) {
     try {
-      if (!fs.statSync(base).isDirectory()) continue;
-      for (const name of fs.readdirSync(base)) {
-        const p = path.join(base, name);
-        if (fs.statSync(p).isDirectory()) candidates.push(p);
-      }
+      newest = Math.max(newest, fs.statSync(path.join(p, f)).mtimeMs);
     } catch {
-      /* skip */
+      /* 文件还没有 */
     }
   }
-  if (!candidates.length) return null;
-  return candidates.reduce((a, b) => (fs.statSync(a).mtimeMs >= fs.statSync(b).mtimeMs ? a : b));
+  return newest;
+}
+
+/** 自动发现 bench 记录目录，返回最新写入的那个 <TOKEN> 目录。
+ *
+ * 搜索策略（修 bug：旧版 `../../../docker/runs` 只在源码布局下正确，构建产物在
+ * dist/ 时算到 exp/docker/runs 不存在；且按目录 mtime 排序会选中 run.sh 刚建的空目录）：
+ *  1. 从本模块所在目录与 cwd 各自向上逐级找 `docker/runs`（对 src/ 与 dist/ 布局都成立）；
+ *  2. 候选里只保留真正的 bench 目录（有 meta.json 或 tasks.jsonl）；
+ *  3. 按目录内记录文件的最新 mtime 排序——"正在被写"的排最前。 */
+export function findLatestRuns(): string | null {
+  const bases = new Set<string>();
+  const probe = (start: string) => {
+    let dir = start;
+    for (let i = 0; i < 6; i++) {
+      const cand = path.join(dir, "docker", "runs");
+      try {
+        if (fs.statSync(cand).isDirectory()) bases.add(cand);
+      } catch {
+        /* 这一级没有 */
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  };
+  probe(fileDir(import.meta.url)); // 模块向上：dist/ 或 src/panel/ 都能命中 tcbench/docker/runs
+  probe(process.cwd()); // cwd 向上：无论从哪个目录启动 pnpm serve 都能找到
+
+  let best: string | null = null;
+  let bestMtime = -1;
+  for (const base of bases) {
+    let names: string[];
+    try {
+      names = fs.readdirSync(base);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const p = path.join(base, name);
+      if (!isBenchDir(p)) continue;
+      const m = recordsMtime(p);
+      if (m > bestMtime) {
+        bestMtime = m;
+        best = p;
+      }
+    }
+  }
+  return best;
+}
+
+/** 把用户给的 --dir 归一化为 bench 目录：给 <TOKEN> 直接用；给 runs/ 父目录则取其中最新。 */
+export function resolveRunsDir(dir: string): string | null {
+  if (isBenchDir(dir)) return dir;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let best: string | null = null;
+  let bestMtime = -1;
+  for (const name of names) {
+    const p = path.join(dir, name);
+    if (!isBenchDir(p)) continue;
+    const m = recordsMtime(p);
+    if (m > bestMtime) {
+      bestMtime = m;
+      best = p;
+    }
+  }
+  return best;
 }
 
 function fileDir(url: string): string {
