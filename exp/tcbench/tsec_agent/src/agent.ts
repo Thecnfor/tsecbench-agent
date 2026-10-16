@@ -59,7 +59,9 @@ import {
 import { initRecords, RECORDS_DIR, type RunRecords, rec } from "./records.js";
 import type { Challenge, ChatMessage, ChatResponse, ContentPart, LlmClient } from "./types.js";
 
-const LOG_PATH = "agent.log";
+// 日志落记录根目录（容器=/work）：曾相对 cwd 写 → cwd=/agent 时经挂载暴露给模型
+// （run2 实测模型 grep agent.log 找 flag 行为）；records 目录随归档走、不进 /agent 挂载。
+const LOG_PATH = path.join(RECORDS_DIR, "agent.log");
 
 // 全局停止事件：平台任务结束（already finished 等终态）时置位，
 // 调度器/worker/watcher 全部收敛退出，不再重试。
