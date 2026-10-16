@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import sop as sop_mod
+from . import streams
 from .api import (
     ChallengeGone,
     HintCompleted,
@@ -27,8 +29,9 @@ from .config import RuntimeConfig, resolve_config
 from .harvester import harvest, submit_candidates
 from .journal import Journal, score_summary
 from .registry import ChallengeRecord, Registry
+from .repair import BASE_WEIGHTS, choose_repair, update_weights
 from .scheduler import can_start, eligible, plan_phase
-from .supervisor import collect_prior, prepare_workspace, run_solver
+from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
 AVAILABLE_TIMEOUT_S = 120.0
@@ -49,6 +52,11 @@ class RunContext:
     stopped: bool = False
     t0: float = 0.0
     env: dict[str, str] | None = None  # 传给 solver 的基础环境（测试注入用）
+    # harness-v2（harness-v2.md §4/§5）：SOP 检索与修复记账；重启丢失，
+    # 不参与崩溃恢复 —— 修复权重是启发式，丢了从 BASE 重新演化即可。
+    repair_notes: dict[str, str] = field(default_factory=dict)  # code → 换面指令
+    repair_weights: dict[str, float] = field(default_factory=lambda: dict(BASE_WEIGHTS))
+    last_repair: dict[str, str] = field(default_factory=dict)  # code → 上轮修复动作
 
 
 # ---------------------------------------------------------------- helpers ----
@@ -142,20 +150,28 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         return
 
     rec.state = "SOLVING"
+    sops = sop_mod.select(ctx.workspace_root, rec.description or "")  # EvoSOP 检索（§4.3）
     ws = prepare_workspace(
         ctx.workspace_root,
         rec,
         attempt=rec.attempts,
         prior=ctx.priors.get(code),
         hint=ctx.hints.get(code),
+        sops=sops,
+        repair_note=ctx.repair_notes.get(code),
     )
     deadline_epoch = min(time.time() + slice_s, ctx.t0 + ctx.config.total_time_limit_s)
-    outcome = await run_solver(
+    # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
+    outcome, early_new, early_completed = await streams.run_solver_with_stream(
         solver_cmd=ctx.solver_cmd,
         ws=ws,
         deadline_epoch=deadline_epoch,
         slice_s=slice_s,
         environ=ctx.env,
+        client=ctx.client,
+        journal=ctx.journal,
+        unique_code=code,
+        rec=rec,
     )
     ctx.journal.append(
         "solver_done",
@@ -173,23 +189,30 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
     report = await submit_candidates(ctx.client, rec, candidates)
     if report.task_ended:
         ctx.stopped = True
-    if report.new_matches:
+    if report.new_matches or early_new:
+        # EVOSTER 锚定（§5）：上一轮修复动作命中 → 权重 +25%
+        last = ctx.last_repair.get(code)
+        if last:
+            update_weights(ctx.repair_weights, last, success=True)
+        # EvoSOP 蒸馏（§4）：本轮有命中 → 把可复用序列蒸馏入库（fail-closed）
+        sop_mod.distill(ws, ctx.workspace_root)
         # 正确提交可能触发关卡解锁 → LOCKED 题重新入队（§5.1）
         for unlocked in ctx.registry.requeue_unlocked():
             ctx.journal.append("requeued_unlocked", unique_code=unlocked)
 
     # ---- 终局判定 ------------------------------------------------------------
-    if rec.is_completed or report.completed:
+    if rec.is_completed or report.completed or early_completed:
         rec.state = "SOLVED"
         await _safe_close(ctx, rec)
         rec.state = "CLOSED"
+        ctx.repair_notes.pop(code, None)
         ctx.journal.append("solved", unique_code=code, matches=len(rec.matched_indices))
         return
     if ctx.stopped:
         await _safe_close(ctx, rec)
         rec.state = "CLOSED"
         return
-    if report.new_matches:
+    if report.new_matches or early_new:
         rec.state = "QUEUED"  # 多 flag 题继续（§4.6 不提前放弃）
         await _safe_close(ctx, rec)
         rec.state = "QUEUED"
@@ -219,11 +242,28 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         rec.state = "ABANDONED"
         await _safe_close(ctx, rec)
         rec.state = "CLOSED"
+        ctx.repair_notes.pop(code, None)
         ctx.journal.append("abandoned", unique_code=code)
         return
+    # EVOSTER 在线修复（§5）：失败信号 → 有界动作；attempt/hint 预算全不动
+    repair = choose_repair(
+        rec,
+        outcome,
+        slice_s,
+        total_remaining_s=ctx.t0 + ctx.config.total_time_limit_s - time.time(),
+        slice_max_s=ctx.config.slice_max_s,
+        weights=ctx.repair_weights,
+    )
+    ctx.last_repair[code] = repair.action
+    ctx.journal.append("repair", unique_code=code, action=repair.action, note=repair.note)
+    if repair.next_slice_s:
+        rec.repair_widened = True  # widen 最多一次；切片只覆盖下一轮一次
+        rec.next_slice_s = repair.next_slice_s
+    if repair.note and repair.action == "recompile":
+        ctx.repair_notes[code] = repair.note
     rec.state = "RETRY"
     await _safe_close(ctx, rec)
-    rec.state = "QUEUED"  # 重新排队换策略再投
+    rec.state = "QUEUED"  # 按修复计划重投（换策略/更大时间片）
 
 
 # ------------------------------------------------------------------ run ----
@@ -322,7 +362,9 @@ async def run_agent(
                 if rec.unique_code in ctx.running:
                     continue
                 rec.state = "QUEUED"
-                task = asyncio.create_task(_pipeline(ctx, rec.unique_code, plan.slice_s))
+                # EVOSTER widen（§5）：下轮时间片有覆盖则用一次即清
+                attempt_slice, rec.next_slice_s = rec.next_slice_s or plan.slice_s, None
+                task = asyncio.create_task(_pipeline(ctx, rec.unique_code, attempt_slice))
                 tasks.add(task)
                 ctx.running.add(rec.unique_code)
                 task.add_done_callback(lambda t, c=rec.unique_code: ctx.running.discard(c))

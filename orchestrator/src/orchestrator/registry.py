@@ -58,6 +58,9 @@ class ChallengeRecord:
     submitted: set[str] = field(default_factory=set)  # 已提交过的候选
     matched_indices: set[int] = field(default_factory=set)
     active_since_reconcile: bool = False  # 本地认为该题容器活跃
+    # 本地修复记账（EVOSTER，harness-v2.md §5；平台读不回来，不在对账路径）
+    repair_widened: bool = False  # widen 动作最多一次
+    next_slice_s: float | None = None  # 下轮时间片覆盖（widen 后生效一次即清零）
 
     @property
     def remaining_flags(self) -> int:

@@ -70,6 +70,7 @@ Docker镜像(限制3G)
 | [architecture.md](architecture.md) | 完整架构设计：语言分工、Solver Adapter 契约（含双图 `prior`）、借鉴清单与自研边界、组件、状态机、预算策略、错误处理、双模运行、测试策略、决赛预留。**§1 是五栈按执行位置的分层设计（L0~L4）+ 性能模型；§9/§11 是两轮外部技术栈建议的逐条核查（含一处已撤回的错误判断）；§10 是开源生态调研轮：refs/ 清单、两个供应链事件、上届官方文档挖到的平台事实、合规红线；**§12 Jev 排除决策（含 §11.2 勘误）；§13 旗舰评测集口径（63/23000/360min/六域）** |
 | [image-spec.md](image-spec.md) | 基座选择理由、工具来源策略、工具清单（含 MCP 工具层）、运行时版本钉死、Ghidra+REA 决策依据、体积预算与降级阶梯、构建规范、密钥与参考资料泄漏防线 |
 | [runbook.md](runbook.md) | 本地评测怎么跑、托管镜像怎么交付、测试矩阵 |
+| [harness-v2.md](harness-v2.md) | 五层升级契约（Staircase 流式 / ReActNet 图工程 / EvoSOP / TriviumDB / EVOSTER 在线修复）：分支 `feat/harness-v2`，初赛前只加法、不动 Dockerfile 与 toolchain，含 TriviumDB 阻塞分析 |
 | [open-questions.md](open-questions.md) | 需要向主办方确认的问题清单（A1–A20），按是否阻塞排序；内部悬置决策（B1–B14）；决策截止线 |
 
 ## 参考实现（`../refs/`，只读，**严禁进镜像**）

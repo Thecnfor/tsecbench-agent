@@ -1,11 +1,11 @@
 # AGENTS.md
 
-TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.14）+ Go recorder + Node MCP server，交付物是 Docker 镜像。设计文档 `docs/`（中文）是行为契约，入口 `docs/README.md`；代码注释大量按章节号引用它们（如 `architecture.md §6.5`），改行为前先读对应章节。**文档与代码冲突时以代码为准**（`README.md` 的「尚未开始实现」已过时：orchestrator/mock 已实现且 147 测试全绿）。
+TSecBench 自主渗透参赛 Agent：uv workspace（Python 3.14）+ Go recorder + Node MCP server，交付物是 Docker 镜像。设计文档 `docs/`（中文）是行为契约，入口 `docs/README.md`；代码注释大量按章节号引用它们（如 `architecture.md §6.5`），改行为前先读对应章节。**文档与代码冲突时以代码为准**（`README.md` 的「尚未开始实现」已过时：orchestrator/mock 已实现且全部单测绿）。
 
 ## 命令
 
 - 首次（或加依赖后）必须先 `make bootstrap`（= `uv sync --all-packages`），否则 `uv run pytest` 直接 `ModuleNotFoundError: orchestrator/mock_server` —— workspace 成员包不会被默认 sync 装上
-- `make test`：147 个单测约 40s，**完全离线**（e2e 在线程里起真 mock server + 假 solver；不需要 VPN、真 token、LLM key）
+- `make test`：约 190 个单测约 40s，**完全离线**（e2e 在线程里起真 mock server + 假 solver；不需要 VPN、真 token、LLM key）
 - 跑单个：`uv run pytest orchestrator/tests/test_gateway.py::TestWhitelist::test_exact_host_accepted`（testpaths 只含 `orchestrator/tests` + `mock/tests`，solver/mcp/recorder 没有测试）
 - `make lint` 两关都要过：`ruff check` + `ruff format --check`；`make fmt` 一键修复两者。无 CI、无 pre-commit，提交前自查就是 `make lint && make test`
 - `make check`：快速接入自检（`scripts/check_access.py`，只读探测平台 API，零副作用）

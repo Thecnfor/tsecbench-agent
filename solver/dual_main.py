@@ -37,8 +37,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import common  # noqa: E402  （solver 非安装包，脚本目录入 sys.path 后导入）
-from gov import planner, prior, profiles  # noqa: E402
+from gov import graphplan, planner, prior, profiles  # noqa: E402
 from gov import session as gov_session  # noqa: E402
+from gov import stream as gov_stream  # noqa: E402
 from kb.index import Index as KBIndex  # noqa: E402
 
 # 版本唯一真值源在 toolchain.env（PI_PACKAGE / PI_VERSION）；此处默认值仅是
@@ -194,6 +195,33 @@ def main() -> int:
         sess.log("kb", sections=len(knowledge.split("## KB:")) - 1)
         strategy += "\n\n" + knowledge
 
+    # EvoSOP（harness-v2.md §4）：上一轮成功路径蒸馏出的 SOP 正文注入
+    # （内容已由编排器脱敏 + 过闸，这里只做注入，零信任也不在这里重复做）
+    for sop_body in (task.get("sops") or [])[:2]:
+        if str(sop_body).strip():
+            strategy += (
+                "\n\n# SOP (distilled from earlier verified success; adapt generically)\n"
+                + str(sop_body)[:1500]
+            )
+
+    # 上轮修复指令（EVOSTER 式在线修复，harness-v2.md §5）：失败信号 → 编排器
+    # 侧修复计划 → task.json.repair → 本轮注入执行端，避免同面重复撞墙。
+    repair = task.get("repair") or {}
+    if repair.get("note"):
+        strategy += (
+            "\n\n# REPAIR FOCUS (previous attempt hit this wall — change the surface, "
+            "do not repeat)\n" + str(repair["note"])[:600]
+        )
+
+    # ReActNet 图工程（harness-v2.md §3）：策略要点编译成 stage 图 + 逐跳指令；
+    # planner 失败时整图按题型默认拓扑降级，零 LLM 依赖。
+    plan_graph = graphplan.compile(
+        task, strategy, (decision or {}).get("category") or category, task.get("prior")
+    )
+    graphplan.dump(out_dir, plan_graph)
+    strategy += "\n\n" + graphplan.render(plan_graph)
+    sess.log("plan_graph", nodes=len(plan_graph["nodes"]), edges=len(plan_graph["edges"]))
+
     prompt = (
         "Solve the pentest challenge described in your instructions now. "
         + (f"Target: {common.TARGET_INFO}. " if common.TARGET_INFO else "")
@@ -223,23 +251,43 @@ def main() -> int:
             start_new_session=True,
         )
         try:
-            out, _ = proc.communicate(timeout=budget_s + 30)
-        except subprocess.TimeoutExpired:
+            # Staircase 流式消费（harness-v2.md §2）：逐行处理，候选实时落
+            # out/flags + session；下游不再等 pi 完整退出。
+            consumed = 0
+
+            def _on_line(line: str) -> None:
+                nonlocal consumed
+                text = line.rstrip("\n")
+                if text:
+                    print(text, flush=True)
+                    sess.log("pi_stdout", text=text[:500])
+                consumed += 1
+                if consumed % gov_stream.FLUSH_EVERY == 0:
+                    # 增量 prior 预写：被杀前已产出观察项也比原契约更早可见（§2.2）
+                    prior.write(out_dir, sess.lines(), sorted(common._reported))
+                for flag in common.find_flags(text, include_generic=True):
+                    common.report_candidate(flag)
+                    sess.log("candidate", flag=flag)
+
+            def _expire() -> None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                print(f"[dual-solver] killed at budget {int(budget_s)}s", flush=True)
+
+            out, _ = gov_stream.stream_pi(
+                proc, _on_line, budget_s=budget_s + 30.0, on_expire=_expire
+            )
+        except Exception as exc:  # 流路兜底：与原 communicate 同级的进程级失败
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
-            out, _ = proc.communicate()
-            print(f"[dual-solver] killed at budget {int(budget_s)}s", flush=True)
+            print(f"[dual-solver] stream error: {exc}", flush=True)
+            out = ""
 
     if out:
-        print(out, flush=True)
-        # 事件流整批入 session（一行一事件，供 prior 合成与复盘）
-        for line in out.splitlines():
-            if line.strip():
-                sess.log("pi_stdout", text=line[:500])
-    flags = common.find_flags(out or "", include_generic=True)
-    for flag in flags:
-        common.report_candidate(flag)
-        sess.log("candidate", flag=flag)
+        # 全文已逐行打印过；收尾只补扫一遍确保候选零漏（§2.2 末段）
+        for flag in common.find_flags(out, include_generic=True):
+            common.report_candidate(flag)
+            sess.log("candidate", flag=flag)
     common.write_result("solved" if common._reported else "failed")
     prior.write(out_dir, sess.lines(), sorted(common._reported))
     sess.log("done", exit_code=proc.returncode)

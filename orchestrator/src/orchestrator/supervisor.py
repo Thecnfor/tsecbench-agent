@@ -49,8 +49,10 @@ def prepare_workspace(
     attempt: int,
     prior: dict | None = None,
     hint: str | None = None,
+    sops: list[str] | None = None,
+    repair_note: str | None = None,
 ) -> Path:
-    """创建该题第 attempt 轮的 workspace 并写 task.json（§2.1 形状）。"""
+    """创建该题第 attempt 轮的 workspace 并写 task.json（§2.1 形状 + harness-v2 §3/§4/§5 注入）。"""
     ws = workspace_root(base) / f"{rec.unique_code}_attempt{attempt}"
     ws.mkdir(parents=True, exist_ok=True)
     task = {
@@ -66,6 +68,9 @@ def prepare_workspace(
         "hint": hint,
         "attempt": attempt,
         "prior": prior or {"assets": [], "explored": [], "open_leads": []},
+        # harness-v2 注入位（solver 侧缺失时不使用，向后兼容）：
+        "sops": list(sops or []),  # EvoSOP：库里检索出的已蒸馏 SOP 正文
+        "repair": {"note": repair_note} if repair_note else {},  # EVOSTER 修复指令
     }
     (ws / "task.json").write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     (ws / "out" / "flags").mkdir(parents=True, exist_ok=True)
