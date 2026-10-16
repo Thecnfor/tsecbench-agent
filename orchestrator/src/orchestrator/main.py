@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import time
@@ -41,6 +42,10 @@ from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
 AVAILABLE_TIMEOUT_S = 120.0
+# TCP 就绪预检上限（c-08 实测 7860 冷启 >45s；编排器等待免费，solver 等待烧片）
+TARGET_READY_TIMEOUT_S = 120.0
+REASONER_MODEL = os.environ.get("SOLVER_REASONER_MODEL", "deepseek-reasoner")
+LIST_FAIL_LIMIT = 3  # list 连续失败达此数才全局停机（瞬时 409/404 不再一击致命）
 # 等 available 的轮询退避（§4.1 修订）。原先固定 0.2s：3 个 pipeline 同时轮询 =
 # 15 req/s 需求，而全局令牌桶只有 3 req/s —— 轮询把桶吃满，submit/close 排在
 # 轮询后面，实测每题 solver_done→solved 固定多花 ~11s（63 题 ≈ 11 分钟纯开销）。
@@ -77,8 +82,10 @@ class RunContext:
 async def _safe_list(ctx: RunContext) -> list[dict] | None:
     try:
         return await ctx.client.list_challenges()
-    except TaskEnded:
-        ctx.stopped = True
+    except TaskEnded as exc:
+        # 实测单次瞬时 409/404 也会走这里（API 事后验证正常）——不立即全局停机，
+        # 交给 run_agent 主循环的连续失败计数（LIST_FAIL_LIMIT）裁决。
+        ctx.journal.append("list_failed", reason=str(exc))
         return None
     except RetryableError:
         return None
@@ -121,6 +128,32 @@ async def _wait_available(ctx: RunContext, rec: ChallengeRecord, timeout_s: floa
     return False
 
 
+async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: float) -> bool:
+    """TCP 就绪预检：available ≠ 服务就绪（实测容器起后 Web 服务还有 ~1-3min 冷启），
+    过早放行 solver 会把它推进「网络诊断死循环」烧掉整个时间片（a-05 实测 14 轮全烧）。
+    best-effort：超时也放行（记 journal），solver 仍可尝试其它攻击面。"""
+    addrs = []
+    for a in rec.container_addr:
+        host, _, port = a.partition(":")
+        addrs.append((host, int(port) if port else 80))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for host, port in addrs:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=3.0
+                )
+                writer.close()
+                return True
+            except OSError:
+                continue
+        await asyncio.sleep(3.0)
+    ctx.journal.append(
+        "target_not_ready", unique_code=rec.unique_code, addrs=[f"{h}:{p}" for h, p in addrs]
+    )
+    return False
+
+
 def _merge_prior(old: dict | None, new: dict) -> dict:
     """双图跨轮合并：solver 只交原始观察，去重由编排器算（§2.5）。"""
     merged = {"assets": [], "explored": [], "open_leads": []}
@@ -140,7 +173,38 @@ def _remaining_score(registry: Registry) -> float:
 
 
 # ---------------------------------------------------------------- pipeline ----
+def _slice_has_progress(ws: Path) -> bool:
+    """widen 门控的进展信号（实测：零线索题 widen 是纯烧片）。
+    prior 双图有任何资产/线索/已探面，或会话有足量动作 → 有进展。"""
+    prior_path = ws / "out" / "prior.json"
+    try:
+        prior = json.loads(prior_path.read_text(encoding="utf-8"))
+        if any(prior.get(k) for k in ("assets", "explored", "open_leads")):
+            return True
+    except (OSError, ValueError):
+        pass
+    session_path = ws / "out" / "session.jsonl"
+    try:
+        with session_path.open(encoding="utf-8") as fh:
+            return sum(1 for _ in fh) >= 8
+    except OSError:
+        return False
+
+
 async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
+    try:
+        await _pipeline_inner(ctx, code, slice_s)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - 埋点：pipeline 异常必须留痕
+        import traceback
+
+        ctx.journal.append(
+            "pipeline_error", unique_code=code, err=repr(exc), tb=traceback.format_exc()[-1500:]
+        )
+
+
+async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     rec = ctx.registry.records[code]
     rec.attempts += 1
     rec.state = "STARTING"
@@ -156,12 +220,20 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         rec.state = "ABANDONED"
         return
     except TaskEnded:
-        ctx.stopped = True
+        # start 撞 409 invalid_state ≠ 整场结束（实测单题 start 409 会把 55 道
+        # 未跑题全部陪葬）。降级：关该题容器、重排队；token 真死时下一轮
+        # _safe_list 返回 None 自然全局退出。
+        ctx.journal.append("start_rejected", unique_code=code)
+        await _safe_close(ctx, rec)
+        if rec.state == "CLOSING":
+            rec.state = "CLOSED"
+        rec.state = "QUEUED"
         return
     rec.active_since_reconcile = True
     ctx.journal.append("started", unique_code=code)
 
     rec.state = "POLLING"
+    ctx.journal.append("phase", unique_code=code, at="wait_available")
     if not await _wait_available(ctx, rec, AVAILABLE_TIMEOUT_S):
         await _safe_close(ctx, rec)
         if rec.state == "CLOSING":
@@ -170,6 +242,9 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         return
 
     rec.state = "SOLVING"
+    ctx.journal.append("phase", unique_code=code, at="target_ready")
+    await _wait_target_ready(ctx, rec, TARGET_READY_TIMEOUT_S)
+    ctx.journal.append("phase", unique_code=code, at="spawn")
     sops = sop_mod.select(ctx.workspace_root, rec.description or "")  # EvoSOP 检索（§4.3）
     ws = prepare_workspace(
         ctx.workspace_root,
@@ -180,13 +255,19 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         repair_note=ctx.repair_notes.get(code),
     )
     deadline_epoch = min(time.time() + slice_s, ctx.t0 + ctx.config.total_time_limit_s)
+    # 分级模型调度（实测 reasoner 支持 tool calls 且延迟 ~3s）：hard 题与
+    # 失败过的题用 reasoner 攻坚提首片解出率，其余用 chat 保吞吐。
+    solver_env = dict(ctx.env or {})
+    if rec.difficulty == "hard" or rec.attempts > 1:
+        solver_env["LLM_MODEL"] = REASONER_MODEL
+        ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
     outcome, early_new, early_completed = await streams.run_solver_with_stream(
         solver_cmd=ctx.solver_cmd,
         ws=ws,
         deadline_epoch=deadline_epoch,
         slice_s=slice_s,
-        environ=ctx.env,
+        environ=solver_env,
         client=ctx.client,
         journal=ctx.journal,
         unique_code=code,
@@ -209,7 +290,10 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
     rec.state = "SUBMITTING"
     report = await submit_candidates(ctx.client, rec, candidates)
     if report.task_ended:
-        ctx.stopped = True
+        # 单题 submit 撞 409/404 ≠ 全场结束（与 start 同类：对已停容器提交
+        # 也会 409）。降级为关题重排队；token 真死由下一轮 _safe_list 兜底。
+        ctx.journal.append("submit_rejected", unique_code=code)
+        report.task_ended = False
     if report.new_matches or early_new:
         # EVOSTER 锚定（§5）：上一轮修复动作命中 → 权重 +25%
         last = ctx.last_repair.get(code)
@@ -253,6 +337,7 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         total_remaining_s=ctx.t0 + ctx.config.total_time_limit_s - time.time(),
         slice_max_s=ctx.config.slice_max_s,
         weights=ctx.repair_weights,
+        progress=_slice_has_progress(ws),
     )
     ctx.last_repair[code] = repair.action
     ctx.journal.append("repair", unique_code=code, action=repair.action, note=repair.note)
@@ -313,10 +398,19 @@ async def run_agent(
     )
     tasks: set[asyncio.Task] = set()
     reconciled = False
+    list_failures = 0
     try:
         while not ctx.stopped and time.time() - ctx.t0 < config.total_time_limit_s:
             rows = await _safe_list(ctx)
-            if ctx.stopped or rows is None:
+            if rows is None:
+                list_failures += 1
+                if list_failures >= LIST_FAIL_LIMIT:
+                    ctx.journal.append("list_fail_limit", failures=list_failures)
+                    break
+                await asyncio.sleep(poll_interval_s)
+                continue
+            list_failures = 0
+            if ctx.stopped:
                 break
             ctx.registry.sync(rows)
             if not reconciled:

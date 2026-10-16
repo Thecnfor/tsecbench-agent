@@ -40,6 +40,9 @@ WEIGHT_CEIL = 2.5
 _MULTI_FLAG_COST = 1.5
 
 
+_ATTEMPT_PENALTY = 0.75  # 每次失败尝试的成本放大系数
+
+
 def estimated_cost(rec: ChallengeRecord) -> float:
     base = _DIFF_COST.get(rec.difficulty, 2.0) * (1.0 + 0.1 * max(0, rec.level - 1))
     return base * (1.0 + _MULTI_FLAG_COST * max(0, rec.flag_count - 1))
@@ -70,9 +73,11 @@ def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
     1. is_completed == false（已通关直接跳过，在 eligible 里已过滤）
     2. 不在 LOCKED 集合（locked 在 eligible 已过滤）
     3. 性价比 = 剩余可得分数 / 预估成本（降序 → 取负）
+       成本带尝试惩罚：失败过的题成本放大，把并发槽让给没跑过的新题
+       （实测：a-05 失败 5 次仍占榜首，零产出烧片占总时间 65%）。
     4. level 升序、difficulty easy → hard
     """
-    value = rec.remaining_score / estimated_cost(rec)
+    value = rec.remaining_score / (estimated_cost(rec) * (1.0 + _ATTEMPT_PENALTY * rec.attempts))
     return (-value, rec.level, DIFFICULTY_RANK.get(rec.difficulty, 1), rec.unique_code)
 
 

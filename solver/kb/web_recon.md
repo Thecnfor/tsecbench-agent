@@ -29,3 +29,13 @@
 - JWT: none algorithm, weak HMAC secret (hashcat -m 16500), kid injection (`kid: ../../dev/null`), alg confusion RS256→HS256.
 - Cookies: base64 decode everything; flask session cookie → flask-unsign --wordlist.
 - Default creds matrix: admin/admin, admin/password, guest/guest, tomcat/s3cret, machine-name/machine-name.
+
+## Creds beat wordlists (measured: 30+ blind 404 guesses while valid logins sat unused)
+If you have ANY valid credentials for a web app, log in and let the app tell you
+its routes: fetch the post-auth dashboard HTML, its <script src> bundles, and
+grep them for fetch/axios/XHR/api paths (`grep -oE '"/?api/[^"]+"' app.js`).
+Authenticated pages reveal endpoint names that dictionary brute-force cannot.
+- Admin panel routes are usually only discoverable while logged in as admin.
+- Dev/test comments ("TODO: 上线前加回权限验证") are flag-path pointers: the named
+  endpoint + the missing auth check IS the intended chain — go use it.
+- Keep the session cookie in a jar (`-c cj.txt -b cj.txt`) and reuse it.

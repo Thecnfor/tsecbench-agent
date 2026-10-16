@@ -59,6 +59,7 @@ def choose_repair(
     total_remaining_s: float,
     slice_max_s: float,
     weights: dict[str, float],
+    progress: bool = False,
 ) -> RepairPlan:
     """失败片 → 修复计划。只在 attempt 预算内转身，不碰任何硬上限。
 
@@ -68,9 +69,11 @@ def choose_repair(
       - 正常结束但零候选    → recompile（原 plan 的面已经探秃）
     """
     if outcome.exit_code == 124 and outcome.timed_out:
+        # widen 只投给有进展信号的片（实测：零线索题 widen 后照样烧满整片，
+        # 纯时间浪费；有 assets/线索的题才值得更多 runway）
         options: list[str] = ["recompile"]
         next_slice = None
-        if not rec.repair_widened:
+        if not rec.repair_widened and progress:
             widened = min(slice_s * WIDEN_FACTOR, slice_max_s * 2.0)
             if widened <= total_remaining_s:
                 options.insert(0, "widen")

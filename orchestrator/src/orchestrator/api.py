@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -93,6 +94,8 @@ class PlatformClient:
     retries_429: int = 2
     retries_500: int = 2
     retries_network: int = 2
+    # 单请求重试总时长预算（实测 100 次上界可卡 16 分钟拖死 pipeline）
+    request_budget_s: float = 60.0
     delay_429: float = 1.0
     delay_500: float = 1.0
     delay_network: float = 0.5
@@ -125,10 +128,18 @@ class PlatformClient:
         """带限速与重试的请求。成功返回解析后的 JSON；解析失败按重试处理。"""
         await self._bucket.acquire()
         attempts_503 = 0
-        for attempt in range(100):  # 上界只是防呆，实际由各分支的次数封顶
+        deadline = time.monotonic() + self.request_budget_s
+        for attempt in range(100):  # 上界只是防呆，实际由总时长预算封顶
+            if time.monotonic() > deadline:
+                raise RetryableError(
+                    f"request budget {self.request_budget_s:.0f}s exhausted: {method} {path}"
+                )
             try:
-                status, raw = await asyncio.to_thread(
-                    self._http, method, path, query=query, body=body
+                # wait_for 兜底：getaddrinfo（DNS）不受 urlopen timeout 管辖，
+                # VPN DNS 抽风时会无限阻塞 executor 线程楔死 pipeline（实测 04:00）。
+                status, raw = await asyncio.wait_for(
+                    asyncio.to_thread(self._http, method, path, query=query, body=body),
+                    timeout=self.request_budget_s + 30.0,
                 )
             except (OSError, urllib.error.URLError) as exc:
                 # 网络错误 / 连接重置 / 超时（platform-api.md §5.1 末行）

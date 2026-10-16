@@ -36,7 +36,9 @@ def _choose(rec, outcome, slice_s=300.0, **kw):
 
 def test_timeout_first_time_widens():
     rec = make_rec()
-    plan = choose_repair(rec, make_outcome(exit_code=124, timed_out=True), 300.0, **_params())
+    plan = choose_repair(
+        rec, make_outcome(exit_code=124, timed_out=True), 300.0, **_params(progress=True)
+    )
     assert plan.action == "widen"
     assert plan.next_slice_s == 450.0  # 300 × 1.5
     assert "runway" in plan.note
@@ -57,7 +59,9 @@ def test_timeout_budget_blocks_widen():
 def test_timeout_second_time_recompiles():
     rec = make_rec()
     rec.repair_widened = True  # widen 只许一次
-    plan = choose_repair(rec, make_outcome(exit_code=124, timed_out=True), 300.0, **_params())
+    plan = choose_repair(
+        rec, make_outcome(exit_code=124, timed_out=True), 300.0, **_params(progress=True)
+    )
     assert plan.action == "recompile"
     assert plan.next_slice_s is None
 
@@ -79,7 +83,9 @@ def test_clean_finish_zero_candidates_recompiles():
 def test_weights_break_tie_by_priority():
     """widen 与 recompile 平票 → 固定优先序 widen 胜出（确定性）。"""
     weights = {k: 3.0 for k in BASE_WEIGHTS}
-    plan = _choose(make_rec(), make_outcome(exit_code=124, timed_out=True), weights=weights)
+    plan = _choose(
+        make_rec(), make_outcome(exit_code=124, timed_out=True), weights=weights, progress=True
+    )
     assert plan.action == "widen"
 
     rec2 = make_rec()
@@ -88,9 +94,18 @@ def test_weights_break_tie_by_priority():
     assert plan2.action == "recompile"
 
 
+def test_timeout_zero_progress_recompiles():
+    """零进展信号的超时片不给 widen —— 直接换面（实测 widen 是纯烧片）。"""
+    rec = make_rec()
+    plan = _choose(rec, make_outcome(exit_code=124, timed_out=True))
+    assert plan.action == "recompile"
+
+
 def test_weights_prefer_higher_weight_option():
     weights = dict(BASE_WEIGHTS, widen=0.1, recompile=2.0)
-    plan = _choose(make_rec(), make_outcome(exit_code=124, timed_out=True), weights=weights)
+    plan = _choose(
+        make_rec(), make_outcome(exit_code=124, timed_out=True), weights=weights, progress=True
+    )
     assert plan.action == "recompile"
 
 
