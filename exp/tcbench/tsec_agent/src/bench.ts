@@ -33,6 +33,7 @@ export async function api(
   method = "GET",
   timeout = 20_000,
   retries = 3,
+  body?: unknown,
 ): Promise<any> {
   const url = CFG.benchmark_base_url.replace(/\/+$/, "") + path;
   let lastErr: unknown;
@@ -40,7 +41,11 @@ export async function api(
     try {
       const resp = await fetch(url, {
         method,
-        headers: { BENCHMARK_TOKEN: CFG.benchmark_token },
+        headers: {
+          BENCHMARK_TOKEN: CFG.benchmark_token,
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(timeout),
       });
       const text = await resp.text();
@@ -83,6 +88,25 @@ export async function startChallenge(code: string): Promise<any> {
 
 export async function closeChallenge(code: string): Promise<any> {
   return await api(`/openapi/v1/challenges/close?unique_code=${code}`, "POST");
+}
+
+/** 提交 flag（submit_flag toolcall 的后端；唯一提交通道）。
+ * 成功返回平台原始 JSON（correct/awarded/cumulative_score/correct_flag_count/
+ * total_flag_count/matched_flag_index）；业务错误（409 duplicate 等）转
+ * {correct:false, error:...} 返回给模型看（业务结果不抛）——评测截止终态仍穿透。 */
+export async function submitFlag(uniqueCode: string, flag: string): Promise<any> {
+  try {
+    return await api("/openapi/v1/challenges/submit", "POST", 20_000, 2, {
+      unique_code: uniqueCode,
+      flag,
+    });
+  } catch (e) {
+    if (e instanceof TaskFinishedError) throw e;
+    if (e instanceof PlatformError) {
+      return { correct: false, error: `${e.code}: ${e.message}` };
+    }
+    throw e; // 网络类：由上层按 LLM/工具错误处理
+  }
 }
 
 export function challengeState(items: Challenge[], code: string): Challenge | null {

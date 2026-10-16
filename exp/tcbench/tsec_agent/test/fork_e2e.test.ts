@@ -410,9 +410,14 @@ describe("solveTask fork 集成", () => {
     const conv = R.conversation("t-off");
     const client: LlmClient = {
       async create(opts) {
-        // 工具集只有 shell
-        expect(opts.tools?.length).toBe(1);
+        // 基础工具集 = shell + submit_flag（submit 常驻唯一提交通道）；
+        // branch 工具（fork/core_log/broadcast）与 corelog 在开关全关时不得出现
+        expect(opts.tools?.length).toBe(2);
         expect(JSON.stringify(opts.tools)).toContain("shell");
+        expect(JSON.stringify(opts.tools)).toContain("submit_flag");
+        expect(JSON.stringify(opts.tools)).not.toContain("fork");
+        expect(JSON.stringify(opts.tools)).not.toContain("core_log");
+        expect(JSON.stringify(opts.tools)).not.toContain("broadcast");
         const toolMsgs = opts.messages.filter((m) => m.role === "tool").length;
         if (toolMsgs === 0) {
           return {

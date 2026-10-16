@@ -149,7 +149,57 @@ export function rebuildMessages(
   });
   // 分支记录只取自己的（branch 缺省视为 0/trunk）
   const filtered = recs.slice(startAt).filter((r) => (r.branch ?? 0) === branchId);
-  return recordsToMessages(filtered);
+  // 多 flag 压缩锚（无压缩记录时原样）——与运行时压缩重写等价
+  return recordsToMessages(applyCompactFilter(filtered, true));
+}
+
+/** 多 flag 压缩锚过滤：保留头（system+card，keepHead）∪ 全部 flag_summary/
+ * flag_continue ∪ 最后一条 flag_continue 之后的过程记录——与运行时「head+总结链+继续」
+ * 的压缩重写等价（多 flag 分段压缩的重建规则）。无压缩记录（单 flag/未压缩）原样返回，
+ * 既有行为零变化。 */
+export function applyCompactFilter(recs: ConvRecord[], keepHead: boolean): ConvRecord[] {
+  const lastCont = recs.reduce(
+    (m, r) => (r.kind_note === "flag_continue" ? Math.max(m, Number(r.seq)) : m),
+    -1,
+  );
+  if (lastCont < 0) return recs; // 未压缩 → 原样
+  return recs.filter(
+    (r, i) =>
+      (keepHead && i <= 1) ||
+      r.kind_note === "flag_summary" ||
+      r.kind_note === "flag_continue" ||
+      Number(r.seq) > lastCont,
+  );
+}
+
+/** 从 conv 解析各分支的 flag 总结链（段启动时恢复压缩素材，多 flag 才需要）。 */
+export function readFlagSummaries(file: string): Map<number, Array<{ idx: number; text: string }>> {
+  const out = new Map<number, Array<{ idx: number; text: string }>>();
+  let lines: string[];
+  try {
+    lines = fs.readFileSync(file, "utf8").split("\n");
+  } catch {
+    return out;
+  }
+  for (const l of lines) {
+    if (!l.trim()) continue;
+    try {
+      const r = JSON.parse(l) as ConvRecord;
+      if (
+        r.kind === "assistant" &&
+        r.kind_note === "flag_summary" &&
+        typeof r.output === "string"
+      ) {
+        const bid = Number(r.branch ?? 0);
+        const list = out.get(bid) ?? [];
+        list.push({ idx: Number(r.flag_index ?? -1), text: r.output });
+        out.set(bid, list);
+      }
+    } catch {
+      /* skip */
+    }
+  }
+  return out;
 }
 
 /** 纯函数：记录列表 → 消息序列（role 映射 + 孤儿过滤 + 配对校验）。 */
@@ -285,7 +335,8 @@ export function rebuildBranches(file: string): Array<{
 }
 
 /** recordsToMessages 的无 system 前置要求版本（分支尾部记录用）。 */
-function recordsToMessagesLoose(recs: ConvRecord[]): ChatMessage[] {
+function recordsToMessagesLoose(rawRecs: ConvRecord[]): ChatMessage[] {
+  const recs = applyCompactFilter(rawRecs, false); // 分支无头概念：纯总结链+锚后过程
   const msgs: ChatMessage[] = [];
   const pending = new Set<string>();
   for (const r of recs) {

@@ -34,6 +34,7 @@ import { CFG, env, resolveAsync } from "./config.js";
 import { extractFlagIndex, FlagLedger, readCorelog } from "./corelog.js";
 import {
   CLOSING_SUMMARY_PROMPT,
+  FLAG_CONTINUE_NOTE,
   fill,
   formatTaskCard,
   GIVEUP_NOTE,
@@ -42,6 +43,7 @@ import {
 } from "./prompt.js";
 import { getTaskCwd, setTaskCwd } from "./shell.js";
 import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
+import { FLAG_SUMMARY_HINT, integrateSubmit, SUBMIT_FLAG_TOOL_SCHEMA } from "./submit_flag.js";
 
 export { getTaskCwd, setTaskCwd };
 
@@ -58,7 +60,7 @@ import {
   setStopCheck,
   tryReauth,
 } from "./llm.js";
-import { initRecords, RECORDS_DIR, type RunRecords, rec } from "./records.js";
+import { initRecords, RECORDS_DIR, type RunRecords, readFlagSummaries, rec } from "./records.js";
 import type { Challenge, ChatMessage, ChatResponse, ContentPart, LlmClient } from "./types.js";
 
 // 日志落记录根目录（容器=/work）：曾相对 cwd 写 → cwd=/agent 时经挂载暴露给模型
@@ -514,7 +516,16 @@ export async function solveTask(
   }
   const corelog = multiOn ? rec().corelog(code) : null;
   const ledger = new FlagLedger();
-  if (opts.flagTotal) ledger.setTotal(opts.flagTotal);
+  const flagTotal = opts.flagTotal ?? 0;
+  if (flagTotal) ledger.setTotal(flagTotal);
+  // 多 flag 压缩：pending 总结轮（branchId→flag_index）+ 段启动从 conv 恢复总结链
+  const flagSummariesPending = new Map<number, { idx: number; turn: number }>();
+  if (flagTotal > 1) {
+    for (const [bid, list] of readFlagSummaries(conv.path)) {
+      const br = bm.get(bid);
+      if (br && !br.flagSummaries.length) br.flagSummaries = list;
+    }
+  }
   const taskClass = opts.taskClass ?? "short";
   const stallSec = taskClass === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
   // 思考档位分档：短题 low 省 thinking（实测占成本 37-69%），长题不发=模型默认档；
@@ -524,7 +535,7 @@ export async function solveTask(
   ).trim();
 
   // 工具集：shell 恒在；fork/broadcast 仅 fork 开；core_log 两者任一开
-  const tools: unknown[] = [SHELL_TOOL_SCHEMA];
+  const tools: unknown[] = [SHELL_TOOL_SCHEMA, SUBMIT_FLAG_TOOL_SCHEMA]; // submit 常驻（唯一提交通道）
   if (forkOn) tools.push(FORK_TOOL_SCHEMA, BROADCAST_TOOL_SCHEMA);
   if (multiOn) tools.push(CORE_LOG_TOOL_SCHEMA);
   const toolDeps = {
@@ -561,7 +572,8 @@ export async function solveTask(
     status,
     lastContent,
     turnsUsed,
-    messages,
+    // 取 trunk 当前引用：压缩重写会把 br.messages 换成新数组，旧引用会丢压缩态
+    messages: bm.get(0)?.messages ?? messages,
     branches: branchLite(),
   });
 
@@ -843,10 +855,19 @@ export async function solveTask(
     const msg = resp.choices[0].message;
     const tlabel = `${code}:${startTurn + turn}`;
     const toolCallsRaw = msg.tool_calls ?? [];
-    // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）
+    // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）。
+    // 多 flag 总结轮（submit 后要求的 flag 探索总结）→ kind_note 标记（rebuild 压缩锚之一）。
+    const isFlagSummaryTurn =
+      flagTotal > 1 &&
+      !toolCallsRaw.length &&
+      flagSummariesPending.has(br.id) &&
+      !!(msg.content && msg.content.trim());
     conv.write("assistant", {
       branch: br.id,
       turn: tlabel,
+      ...(isFlagSummaryTurn
+        ? { kind_note: "flag_summary", flag_index: flagSummariesPending.get(br.id)?.idx }
+        : {}),
       thinking: msg.reasoning_content ?? null,
       output: msg.content ?? null,
       tool_calls: toolCallsRaw.map((tc) => ({
@@ -872,11 +893,49 @@ export async function solveTask(
     br.messages.push(clean);
 
     if (!toolCallsRaw.length) {
+      // 多 flag 总结轮（submit 后系统要求的该 flag 探索总结）→ 压缩此前过程，继续
+      const pendIdx = flagSummariesPending.get(br.id)?.idx;
+      if (flagTotal > 1 && pendIdx !== undefined && msg.content && msg.content.trim()) {
+        br.flagSummaries.push({ idx: pendIdx, text: msg.content.trim() });
+        flagSummariesPending.delete(br.id);
+        // 压缩重写：[system, 任务卡] + 总结链（asst 总结 + 继续指令交替）——
+        // 探索过程段整体丢弃；conv 已记 flag_summary（assistant）与下面的 flag_continue
+        const head = br.messages.slice(0, 2);
+        const chain: ChatMessage[] = [];
+        for (const fs of br.flagSummaries) {
+          chain.push({ role: "assistant", content: fs.text });
+          chain.push({ role: "user", content: FLAG_CONTINUE_NOTE });
+        }
+        br.messages = [...head, ...chain];
+        conv.write("user", {
+          branch: br.id,
+          kind_note: "flag_continue",
+          content: FLAG_CONTINUE_NOTE,
+        });
+        rec().event("flag_summary_compacted", {
+          code,
+          branch: br.id,
+          idx: pendIdx,
+          kept: br.flagSummaries.length,
+        });
+        log(
+          `[${code}] flag#${pendIdx} summary recorded; context compacted ` +
+            `(${br.flagSummaries.length} summaries kept, ${br.messages.length} msgs)`,
+        );
+        continue; // 不 park：继续下一个 flag
+      }
+      flagSummariesPending.delete(br.id); // 未按指示输出总结 → 本 flag 放弃压缩（不纠缠）
       if (!multiOn) return finish("done"); // 单分支语义不变：无工具总结 = 本题上下文收束
       // fork 模式：该分支 parked（无收尾权），其他分支继续；全 parked 时循环顶部收束
       bm.park(br.id);
       log(`[${code}] branch ${br.id} parked (no tool call)`);
       continue;
+    }
+    // 上轮遗留的 pending 且本轮发工具（继续干活而非总结）→ 放弃该 flag 的压缩；
+    // 本轮自己 submit 刚设的（turn 相同）不清——否则轮1 submit 后 pending 立即被删（实测 bug）
+    {
+      const p = flagSummariesPending.get(br.id);
+      if (p !== undefined && p.turn < turn) flagSummariesPending.delete(br.id);
     }
 
     const pendingForks: PendingFork[] = [];
@@ -935,6 +994,50 @@ export async function solveTask(
             });
             bm.recordCore(br.id, nowSec());
             log(`[${code}] branch ${br.id} flagged idx=${idx} (${ledger.progress()})`);
+          }
+        }
+      } else if (tc.function.name === "submit_flag") {
+        // 唯一提交通道：结构化响应直喂账本/flag 卡/时钟；多 flag 未完 → 总结轮触发器
+        let parsed: Record<string, unknown> = {};
+        try {
+          parsed = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+        } catch {
+          parsed = {};
+        }
+        args = parsed;
+        const flagVal = String(parsed.flag ?? "").trim();
+        if (!flagVal) {
+          result = "error: `flag` is required";
+        } else {
+          try {
+            const resp = await bench.submitFlag(code, flagVal);
+            const out = integrateSubmit(resp, ledger, br.id);
+            let extra = "";
+            if (resp?.correct === true) {
+              bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
+              corelog?.write({
+                branch: br.id,
+                kind: "flag",
+                flag_index: out.flagIndex,
+                correct_flag_count: out.correctCount,
+                total_flag_count: out.totalCount || undefined,
+              });
+              bm.recordCore(br.id, nowSec());
+              log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
+              // 多 flag 且未全部完成 → 要求输出该 flag 探索总结（压缩触发器）
+              if (out.totalCount > 1 && out.correctCount < out.totalCount) {
+                flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
+                extra = FLAG_SUMMARY_HINT;
+              }
+            }
+            result = out.result + extra;
+          } catch (e) {
+            if (e instanceof TaskFinishedError) {
+              platformEnded("submit", e); // 评测截止终态：全局收敛，不当工具错误
+              result = "评测已截止：平台返回终态，停止提交";
+            } else {
+              result = `error: submit failed: ${e instanceof Error ? e.message : e}`;
+            }
           }
         }
       } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {

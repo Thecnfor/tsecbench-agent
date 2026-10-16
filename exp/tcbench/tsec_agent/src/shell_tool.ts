@@ -2,6 +2,7 @@
 
 import { attachPyLint } from "./py_lint.js";
 import { IMAGE_EXT, ShellManager } from "./shell.js";
+import { isSubmitCurl } from "./submit_flag.js";
 import type { ContentPart } from "./types.js";
 
 export const SHELL_TOOL_SCHEMA = {
@@ -282,6 +283,14 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
     if (action === "run") {
       const command = args.command;
       if (!command) return "error: `command` is required for action=run";
+      // 防代码爆破：提交只走 submit_flag toolcall——shell 里 curl submit（脚本化/
+      // 批量穷举的通道）直接拒绝
+      if (isSubmitCurl(String(command))) {
+        return (
+          "error: 提交必须用 submit_flag toolcall（shell 禁止 curl submit——" +
+          '防止脚本化批量提交）。调用 submit_flag({flag: "<从目标读出的原文>"})。'
+        );
+      }
       const out = await SHELL.run({
         command: String(command),
         cwd: (args.cwd as string) ?? null,
