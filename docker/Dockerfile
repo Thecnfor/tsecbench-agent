@@ -79,13 +79,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       # 侦察与扫描
       nmap masscan \
       # Web
-      sqlmap nikto whatweb \
+      sqlmap whatweb \
       # 爆破
-      hydra john \
+      hydra john hashcat \
       # 二进制 / Pwn
       gdb binutils patchelf gcc g++ make gcc-multilib \
-      # 逆向
-      rizin binwalk \
+      # 逆向（trixie 无 rizin，用 radare2；nikto 也不在 trixie，
+      #   image-spec.md §3 记为 apt/git，需要时单独 clone）
+      radare2 binwalk \
       # L4 Lua 注入面（仅本地写/自检 .nse）+ Redis
       lua5.4 redis-tools \
       # Python 3.13 运行时（trixie 自带）
