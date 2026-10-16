@@ -65,6 +65,7 @@ export class FetchLlmClient implements LlmClient {
         ? (AbortSignal as any).any([timeoutSig, opts.signal])
         : timeoutSig;
     let resp: Response;
+    let text: string;
     try {
       resp = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
@@ -72,12 +73,15 @@ export class FetchLlmClient implements LlmClient {
         body: JSON.stringify(body),
         signal,
       });
+      // 读响应体必须同在 try 内：body 流超时抛裸 DOMException(TimeoutError)，
+      // 曾绕过 callLlm 的 LlmHttpError forever 重试 → 直接 fatal abandon →
+      // 整题上下文丢弃重来（arena run3 实测：一次 body 超时丢了 8 分钟工作）。
+      text = await resp.text();
     } catch (e) {
-      // 网络类错误（超时/连接/DNS）：转成带 status=null 的错误，走重试
+      // 网络类错误（超时/连接/DNS/读流中断）：转成带 status=null 的错误，走重试
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       throw new LlmHttpError(`connection error: ${msg}`, null);
     }
-    const text = await resp.text();
     if (!resp.ok) {
       let parsed: any = null;
       try {

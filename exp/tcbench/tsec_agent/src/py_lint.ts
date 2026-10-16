@@ -57,16 +57,7 @@ export function parseRuffLines(lines: string[]): string[] {
 function runRuff(file: string): string[] | null {
   const r = spawnSync(
     "ruff",
-    [
-      "check",
-      "--no-cache",
-      "--no-summary",
-      "--select",
-      RUFF_SELECT,
-      "--output-format",
-      "concise",
-      file,
-    ],
+    ["check", "--no-cache", "--select", RUFF_SELECT, "--output-format", "concise", file],
     {
       timeout: 5000,
       encoding: "utf8",
@@ -169,7 +160,7 @@ export function lintPyScript(src: string): string | null {
     if (ruff) notes.push(...parseRuffLines(ruff));
     if (!notes.length) {
       notes.push(
-        ruff ? "[py-lint] 检查通过（ruff + ast）" : "[py-lint] 检查通过（ast；ruff 未安装）",
+        ruff ? "[py-lint] 检查通过（ruff + ast）" : "[py-lint] 检查通过（ast；ruff 不可用）",
       );
     }
     return `\n${notes.join("\n")}`;
