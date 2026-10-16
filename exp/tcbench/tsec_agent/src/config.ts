@@ -162,6 +162,19 @@ export interface Config {
   vision: string;
   vision_max_kb: number;
   vision_ok: boolean | null;
+  // fork 多分支（默认关）
+  fork_enabled: boolean;
+  max_branches: number;
+  fork_max: number;
+  fork_cooldown_sec: number;
+  branch_prune_sec: number;
+  broadcast_max: number;
+  // 旁观者（默认关）
+  bystander_enabled: boolean;
+  bystander_max: number;
+  bystander_cooldown_sec: number;
+  stall_short_sec: number;
+  stall_long_sec: number;
   extra_env: Record<string, string>;
   llm_base_url: string;
   llm_api_key: string;
@@ -215,6 +228,22 @@ export const CFG: Config = {
   vision: env("AGENT_VISION", "auto").toLowerCase(),
   vision_max_kb: num("AGENT_VISION_MAX_KB", "4096"),
   vision_ok: null,
+
+  // --- fork 多分支（../docs/fork-bystander-design.md §7，默认全关） ---
+  fork_enabled: ["1", "on", "true"].includes(env("AGENT_FORK", "0").toLowerCase()),
+  max_branches: num("AGENT_MAX_BRANCHES", "3"), // 存活分支上限（含 trunk）
+  fork_max: num("AGENT_FORK_MAX", "5"), // 每题 fork 总数硬上限
+  fork_cooldown_sec: num("AGENT_FORK_COOLDOWN_SEC", "180"),
+  branch_prune_sec: num("AGENT_BRANCH_PRUNE_SEC", "600"), // corelog/flag 双停滞剪枝
+  broadcast_max: num("AGENT_BROADCAST_MAX", "8"), // 每段每分支广播上限
+
+  // --- 旁观者（默认关；依赖 core_log 工具，可单独于 fork 打开） ---
+  bystander_enabled: ["1", "on", "true"].includes(env("AGENT_BYSTANDER", "0").toLowerCase()),
+  bystander_max: num("AGENT_BYSTANDER_MAX", "2"), // 每段每分支旁观者上限
+  bystander_cooldown_sec: num("AGENT_BYSTANDER_COOLDOWN_SEC", "400"),
+  // 组合信号（任二成立触发）的分档阈值：停滞时长按题目分类取值
+  stall_short_sec: num("AGENT_STALL_SHORT_SEC", "300"),
+  stall_long_sec: num("AGENT_STALL_LONG_SEC", "600"),
 
   // 追加到 shell 子进程环境的变量
   extra_env: {

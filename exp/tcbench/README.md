@@ -230,6 +230,16 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
 | `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
+| `AGENT_FORK` | fork 多分支（`1`/`on` 开：分支工具 fork/core_log/broadcast + 交错轮转；缓存实测交错零代价） | `0` |
+| `AGENT_BYSTANDER` | 旁观者（`1`/`on` 开：卡塞组合信号触发独立短上下文插嘴；可单独于 fork 开） | `0` |
+| `AGENT_MAX_BRANCHES` | 活跃分支上限（含 trunk） | `3` |
+| `AGENT_FORK_MAX` | 每题 fork 总数硬上限（含分支再分叉） | `5` |
+| `AGENT_FORK_COOLDOWN_SEC` | fork 冷却秒 | `180` |
+| `AGENT_BRANCH_PRUNE_SEC` | 分支 corelog/flag 双停滞剪枝阈值秒 | `600` |
+| `AGENT_BROADCAST_MAX` | 每段每分支广播上限 | `8` |
+| `AGENT_BYSTANDER_MAX` | 每段每分支旁观者注入上限 | `2` |
+| `AGENT_BYSTANDER_COOLDOWN_SEC` | 旁观者冷却秒 | `400` |
+| `AGENT_STALL_SHORT_SEC` / `AGENT_STALL_LONG_SEC` | 停滞信号阈值（短题/长题分档） | `300` / `600` |
 | `AGENT_VISION` | 多模态读图 `auto`/`on`/`off`（auto=网关拒图时本会话降级为文本，只给元数据） | `auto` |
 | `AGENT_VISION_MAX_KB` | `action=view` 单图 data URL 上限，超出先自动压缩 | `4096` |
 | `VPN_CONF` | 容器内 vpn 配置路径 | `/config/vpn.ovpn` |
@@ -251,12 +261,20 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
 └── tasks/<code>/
      ├── conversation.jsonl           # 完整 LLM 对话，**全量不裁剪**：
      │    system/user 任务卡、assistant{thinking,output,tool_calls}、tool{result}
-     │    每条含 ts/seq/turn/tool_call_id + **成对起止时间戳（供甘特图）**：
+     │    每条含 ts/seq/turn/tool_call_id/**branch**（fork 多分支，0=trunk）
+     │    + **成对起止时间戳（供甘特图）**：
      │    started_at/ended_at（epoch 秒·毫秒精度）+ duration_ms（自动算）——
      │    assistant=本次 LLM 调用起止、tool=工具执行起止、user/note=写入同刻；
-     │    **同时是分段解题续跑时重建上下文的唯一来源**（`records.rebuildMessages`）
+     │    **同时是分段解题续跑时重建上下文的唯一来源**（`records.rebuildMessages`
+     │    trunk / `rebuildBranches` 分支——分支按 fork_seq 截断父快照）
      │    **通关后同上下文追加复盘总结**
      │    （思路/工具困难/优化建议，assistant 条目带 kind_note:"closing_summary"）
+     ├── corelog.jsonl                # fork/旁观者核心日志（AGENT_FORK/AGENT_BYSTANDER 开时）：
+     │    {ts,seq,branch,kind,note?}，kind ∈ core|broadcast|bystander|flag|prune|fork；
+     │    **flag 事件以 matched_flag_index 为稳定 ID**（flag 内容随靶机重启变、索引不变，
+     │    续跑按 index 对账「还差 idx 2,4」）；旁观者输入按分支分组读此文件
+     ├── branches/<N>/                # fork 分支命名空间（分支专属 cwd，shell 默认写这里；
+     │                                #  读任意路径允许，写只写自己目录——提示词约定）
      └── <AI 解题产物>
 ```
 

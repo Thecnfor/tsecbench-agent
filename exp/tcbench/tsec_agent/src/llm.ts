@@ -255,13 +255,15 @@ export function setStopCheck(fn: () => boolean): void {
  *   直到成功或任务时限；每 10 次记一条日志避免刷屏。
  * - finite：最多 api_max_retries 次后抛出。
  * - 4xx（认证/参数错误，非 429）：立即抛出，不重试。
- * - useTools=false：复盘总结轮用——不下发工具，模型只能输出文本。
+ * - useTools=false：复盘总结轮/旁观者轮用——不下发工具，模型只能输出文本。
+ * - extra.tools：动态工具集（fork/core_log/broadcast 开启时由 solveTask 组装）；
+ *   缺省仍只有 shell（默认行为不变）。
  */
 export async function callLlm(
   client: LlmClient,
   messages: ChatMessage[],
   useTools = true,
-  extra: { signal?: AbortSignal } = {},
+  extra: { signal?: AbortSignal; tools?: unknown[] } = {},
 ): Promise<ChatResponse> {
   let delayMs = 2000;
   let attempt = 0;
@@ -277,7 +279,7 @@ export async function callLlm(
         temperature: 0.2,
       };
       if (useTools) {
-        opts.tools = [SHELL_TOOL_SCHEMA];
+        opts.tools = extra.tools?.length ? extra.tools : [SHELL_TOOL_SCHEMA];
         opts.tool_choice = "auto";
       }
       if (extra.signal) opts.signal = extra.signal; // 限时调用（通关总结）的中止信号

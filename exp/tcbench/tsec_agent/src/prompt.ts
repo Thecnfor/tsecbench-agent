@@ -203,3 +203,58 @@ export const CLOSING_SUMMARY_PROMPT = `本题全部 flag 已提交成功、确�
 export function fill(tpl: string, vars: Record<string, string | number>): string {
   return tpl.replace(/\{(\w+)\}/g, (m, k) => (Object.hasOwn(vars, k) ? String(vars[k]) : m));
 }
+
+// ---------------------------------------------------------------- fork/旁观者 --
+// 只在 AGENT_FORK / AGENT_BYSTANDER 打开时拼接（前缀变更只发生在启用配置内，缓存自洽）。
+
+/** fork 模式：三工具用法 + 命名空间规则 + 分支纪律。 */
+export const FORK_PROMPT_EXTRA = `
+
+# 多分支协作（fork 模式）
+除 shell 外你还有三个协作工具，**全分支同一套**：
+- \`fork(direction)\`：把**你当前的上下文**复制出一条新分支去并行探索另一个方向
+  （另一条攻击链、另一个服务、一个待验证的猜想）。分出后**你继续走自己的路**。
+  存活分支数与每题 fork 总数有限，被拒绝时会告诉你原因（比如冷却中）——继续推进即可，
+  不要反复重试 fork。
+- \`core_log(note)\`：把**关键发现/新方向/已排除的死路/拿到的 flag** 记成一行核心日志。
+  频繁使用：核心日志是其他分支与外部观察者理解进度的唯一抽象层；
+  **停滞过久（无 core_log/flag）的分支会被系统回收**，摘要汇入主分支。
+  提交 flag 后记一条 \`flag idx=N\`（N = submit 响应里的 matched_flag_index）。
+- \`broadcast(note, to?)\`：给其他分支发一行消息（下一轮注入它们的对话尾部）。
+  用途：共享它们需要的发现、警告你即将对共享靶机做的**有副作用的操作**
+  （重启服务/监听端口/改配置——命名空间外的动作先广播协调）、求助。
+  近似重复的广播会被抑制，每段有次数上限。
+- **命名空间**：你有专属工作目录（分支创建时给出）；**读任意路径都允许**
+  （含其他分支目录，通报产物路径时写全路径）；**写只写自己的目录**；
+  命名空间之外与容器级操作（重启服务/监听共享端口/改系统/iptables）默认**只读**，
+  确需改动先 broadcast 协调。
+- **分支没有收尾权**：不要输出无工具总结（那会暂停你的分支）；
+  拿到全部 flag 时正常提交并 core_log 记录，收束由主分支/控制器负责。
+- 各分支共享同一台靶机：别的分支可能已经重启过服务/改过状态，结论要交叉验证。`;
+
+/** 只开旁观者（未开 fork）时的最小增量：core_log 用法。 */
+export const CORE_LOG_PROMPT_EXTRA = `
+
+# 核心日志（core_log 工具）
+把**关键发现/新方向/已排除的死路/拿到的 flag** 记成一行：\`core_log(note)\`。
+频繁使用——它是外部观察者判断你是否卡住、以及给你指引的依据；
+**长时间没有 core_log/flag 活动会被判定为停滞**。
+提交 flag 后记一条 \`flag idx=N\`（N = submit 响应里的 matched_flag_index）。`;
+
+/** 旁观者存在说明（启用旁观者时追加）。 */
+export const BYSTANDER_NOTE = `
+
+# 旁观者
+解题过程中，若你长时间没有进展，系统可能注入一条 \`[旁观者提示]\` 消息——
+那是换了视角的全局观察（基于各分支核心日志），**认真考虑它指出的方向**，
+尤其是让你放弃某条路/换抽象层面的建议；它是建议不是命令，与现场事实冲突时以你掌握的事实为准。`;
+
+/** 按开关拼接系统提示词（solveTask 用；未启用任何开关时与 SYSTEM_PROMPT 逐字节一致）。 */
+export function systemPromptWithExtras(forkOn: boolean, bystanderOn: boolean): string {
+  if (!forkOn && !bystanderOn) return SYSTEM_PROMPT;
+  return (
+    SYSTEM_PROMPT +
+    (forkOn ? FORK_PROMPT_EXTRA : bystanderOn ? CORE_LOG_PROMPT_EXTRA : "") +
+    (bystanderOn ? BYSTANDER_NOTE : "")
+  );
+}

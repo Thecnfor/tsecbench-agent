@@ -12,6 +12,7 @@ import {
   platStats,
   predictVsBaseline,
   taskFilterOf,
+  taskLiveView,
   utcEpoch,
 } from "../src/panel/data.js";
 
@@ -183,5 +184,44 @@ describe("展示格式", () => {
     expect(fmtDur(3725)).toBe("1:02:05");
     expect(fmtDelta(-65)).toBe("-1:05");
     expect(fmtDelta(65)).toBe("+1:05");
+  });
+});
+
+describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
+  it("读取 fork_directive 与 corelog（含已回收标记）", () => {
+    const runs = path.join(dir, "runs1");
+    fs.mkdirSync(path.join(runs, "tasks", "t-01"), { recursive: true });
+    writeJsonl(path.join(runs, "tasks", "t-01", "conversation.jsonl"), [
+      { kind: "system", content: "sys" },
+      { kind: "user", content: "card" },
+      {
+        kind: "user",
+        branch: 1,
+        kind_note: "fork_directive",
+        fork_label: "redis 方向",
+        content: "【分支 1】",
+      },
+      {
+        kind: "assistant",
+        branch: 0,
+        output: "继续",
+        tool_calls: [{ id: "c1", name: "shell", arguments: '{"command":"echo hi"}' }],
+      },
+    ]);
+    writeJsonl(path.join(runs, "tasks", "t-01", "corelog.jsonl"), [
+      { branch: 0, kind: "core", note: "发现注入点" },
+      { branch: 1, kind: "prune", note: "stalled 600s" },
+    ]);
+    const v = taskLiveView(runs, "t-01");
+    expect(v.branches).toEqual(["1: redis 方向（已回收）"]);
+    expect(v.corelog_tail.some((s) => s.includes("发现注入点"))).toBe(true);
+    // 无 fork 的题：空名册不炸
+    fs.mkdirSync(path.join(runs, "tasks", "t-02"), { recursive: true });
+    writeJsonl(path.join(runs, "tasks", "t-02", "conversation.jsonl"), [
+      { kind: "system", content: "s" },
+    ]);
+    const v2 = taskLiveView(runs, "t-02");
+    expect(v2.branches).toEqual([]);
+    expect(v2.corelog_tail).toEqual([]);
   });
 });

@@ -55,8 +55,12 @@
 
 ## 架构不变量（不要轻易破坏）
 
-1. **单工具设计**：agent 只有 `shell` 一个工具（异步 background 模式），**没有 MCP、没有 subagent**。
-   这是评测方的设计要求，不要往里加 read/write/web 等工具。
+1. **单工具设计（2026-10-16 放宽）**：基础工具只有 `shell`（异步 background 模式），**无 MCP**。
+   fork 多分支与旁观者是**控制器层能力**（默认关，`AGENT_FORK=0`/`AGENT_BYSTANDER=0`），
+   打开后工具集扩展为 `shell + fork + core_log + broadcast`——这是与评测方对齐后的演进
+   （初赛镜像两开关默认 off，行为与旧版逐语义一致）。read/write/web 等文件类工具仍禁止
+   （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-bystander-design.md`，
+   缓存实测依据见 `../cache_exp/README.md`。
 2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/wait_any/status/kill/list` 收结果。
    - 快速命令有 1.5s 同步窗口（`AGENT_SHELL_WAIT_MS`）；`run` 可带 `wait_sec`（≤300s），
      **工具替模型决定何时返回**（命令结束 / 攒够 ≥2KB 新输出 / 到点，先到先返回）。
@@ -126,11 +130,18 @@
      归档脚本在失败时用 `tsec-agent` 镜像以 root 归位属主后重试（docker 组走 newgrp，
      同时修好"运行中容器占用检查"），docker 不可用则报错并保留源目录；
    - **对话忠诚不裁剪**：发送给模型的 system/user、模型的 thinking/output/tool_calls、
-     工具 result 全部原样落 `conversation.jsonl`（含 ts/seq/turn/tool_call_id），
+     工具 result 全部原样落 `conversation.jsonl`（含 ts/seq/turn/tool_call_id/**branch**），
      **禁止任何 _clip/截断逻辑进对话记录**；
      **每条消息带成对起止时间戳**（`started_at`/`ended_at` epoch 秒·毫秒精度 +
      `duration_ms` 自动计算；assistant=LLM 调用起止、tool=工具执行起止，
      埋点在 `solve_task`/`closing_summary`）——直接可画甘特图（llm/tool 泳道）；
+   - **fork 分支记录（2026-10-16 增）**：conversation.jsonl 单流追加 + `branch` 字段
+     （0=trunk，缺省视为 0 兼容旧记录）；分支创建写 `kind_note:"fork_directive"`
+     （含 parent_branch/fork_seq/fork_label）；**`corelog.jsonl` 独立文件**记
+     core/broadcast/bystander/flag/prune/fork 六类核心事件，**flag 以
+     `matched_flag_index` 为稳定 ID**（内容随靶机重启变、索引不变）；
+     暂停续跑时 trunk 用 `rebuildMessages`（branch=0 过滤）、分支用 `rebuildBranches`
+     （父分支 **fork_seq 快照截断** + 分支自身记录；fork 后父分支的轮次不得进入分支）；
    - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt,resume}` /
      `task_close{closed_at,duration_sec,outcome,flags}`（`outcome` ∈ `pass`/`fail`/`paused`）；
    - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求
@@ -161,9 +172,13 @@
 | `tsec_agent/src/shell.ts` + `shell_tool.ts` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parseToolArguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
 | `tsec_agent/src/llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换 | 网关协议/鉴权变化 |
 | `tsec_agent/src/prompt.ts` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
-| `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl；`rebuildMessages` 从对话重建续跑上下文 | 记录字段调整、续跑上下文 |
+| `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl（+corelog.jsonl）；`rebuildMessages`/`rebuildBranches` 从对话重建续跑上下文（分支按 fork_seq 截断） | 记录字段调整、续跑上下文 |
+| `tsec_agent/src/branch.ts` | fork 多分支执行面：分支状态/护栏（存活≤3、总数≤5、冷却 180s、剪枝 600s）/轮转调度/广播（尾部追加+限频+去重） | 分支策略调整 |
+| `tsec_agent/src/branch_tools.ts` | fork/core_log/broadcast 三工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize 保证 tool 配对完整） | 工具契约变化 |
+| `tsec_agent/src/corelog.ts` | corelog.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ 旁观者分组视图 | 核心日志格式 |
+| `tsec_agent/src/bystander.ts` | 旁观者：卡塞组合信号（停滞/重复/预算任二）+ 输入构建（按分支分组防交错难读）+ 插嘴指令 | 卡塞判定/提示词 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
-| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖） | 加配置项 |
+| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/旁观者开关 `AGENT_FORK`/`AGENT_BYSTANDER`（默认 0）及护栏阈值 | 加配置项 |
 | `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
 | `docker/entrypoint.sh` | 容器入口：VPN → 预检 → DNS → 冒烟 → 跑分 | 接入流程变化 |

@@ -15,6 +15,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { CorelogWriter } from "./corelog.js";
 import type { ChatMessage, ContentPart, ConvRecord } from "./types.js";
 
 /** 记录根目录解析（对应 Python 版 RECORDS_DIR 语义）：
@@ -102,6 +103,11 @@ export class ConversationWriter {
     } as ConvRecord;
     fs.appendFileSync(this.path, `${JSON.stringify(rec)}\n`);
   }
+
+  /** 当前已写记录数（fork 分界：directive 写入前的 seq = 父前缀截止点）。 */
+  get currentSeq(): number {
+    return this.seq;
+  }
 }
 
 /** 从 conversation.jsonl 重建可发送给模型的消息序列（分段解题：暂停→恢复用）。
@@ -109,33 +115,48 @@ export class ConversationWriter {
  * 只重建会话必需字段；thinking/usage 等仅记录字段不回传。尾部裁掉「assistant 已发
  * tool_calls 但结果不齐」的半截对话——OpenAI 协议要求每个 tool_call 后紧跟同 id 的
  * tool 结果，否则 400。返回 [] 表示没有可用上下文。
+ *
+ * fork 分支感知：opts.branch 缺省 = trunk（只取 branch 0/缺省记录，与其他分支隔离）；
+ * 分支重建用 rebuildBranches（递归复用本函数 + fork_seq 截断）。
  */
-export function rebuildMessages(file: string): ChatMessage[] {
-  const msgs: ChatMessage[] = [];
-  const pending = new Set<string>(); // 已发出、尚未收到结果的 tool_call id
-  let lines: string[];
-  try {
-    lines = fs.readFileSync(file, "utf8").split("\n");
-  } catch {
-    return [];
-  }
-  const parse = (l: string): ConvRecord | null => {
+export function rebuildMessages(
+  file: string,
+  opts: { branch?: number; records?: ConvRecord[] } = {},
+): ChatMessage[] {
+  const branchId = opts.branch ?? 0;
+  let recs: ConvRecord[] | null = opts.records ?? null;
+  if (recs === null) {
+    let lines: string[];
     try {
-      return JSON.parse(l) as ConvRecord;
+      lines = fs.readFileSync(file, "utf8").split("\n");
     } catch {
-      return null;
+      return [];
     }
-  };
+    const parsed: ConvRecord[] = [];
+    for (const l of lines) {
+      try {
+        parsed.push(JSON.parse(l) as ConvRecord);
+      } catch {
+        /* 跳过坏行 */
+      }
+    }
+    recs = parsed;
+  }
   // 只从「最后一次 system」开始重建：真失败后重启会重新写 system+任务卡（新上下文）。
   let startAt = 0;
-  lines.forEach((l, i) => {
-    const r = parse(l);
-    if (r && r.kind === "system") startAt = i;
+  recs.forEach((r, i) => {
+    if (r.kind === "system") startAt = i;
   });
+  // 分支记录只取自己的（branch 缺省视为 0/trunk）
+  const filtered = recs.slice(startAt).filter((r) => (r.branch ?? 0) === branchId);
+  return recordsToMessages(filtered);
+}
 
-  for (const line of lines.slice(startAt)) {
-    const r = parse(line);
-    if (!r) continue;
+/** 纯函数：记录列表 → 消息序列（role 映射 + 孤儿过滤 + 尾部配对裁剪）。 */
+function recordsToMessages(recs: ConvRecord[]): ChatMessage[] {
+  const msgs: ChatMessage[] = [];
+  const pending = new Set<string>(); // 已发出、尚未收到结果的 tool_call id
+  for (const r of recs) {
     const kind = r.kind;
     if (kind === "system" || kind === "user") {
       const content = r.content;
@@ -143,7 +164,7 @@ export function rebuildMessages(file: string): ChatMessage[] {
         msgs.push({ role: kind, content });
       }
     } else if (kind === "assistant") {
-      const toolCalls = (r.tool_calls as ConvRecord["tool_calls"]) ?? [];
+      const toolCalls = r.tool_calls ?? [];
       const content = r.output;
       if (!toolCalls?.length && !content) continue;
       const m: ChatMessage = { role: "assistant" };
@@ -191,6 +212,141 @@ export function rebuildMessages(file: string): ChatMessage[] {
     }
   }
   if (!msgs.length || msgs[0].role !== "system") return [];
+  return msgs;
+}
+
+/** fork 分支重建：分支 B 的上下文 = 父分支**截至 B.forkSeq 的快照** + B 自己的记录。
+ *（fork 后父分支继续跑的轮次不得进入 B——seq 截断精确还原 materializeFork 的复制点；
+ * 嵌套 fork 时 seqLimit 沿父链向上传递取更小者。）
+ * 返回全部可恢复分支（trunk 用 rebuildMessages）。父分支无法重建 → 该分支直接丢弃
+ * （宁丢不发残缺上下文）。 */
+export function rebuildBranches(file: string): Array<{
+  id: number;
+  parent: number | null;
+  forkSeq: number;
+  label: string;
+  messages: ChatMessage[];
+}> {
+  let lines: string[];
+  try {
+    lines = fs.readFileSync(file, "utf8").split("\n");
+  } catch {
+    return [];
+  }
+  const recs: ConvRecord[] = [];
+  for (const l of lines) {
+    try {
+      recs.push(JSON.parse(l) as ConvRecord);
+    } catch {
+      /* 跳过坏行 */
+    }
+  }
+  // fork 标记：directive user 记录（branch=新分支，kind_note=fork_directive）
+  const forks = new Map<number, { parent: number; forkSeq: number; label: string }>();
+  for (const r of recs) {
+    if (r.kind === "user" && r.kind_note === "fork_directive") {
+      const id = r.branch ?? 0;
+      if (id > 0 && typeof r.parent_branch === "number" && typeof r.fork_seq === "number") {
+        forks.set(id, {
+          parent: r.parent_branch,
+          forkSeq: r.fork_seq,
+          label: String(r.fork_label ?? ""),
+        });
+      }
+    }
+  }
+  if (!forks.size) return [];
+
+  const cache = new Map<string, ChatMessage[]>();
+  const build = (id: number, seqLimit: number): ChatMessage[] => {
+    const key = `${id}:${seqLimit}`;
+    if (cache.has(key)) return cache.get(key)!;
+    let out: ChatMessage[];
+    if (id === 0) {
+      out = rebuildMessages(file, {
+        branch: 0,
+        records:
+          seqLimit === Number.MAX_SAFE_INTEGER ? recs : recs.filter((r) => r.seq <= seqLimit),
+      });
+    } else {
+      const f = forks.get(id);
+      if (!f) return [];
+      const parentMsgs = build(f.parent, Math.min(seqLimit, f.forkSeq));
+      if (!parentMsgs.length) return [];
+      const own = recordsToMessagesLoose(
+        recs.filter((r) => (r.branch ?? 0) === id && r.seq <= seqLimit),
+      );
+      if (!own.length) return [];
+      out = [...parentMsgs, ...own];
+    }
+    cache.set(key, out);
+    return out;
+  };
+  const out: Array<{
+    id: number;
+    parent: number | null;
+    forkSeq: number;
+    label: string;
+    messages: ChatMessage[];
+  }> = [];
+  for (const [id, f] of forks) {
+    const messages = build(id, Number.MAX_SAFE_INTEGER);
+    if (messages.length)
+      out.push({ id, parent: f.parent, forkSeq: f.forkSeq, label: f.label, messages });
+  }
+  return out.sort((a, b) => a.id - b.id);
+}
+
+/** recordsToMessages 的无 system 前置要求版本（分支尾部记录用）。 */
+function recordsToMessagesLoose(recs: ConvRecord[]): ChatMessage[] {
+  const msgs: ChatMessage[] = [];
+  const pending = new Set<string>();
+  for (const r of recs) {
+    if (r.kind === "user" && typeof r.content === "string" && r.content) {
+      msgs.push({ role: "user", content: r.content });
+    } else if (r.kind === "assistant") {
+      const toolCalls = r.tool_calls ?? [];
+      if (!toolCalls.length && !r.output) continue;
+      const m: ChatMessage = { role: "assistant" };
+      if (r.output) m.content = r.output;
+      if (toolCalls.length) {
+        m.tool_calls = toolCalls.map((t) => ({
+          id: t.id,
+          type: "function" as const,
+          function: { name: t.name, arguments: t.arguments || "{}" },
+        }));
+        for (const t of toolCalls) pending.add(t.id);
+      }
+      msgs.push(m);
+    } else if (r.kind === "tool") {
+      const tid = r.tool_call_id;
+      if (!tid || !pending.has(tid)) continue;
+      pending.delete(tid);
+      const result = r.result;
+      const content = Array.isArray(result)
+        ? (result as ContentPart[])
+        : typeof result === "string"
+          ? result
+          : JSON.stringify(result ?? null);
+      msgs.push({ role: "tool", tool_call_id: tid, content });
+    }
+  }
+  // 尾部配对裁剪（同 recordsToMessages）
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "assistant" && msgs[i].tool_calls?.length) {
+      const ids = new Set(msgs[i].tool_calls!.map((t) => t.id));
+      const got = new Set(
+        msgs
+          .slice(i + 1)
+          .filter((m) => m.role === "tool")
+          .map((m) => m.tool_call_id),
+      );
+      let ok = true;
+      for (const id of ids) if (!got.has(id)) ok = false;
+      if (!ok) msgs.splice(i);
+      break;
+    }
+  }
   return msgs;
 }
 
@@ -256,10 +412,28 @@ export class RunRecords {
     return new ConversationWriter(file, code);
   }
 
+  /** 核心日志 writer（fork/core_log/旁观者/flag 事件；见 corelog.ts） */
+  corelog(code: string): CorelogWriter {
+    const file = path.join(this.dir, "tasks", code, "corelog.jsonl");
+    return new CorelogWriter(file, code);
+  }
+
   /** 从对话记录重建消息序列（暂停→恢复续跑用），见 rebuildMessages。 */
   loadMessages(code: string): ChatMessage[] {
     const file = path.join(this.dir, "tasks", code, "conversation.jsonl");
     return rebuildMessages(file);
+  }
+
+  /** 重建全部 fork 分支（暂停→恢复续跑用），见 rebuildBranches。 */
+  loadBranches(code: string): Array<{
+    id: number;
+    parent: number | null;
+    forkSeq: number;
+    label: string;
+    messages: ChatMessage[];
+  }> {
+    const file = path.join(this.dir, "tasks", code, "conversation.jsonl");
+    return rebuildBranches(file);
   }
 }
 
@@ -272,7 +446,19 @@ class Noop {
   conversation(_code: string): ConversationWriter {
     throw new Error("records not initialized");
   }
+  corelog(_code: string): CorelogWriter {
+    throw new Error("records not initialized");
+  }
   loadMessages(_code: string): ChatMessage[] {
+    return [];
+  }
+  loadBranches(_code: string): Array<{
+    id: number;
+    parent: number | null;
+    forkSeq: number;
+    label: string;
+    messages: ChatMessage[];
+  }> {
     return [];
   }
 }

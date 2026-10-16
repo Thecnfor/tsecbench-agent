@@ -14,7 +14,14 @@ interface TaskRow {
   summary?: string;
   running: boolean;
   elapsed?: number;
-  live?: { last_output: string; last_thinking: string; running_cmds: string[]; last_cmd: string };
+  live?: {
+    last_output: string;
+    last_thinking: string;
+    running_cmds: string[];
+    last_cmd: string;
+    branches?: string[];
+    corelog_tail?: string[];
+  };
 }
 
 interface PredictItem {
@@ -315,6 +322,14 @@ export function App() {
                   <div className="muted">
                     另 {t.live.running_cmds.length - 1} 个在跑：
                     {t.live.running_cmds.slice(1).join(" | ")}
+                  </div>
+                )}
+                {(t.live.branches?.length ?? 0) > 0 && (
+                  <div className="muted">⑂ {t.live.branches?.join(" ｜ ")}</div>
+                )}
+                {(t.live.corelog_tail?.length ?? 0) > 0 && (
+                  <div className="muted">
+                    corelog: {t.live.corelog_tail?.slice(0, 3).join(" ｜ ")}
                   </div>
                 )}
               </div>

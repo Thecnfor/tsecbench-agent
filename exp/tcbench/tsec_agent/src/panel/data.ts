@@ -281,13 +281,22 @@ export interface LiveView {
   last_thinking: string;
   running_cmds: string[];
   last_cmd: string;
+  branches: string[]; // fork 分支名册（"1: 方向…"；含已回收标记）
+  corelog_tail: string[]; // 核心日志尾部（旁观者视角缩略）
 }
 
-/** 单题对话的实时视角：最近模型输出 + 进行中/最近的 shell 调用。 */
+/** 单题对话的实时视角：最近模型输出 + 进行中/最近的 shell 调用 + fork 分支名册。 */
 export function taskLiveView(runsDir: string, code: string): LiveView {
   const convPath = path.join(runsDir, "tasks", code, "conversation.jsonl");
   const msgs = readJsonlTail(convPath, 60) as ConvRecord[];
-  const view: LiveView = { last_output: "", last_thinking: "", running_cmds: [], last_cmd: "" };
+  const view: LiveView = {
+    last_output: "",
+    last_thinking: "",
+    running_cmds: [],
+    last_cmd: "",
+    branches: [],
+    corelog_tail: [],
+  };
   const pending: string[] = []; // 已发出、未回结果的 tool_call
   const finished: string[] = []; // 最近完成的命令
   for (const r of msgs) {
@@ -334,6 +343,27 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
   }
   view.running_cmds = pending.slice(0, 4);
   view.last_cmd = finished.length ? finished[finished.length - 1] : "";
+  // fork 分支名册（conversation 的 fork_directive + corelog 的 prune）+ 核心日志尾部
+  try {
+    const pruned = new Set<number>();
+    for (const r of readJsonlTail(path.join(runsDir, "tasks", code, "corelog.jsonl"), 200)) {
+      if ((r as any).kind === "prune") pruned.add(Number((r as any).branch));
+    }
+    for (const r of msgs) {
+      if (r.kind === "user" && r.kind_note === "fork_directive") {
+        const id = Number(r.branch ?? 0);
+        view.branches.push(
+          `${id}: ${String(r.fork_label ?? "").slice(0, 40)}${pruned.has(id) ? "（已回收）" : ""}`,
+        );
+      }
+    }
+    const corelog = readJsonlTail(path.join(runsDir, "tasks", code, "corelog.jsonl"), 6) as any[];
+    view.corelog_tail = corelog
+      .reverse()
+      .map((e) => `b${e.branch} ${e.kind}${e.note ? `: ${String(e.note).slice(0, 60)}` : ""}`);
+  } catch {
+    /* 无 corelog（fork 未启用）→ 保持空 */
+  }
   return view;
 }
 

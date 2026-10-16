@@ -11,17 +11,35 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { type BranchCfg, type BranchLite, BranchManager } from "./branch.js";
+import {
+  afterForkMaterialized,
+  BRANCH_TOOL_NAMES,
+  BROADCAST_TOOL_SCHEMA,
+  CORE_LOG_TOOL_SCHEMA,
+  dispatchBranchTool,
+  FORK_TOOL_SCHEMA,
+  type PendingFork,
+} from "./branch_tools.js";
+import {
+  BYSTANDER_SYSTEM,
+  buildBystanderInput,
+  bystanderMessage,
+  evaluateStall,
+  recentDigest,
+} from "./bystander.js";
 import { CFG, env, resolveAsync } from "./config.js";
+import { extractFlagIndex, FlagLedger, readCorelog } from "./corelog.js";
 import {
   CLOSING_SUMMARY_PROMPT,
   fill,
   formatTaskCard,
   GIVEUP_NOTE,
   RESUME_NOTE,
-  SYSTEM_PROMPT,
+  systemPromptWithExtras,
 } from "./prompt.js";
 import { getTaskCwd, setTaskCwd } from "./shell.js";
-import { dispatchShell, parseToolArguments } from "./shell_tool.js";
+import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
 
 export { getTaskCwd, setTaskCwd };
 
@@ -387,11 +405,26 @@ export interface SolveResult {
   lastContent: string;
   turnsUsed: number;
   messages: ChatMessage[];
+  branches: BranchLite[]; // fork 模式的跨段分支状态（disabled 时为空）
+}
+
+/** fork/旁观者配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
+function branchCfgFromConfig(): BranchCfg {
+  return {
+    enabled: CFG.fork_enabled,
+    maxBranches: CFG.max_branches,
+    maxForks: CFG.fork_max,
+    forkCooldownSec: CFG.fork_cooldown_sec,
+    pruneSec: CFG.branch_prune_sec,
+    broadcastMax: CFG.broadcast_max,
+    bystanderMax: CFG.bystander_max,
+    bystanderCooldownSec: CFG.bystander_cooldown_sec,
+  };
 }
 
 /** 单题分段解题：本段直到模型输出最终总结（无工具调用）或【段墙钟预算】到点。
  *
- * 状态: done(模型输出无工具总结) / paused(段到点) / stopped(平台终态) /
+ * 状态: done(全部分支收束) / paused(段到点) / stopped(平台终态) /
  * vpn_abandon / deadline / llm_error / context_overflow
  * messages/startTurn：续跑时传入重建好的上下文与轮次偏移。
  * budgetSec：段墙钟预算（C 策略：短 600s/长 1800s）——轮数只当安全网（防极端空转，
@@ -399,7 +432,11 @@ export interface SolveResult {
  * completionCheck：A 策略——每轮开头问一次"平台是否已标记通关"（读 watcher 缓存，
  * 零额外 API 调用，最坏延迟 20s）。通关即收束，不等段边界、不等模型自己想起来收尾
  * （b-02 实测通关后白挂 22 分钟就是等模型收尾）。
- * 对话全量、忠实落盘（conversation.jsonl）。
+ * 对话全量、忠实落盘（conversation.jsonl，带 branch 字段）。
+ *
+ * fork 多分支（AGENT_FORK=1，默认关）：单飞轮转交错推进（a1 b1 a2 b2，缓存零代价
+ * 已实测）；护栏与调度见 branch.ts；旁观者（AGENT_BYSTANDER=1）见 bystander.ts。
+ * 分支/旁观者开关关闭时行为与旧单分支版逐语义一致。
  */
 export async function solveTask(
   client: LlmClient,
@@ -411,17 +448,22 @@ export async function solveTask(
     messages?: ChatMessage[];
     startTurn?: number;
     completionCheck?: () => boolean;
+    branches?: BranchLite[]; // 续段恢复的分支状态
+    taskClass?: "long" | "short"; // 旁观者停滞阈值分档
+    flagTotal?: number; // flag 索引账本总数
   } = {},
 ): Promise<SolveResult> {
+  const forkOn = CFG.fork_enabled;
+  const multiOn = forkOn || CFG.bystander_enabled;
   let messages: ChatMessage[];
   if (!opts.messages) {
     messages = [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: systemPromptWithExtras(forkOn, CFG.bystander_enabled) },
       { role: "user", content: taskCard },
     ];
     // 忠实记录本题输入（system + 任务卡）
-    conv.write("system", { turn: `${code}:0`, content: SYSTEM_PROMPT });
-    conv.write("user", { turn: `${code}:0`, content: taskCard });
+    conv.write("system", { branch: 0, turn: `${code}:0`, content: messages[0].content });
+    conv.write("user", { branch: 0, turn: `${code}:0`, content: taskCard });
   } else {
     messages = opts.messages;
   }
@@ -429,48 +471,222 @@ export async function solveTask(
   let lastContent = "";
   let turnsUsed = 0;
   let turn = 0;
-  let segStartTs = Date.now() / 1000;
+  let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
+  const nowSec = () => Date.now() / 1000;
+
+  // --- fork/旁观者基础设施（默认关：单 trunk、无额外工具、无额外调用） ---
+  const workdir = getTaskCwd() || "";
+  const branchCwd = (id: number): string => {
+    const d = `${workdir}/branches/${id}`;
+    try {
+      fs.mkdirSync(d, { recursive: true });
+    } catch {
+      /* 目录已存在/不可建：shell 会回退到默认 cwd */
+    }
+    return d;
+  };
+  const bm = new BranchManager(branchCfgFromConfig(), messages, nowSec(), workdir);
+  if (opts.branches?.length) bm.restore(opts.branches, nowSec());
+  const corelog = multiOn ? rec().corelog(code) : null;
+  const ledger = new FlagLedger();
+  if (opts.flagTotal) ledger.setTotal(opts.flagTotal);
+  const stallSec =
+    (opts.taskClass ?? "short") === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
+
+  // 工具集：shell 恒在；fork/broadcast 仅 fork 开；core_log 两者任一开
+  const tools: unknown[] = [SHELL_TOOL_SCHEMA];
+  if (forkOn) tools.push(FORK_TOOL_SCHEMA, BROADCAST_TOOL_SCHEMA);
+  if (multiOn) tools.push(CORE_LOG_TOOL_SCHEMA);
+  const toolDeps = {
+    bm,
+    corelog,
+    ledger,
+    now: nowSec,
+    log,
+    // broadcast 送达 → 目标分支的注入消息忠实落盘（对话忠实不变量）
+    onBroadcast: (fromId: number, toIds: number[], note: string) => {
+      for (const tid of toIds) {
+        conv.write("user", {
+          branch: tid,
+          kind_note: "broadcast",
+          content: `[分支 ${fromId} 广播] ${note}`,
+        });
+      }
+    },
+  };
+
+  const branchLite = (): BranchLite[] =>
+    bm
+      .alive()
+      .filter((b) => b.id !== 0)
+      .map((b) => ({
+        id: b.id,
+        parent: b.parent,
+        label: b.label,
+        cwd: b.cwd,
+        forkSeq: b.forkSeq,
+        messages: b.messages,
+      }));
+  const finish = (status: SolveStatus): SolveResult => ({
+    status,
+    lastContent,
+    turnsUsed,
+    messages,
+    branches: branchLite(),
+  });
+
+  // 剪枝：corelog/flag 双停滞 → 回收分支 + 摘要注入 trunk（尾部追加保缓存）
+  const pruneStalled = (): void => {
+    if (!forkOn) return;
+    const t = nowSec();
+    for (const b of bm.alive()) {
+      if (b.id === 0) continue;
+      if (t - b.lastCoreTs < CFG.branch_prune_sec) continue;
+      const pruned = bm.prune(b.id);
+      if (!pruned) continue;
+      const tail = corelog
+        ? readCorelog(corelog.path)
+            .filter((e) => e.branch === b.id && (e.kind === "core" || e.kind === "flag"))
+            .slice(-10)
+            .map((e) => (e.kind === "flag" ? `flag idx=${e.flag_index ?? "?"}` : (e.note ?? "")))
+        : [];
+      const summary =
+        `[分支 ${b.id} 已回收] 方向：${b.label}；停滞 ${Math.round(t - b.lastCoreTs)}s 无核心事件。\n` +
+        `核心日志摘要：\n${tail.map((s) => `- ${s}`).join("\n") || "-（无）"}\n` +
+        `（该分支的工作目录 ${b.cwd} 与产物仍在，可读取）`;
+      bm.get(0)?.messages.push({ role: "user", content: summary });
+      conv.write("user", { branch: 0, kind_note: "branch_pruned", content: summary });
+      corelog?.write({
+        branch: b.id,
+        kind: "prune",
+        note: `stalled ${Math.round(t - b.lastCoreTs)}s`,
+      });
+      log(`[${code}] branch ${b.id} pruned (stalled); summary injected into trunk`);
+    }
+  };
+
+  // 旁观者：组合信号任二成立 → 独立短上下文调用 → 尾部插嘴（限频在 bm）
+  const maybeBystander = async (): Promise<void> => {
+    if (!CFG.bystander_enabled) return;
+    const t = nowSec();
+    const active = bm.active();
+    if (!active.length) return;
+    const stalled = active.filter(
+      (b) =>
+        evaluateStall({
+          sinceCoreSec: t - b.lastCoreTs,
+          stallSec,
+          recentCmds: b.recentCmds,
+          segElapsedSec: t - segStartTs,
+          segBudgetSec: budgetSec,
+          coreThisSegment: b.lastCoreTs > segStartTs,
+        }).count >= 2,
+    );
+    if (!stalled.length) return;
+    // 全分支停滞 → 插 trunk；否则插第一个停滞分支
+    const target = stalled.length === active.length ? bm.get(0) : stalled[0];
+    if (!target || !bm.bystanderAvailable(target.id, t)) return;
+    const sig = evaluateStall({
+      sinceCoreSec: t - target.lastCoreTs,
+      stallSec,
+      recentCmds: target.recentCmds,
+      segElapsedSec: t - segStartTs,
+      segBudgetSec: budgetSec,
+      coreThisSegment: target.lastCoreTs > segStartTs,
+    });
+    const entries = corelog ? readCorelog(corelog.path) : [];
+    const input = buildBystanderInput({
+      entries,
+      branchId: target.id,
+      branchLabel: target.label,
+      branchNames: bm.names(),
+      ledger: multiOn ? ledger : null,
+      recentDigest: recentDigest(target.messages),
+      recentCmds: target.recentCmds,
+      segElapsedSec: t - segStartTs,
+      signals: sig,
+    });
+    let advice = "";
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 60_000);
+    try {
+      const resp = await callLlm(
+        client,
+        [
+          { role: "system", content: BYSTANDER_SYSTEM },
+          { role: "user", content: input },
+        ],
+        false,
+        { signal: ac.signal },
+      );
+      advice = (resp.choices[0].message.content ?? "").trim();
+    } catch (e) {
+      log(`[${code}] bystander call failed: ${e instanceof Error ? `${e.name}: ${e.message}` : e}`);
+      return; // 失败不消耗限频额度
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!advice) return;
+    const content = bystanderMessage(advice);
+    target.messages.push({ role: "user", content });
+    target.active = true; // 插嘴 = 新方向，激活 parked 分支
+    bm.noteBystander(target.id, t);
+    conv.write("user", {
+      branch: target.id,
+      kind_note: "bystander",
+      content,
+    });
+    corelog?.write({ branch: target.id, kind: "bystander", note: advice.slice(0, 400) });
+    log(
+      `[${code}] bystander injected into ${target.id === 0 ? "trunk" : `branch ${target.id}`}: ` +
+        `${advice.slice(0, 100)}`,
+    );
+  };
+
   while (true) {
-    if (STOP) return { status: "stopped", lastContent, turnsUsed, messages };
+    if (STOP) return finish("stopped");
     // A 策略：每轮开头查通关（watcher 缓存）——平台已确认满 flag 就立刻收束，
     // 不再等模型自己输出总结（它可能根本想不起来，b-02 白挂 22 分钟的教训）。
     if (opts.completionCheck?.()) {
       log(`[${code}] platform confirmed completion mid-segment — closing segment early`);
-      return { status: "done", lastContent, turnsUsed, messages };
+      return finish("done");
     }
     // C 策略：段墙钟预算到点即收段（转 paused 让调度处置：原地续或关题让位）。
     // 安全网：轮数超上限也收段（0=关闭轮数闸），防模型纯说话空转烧 token。
-    if (Date.now() / 1000 - segStartTs >= budgetSec) {
+    if (nowSec() - segStartTs >= budgetSec) {
       log(`[${code}] segment wall-clock budget ${budgetSec}s reached (turn ${turn})`);
-      return { status: "paused", lastContent, turnsUsed, messages };
+      return finish("paused");
     }
     if (CFG.task_max_turns > 0 && turn >= CFG.task_max_turns) {
       log(`[${code}] turn safety-net ${CFG.task_max_turns} reached`);
-      return { status: "paused", lastContent, turnsUsed, messages };
+      return finish("paused");
     }
     // VPN 守卫：VPN 挂起 → 本题挂起等待恢复（不烧轮次预算），恢复后原地继续。
     // 等待超过 AGENT_VPN_WAIT_MAX（默认 600s）仍未恢复才放弃本题。
     if (VPN_DOWN) {
       const waitMax = Number(env("AGENT_VPN_WAIT_MAX", "600"));
-      const t0 = Date.now() / 1000;
+      const t0 = nowSec();
       conv.write("note", {
+        branch: 0,
         turn: `${code}:${turn}`,
         content: `VPN down detected; suspending task (max ${waitMax.toFixed(0)}s)`,
       });
       log(`[${code}] VPN down; task suspended (waiting for recovery)`);
-      while (VPN_DOWN && !STOP && Date.now() / 1000 - t0 < waitMax) {
+      while (VPN_DOWN && !STOP && nowSec() - t0 < waitMax) {
         await sleep(3000);
       }
-      const waited = Date.now() / 1000 - t0;
+      const waited = nowSec() - t0;
       if (VPN_DOWN) {
         conv.write("error", {
+          branch: 0,
           turn: `${code}:${turn}`,
           error: `VPN still down after ${waited.toFixed(0)}s; abandoning task`,
         });
         log(`[${code}] VPN still down after ${waited.toFixed(0)}s; abandoning`);
-        return { status: "vpn_abandon", lastContent, turnsUsed, messages };
+        return finish("vpn_abandon");
       }
       conv.write("note", {
+        branch: 0,
         turn: `${code}:${turn}`,
         content: `VPN recovered after ${waited.toFixed(0)}s; resuming`,
       });
@@ -480,17 +696,28 @@ export async function solveTask(
       continue; // 恢复后从当前 turn 继续（不烧预算）
     }
     const rem = remainingSec();
-    if (rem !== null && rem <= 0) return { status: "deadline", lastContent, turnsUsed, messages };
+    if (rem !== null && rem <= 0) return finish("deadline");
+
+    pruneStalled();
+    await maybeBystander();
+
+    const br = bm.pick();
+    if (!br) {
+      // 全部分支 parked（输出无工具总结）→ 本段收束（是否通关由控制器查平台）
+      log(`[${code}] all branches parked (turn ${turn}); closing segment`);
+      return finish("done");
+    }
+
     turn++;
-    const tLlmStart = Date.now() / 1000;
+    const tLlmStart = nowSec();
     let resp: ChatResponse | null = null;
     let err: unknown = null;
     try {
-      resp = await callLlm(client, messages);
+      resp = await callLlm(client, br.messages, true, { tools });
     } catch (e) {
       err = e;
       // 多模态降级：网关拒收图片 → 剥掉 image part 改发纯文本，本会话后续不再附图
-      const dropped = CFG.vision_ok !== false ? stripImages(messages) : 0;
+      const dropped = CFG.vision_ok !== false ? stripImages(br.messages) : 0;
       if (dropped) {
         CFG.vision_ok = false;
         log(
@@ -498,6 +725,7 @@ export async function solveTask(
             `dropped ${dropped} image(s), retrying text-only`,
         );
         conv.write("note", {
+          branch: br.id,
           turn: `${code}:${turn}`,
           content: `网关拒图，降级为文本模式：${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`,
         });
@@ -507,7 +735,7 @@ export async function solveTask(
           error: `${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`.slice(0, 400),
         });
         try {
-          resp = await callLlm(client, messages);
+          resp = await callLlm(client, br.messages, true, { tools });
         } catch (e2) {
           err = e2;
         }
@@ -515,19 +743,25 @@ export async function solveTask(
       if (!resp) {
         const emsg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
         log(`[${code}] fatal LLM error: ${emsg}`);
-        conv.write("error", { turn: `${code}:${turn}`, error: emsg, started_at: tLlmStart });
+        conv.write("error", {
+          branch: br.id,
+          turn: `${code}:${turn}`,
+          error: emsg,
+          started_at: tLlmStart,
+        });
         const status: SolveStatus = isContextOverflow(err) ? "context_overflow" : "llm_error";
-        return { status, lastContent, turnsUsed, messages };
+        return finish(status);
       }
     }
     turnsUsed++;
-    const tLlmEnd = Date.now() / 1000;
+    const tLlmEnd = nowSec();
 
     const msg = resp.choices[0].message;
     const tlabel = `${code}:${startTurn + turn}`;
     const toolCallsRaw = msg.tool_calls ?? [];
     // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）
     conv.write("assistant", {
+      branch: br.id,
       turn: tlabel,
       thinking: msg.reasoning_content ?? null,
       output: msg.content ?? null,
@@ -551,17 +785,21 @@ export async function solveTask(
         function: { name: tc.function.name, arguments: tc.function.arguments },
       }));
     }
-    messages.push(clean);
+    br.messages.push(clean);
 
     if (!toolCallsRaw.length) {
-      // 本题上下文的最终总结 → 交还控制器（是否通关由控制器查平台）
-      return { status: "done", lastContent: msg.content || "", turnsUsed, messages };
+      if (!multiOn) return finish("done"); // 单分支语义不变：无工具总结 = 本题上下文收束
+      // fork 模式：该分支 parked（无收尾权），其他分支继续；全 parked 时循环顶部收束
+      bm.park(br.id);
+      log(`[${code}] branch ${br.id} parked (no tool call)`);
+      continue;
     }
 
+    const pendingForks: PendingFork[] = [];
     for (const tc of toolCallsRaw) {
       let args: Record<string, unknown> = {};
       const rawArgs = tc.function.arguments || "{}";
-      const tToolStart = Date.now() / 1000;
+      const tToolStart = nowSec();
       let result: unknown;
       if (tc.function.name === "shell") {
         const [parsed, fix] = parseToolArguments(rawArgs);
@@ -569,6 +807,8 @@ export async function solveTask(
           result = `error: ${fix || "invalid tool arguments"}`;
         } else {
           args = parsed;
+          // 分支命名空间：shell 默认 cwd = 本分支目录（显式传 cwd 优先；trunk 不改）
+          if (br.id !== 0 && !args.cwd) args.cwd = br.cwd;
           if (fix) {
             // 模型把参数序列化坏了：直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
             log(`[${code}] tool args repaired: ${fix}`);
@@ -582,13 +822,46 @@ export async function solveTask(
           } else {
             result = await dispatchShell(args);
           }
+          if (typeof args.command === "string") bm.pushCmd(br.id, args.command);
+          // flag 事件（权威之一）：submit 响应的 matched_flag_index 作稳定 ID 进账本
+          const idx = extractFlagIndex(firstText(result));
+          if (idx !== null && ledger.add(idx, br.id)) {
+            const cfc = /"correct_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
+            const tfc = /"total_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
+            if (tfc) ledger.setTotal(Number(tfc[1]));
+            corelog?.write({
+              branch: br.id,
+              kind: "flag",
+              flag_index: idx,
+              correct_flag_count: cfc ? Number(cfc[1]) : ledger.count(),
+              total_flag_count: tfc ? Number(tfc[1]) : undefined,
+            });
+            bm.recordCore(br.id, nowSec());
+            log(`[${code}] branch ${br.id} flagged idx=${idx} (${ledger.progress()})`);
+          }
+        }
+      } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
+        let parsedArgs: Record<string, unknown> = {};
+        try {
+          parsedArgs = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+        } catch {
+          parsedArgs = {};
+        }
+        args = parsedArgs;
+        const out = dispatchBranchTool(tc.function.name, parsedArgs, toolDeps, br.id, tc.id);
+        if (!out) {
+          result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
+        } else {
+          result = out.result;
+          if (out.pendingFork) pendingForks.push(out.pendingFork);
         }
       } else {
         result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
       }
-      const tToolEnd = Date.now() / 1000;
+      const tToolEnd = nowSec();
       // 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联；起止 = 工具执行）
       conv.write("tool", {
+        branch: br.id,
         turn: tlabel,
         tool_call_id: tc.id,
         tool: tc.function.name,
@@ -599,10 +872,38 @@ export async function solveTask(
       });
       const first = firstText(result);
       log(
-        `tool#${tc.id.slice(-6)} ${tc.function.name} -> ` +
+        `tool#${tc.id.slice(-6)} ${tc.function.name}[b${br.id}] -> ` +
           `${first ? (first.split("\n")[0] || "").slice(0, 160) : ""}`,
       );
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
+      br.messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
+    }
+
+    // 轮末 materialize fork（此时父分支上下文 tool 配对完整，拷贝协议安全）
+    for (const pf of pendingForks) {
+      const t = nowSec();
+      const forkSeq = conv.currentSeq;
+      const made = bm.materializeFork(
+        pf.reservation.id,
+        pf.parentId,
+        pf.direction,
+        forkSeq,
+        t,
+        branchCwd,
+      );
+      if (!made) continue;
+      conv.write("user", {
+        branch: made.branch.id,
+        kind_note: "fork_directive",
+        parent_branch: pf.parentId,
+        fork_seq: forkSeq,
+        fork_label: pf.direction.slice(0, 200),
+        content: made.directive,
+        turn: tlabel,
+      });
+      afterForkMaterialized(corelog, pf.parentId, made.branch.id, pf.direction);
+      log(
+        `[${code}] fork materialized: branch ${made.branch.id} from ${pf.parentId}: ${pf.direction.slice(0, 80)}`,
+      );
     }
   }
 }
@@ -924,6 +1225,7 @@ async function runParallel(
     let containerReleased = false; // A：通关即关容器后置位，finally 里不再重复 close
     const conv = rec().conversation(code);
     let messages: ChatMessage[] | null = null;
+    let branches: BranchLite[] = []; // fork 模式跨段分支状态
     const meta = resumeMeta[code] ?? {};
     let pauses = Number(meta.pauses ?? 0);
     let gives = Number(meta.gives ?? 0);
@@ -963,9 +1265,24 @@ async function runParallel(
             turns: startTurn,
           });
           messages.push({ role: "user", content: note });
-          conv.write("user", { turn: `${code}:${startTurn}`, content: note });
+          conv.write("user", { branch: 0, turn: `${code}:${startTurn}`, content: note });
+          // fork 分支重建（fork 关闭时为空）：父上下文按 fork_seq 截断，见 records.rebuildBranches
+          if (CFG.fork_enabled) {
+            branches = rec()
+              .loadBranches(code)
+              .map((b) => ({
+                ...b,
+                // cwd 不落盘（可由 workdir 确定性推导）：恢复时重建同一路径，产物不丢
+                cwd: `${getTaskCwd() || taskWorkdir(code)}/branches/${b.id}`,
+              }));
+            for (const b of branches) {
+              b.messages.push({ role: "user", content: note });
+              conv.write("user", { branch: b.id, turn: `${code}:${startTurn}`, content: note });
+            }
+          }
           log(
-            `[${code}] resume segment: ${startTurn} prior turns restored, ` +
+            `[${code}] resume segment: ${startTurn} prior turns restored` +
+              `${branches.length ? `, ${branches.length} branch(es)` : ""}, ` +
               `target=${addr} (was ${oldTarget || "?"})`,
           );
         } else {
@@ -982,11 +1299,15 @@ async function runParallel(
           // A 策略：每轮问一次平台快照缓存（watcher 20s 刷新，零额外 API 调用）——
           // 通关即收束，不等段边界、不等模型自己想起来（b-02 白挂 22 分钟的教训）。
           completionCheck: () => confirmedComplete(code),
+          branches: branches.length ? branches : undefined,
+          taskClass: cls(task),
+          flagTotal: task.flag_count,
         });
         status = r.status;
         last = r.lastContent;
         used = r.turnsUsed;
         messages = r.messages;
+        branches = r.branches;
 
         // 校验平台状态（快照失败重试，避免误判）
         let itemsNow: Challenge[] | null = null;

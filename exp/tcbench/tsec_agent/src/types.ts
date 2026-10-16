@@ -66,6 +66,7 @@ export interface ConvRecord {
   seq: number;
   code: string;
   kind: "system" | "user" | "assistant" | "tool" | "note" | "error";
+  branch?: number; // fork 多分支：0=trunk（缺省视为 0，兼容旧记录）
   started_at: number;
   ended_at: number;
   duration_ms: number;
@@ -78,6 +79,8 @@ export interface ConvRecord {
   arguments?: unknown;
   result?: unknown;
   kind_note?: string;
+  parent_branch?: number; // kind_note=fork_directive 时的父分支
+  fork_seq?: number; // fork 时刻父分支的 conv seq（重建分界）
   error?: string;
   usage?: unknown;
   turn?: string;
