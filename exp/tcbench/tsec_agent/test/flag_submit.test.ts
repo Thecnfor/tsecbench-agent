@@ -9,7 +9,12 @@ import { FlagLedger } from "../src/corelog.js";
 import { CLOSING_SUMMARY_PROMPT, FLAG_CONTINUE_NOTE } from "../src/prompt.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
 import { dispatchShell } from "../src/shell_tool.js";
-import { FLAG_SUMMARY_HINT, integrateSubmit, isSubmitCurl } from "../src/submit_flag.js";
+import {
+  FLAG_SUMMARY_HINT_MULTI,
+  FLAG_SUMMARY_HINT_SINGLE,
+  integrateSubmit,
+  isSubmitCurl,
+} from "../src/submit_flag.js";
 import type { ChatMessage, LlmClient } from "../src/types.js";
 
 const SNAP = { ...CFG };
@@ -77,9 +82,15 @@ describe("submitFlag 平台响应集成", () => {
     expect(bad.newFlag).toBe(false);
   });
 
-  it("FLAG_SUMMARY_HINT 要求 ≤120 字总结且不调工具", () => {
-    expect(FLAG_SUMMARY_HINT).toContain("≤120");
-    expect(FLAG_SUMMARY_HINT).toContain("不调用工具");
+  it("两版总结指示：多 flag（压缩+继续）/ 单 flag（即收尾）", () => {
+    expect(FLAG_SUMMARY_HINT_MULTI).toContain("≤120");
+    expect(FLAG_SUMMARY_HINT_MULTI).toContain("不调用工具");
+    expect(FLAG_SUMMARY_HINT_MULTI).toContain("压缩");
+    expect(FLAG_SUMMARY_HINT_MULTI).toContain("继续下一个 flag");
+    expect(FLAG_SUMMARY_HINT_SINGLE).toContain("≤120");
+    expect(FLAG_SUMMARY_HINT_SINGLE).toContain("不调用工具");
+    expect(FLAG_SUMMARY_HINT_SINGLE).toContain("作为本题收尾");
+    expect(FLAG_SUMMARY_HINT_SINGLE).not.toContain("压缩");
   });
 });
 
@@ -213,15 +224,20 @@ describe("多 flag 总结压缩（solveTask 集成）", () => {
     const conv = rec().conversation("t-c1");
     const r = await solveTask(client, "t-c1", "卡", 600, conv, { flagTotal: 1 });
     expect(r.status).toBe("done");
-    // 无继续指令（不压）
+    // 单 flag：同样产出总结（机制一致），但不执行替换——无继续指令、原文保留
+    expect(r.flagSummaryDone).toBe(true);
     expect(r.messages.some((m) => String(m.content ?? "") === FLAG_CONTINUE_NOTE)).toBe(false);
+    expect(r.messages.some((m) => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0)).toBe(
+      true,
+    ); // submit 的过程 assistant 仍在（原文未被替换）
     const convRecs = fs
       .readFileSync(path.join(recdir, "tasks", "t-c1", "conversation.jsonl"), "utf8")
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(0);
-    // 过程完整保留（单 flag 不压缩）
+    expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
+    expect(convRecs.filter((x) => x.kind_note === "flag_continue").length).toBe(0);
+    // 过程完整保留（单 flag 不压缩）；rebuild 仍等价（flag_summary 无 continue 锚 → 原样规则）
     expect(rec().loadMessages("t-c1").length).toBe(r.messages.length);
   });
 });

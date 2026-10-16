@@ -43,7 +43,12 @@ import {
 } from "./prompt.js";
 import { getTaskCwd, setTaskCwd } from "./shell.js";
 import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
-import { FLAG_SUMMARY_HINT, integrateSubmit, SUBMIT_FLAG_TOOL_SCHEMA } from "./submit_flag.js";
+import {
+  FLAG_SUMMARY_HINT_MULTI,
+  FLAG_SUMMARY_HINT_SINGLE,
+  integrateSubmit,
+  SUBMIT_FLAG_TOOL_SCHEMA,
+} from "./submit_flag.js";
 
 export { getTaskCwd, setTaskCwd };
 
@@ -412,6 +417,7 @@ export interface SolveResult {
   turnsUsed: number;
   messages: ChatMessage[];
   branches: BranchLite[]; // fork 模式的跨段分支状态（disabled 时为空）
+  flagSummaryDone: boolean; // 单 flag 的收尾总结已由 flag_summary 轮产出（worker 跳过 closingSummary）
 }
 
 /** fork/旁观者配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
@@ -478,6 +484,7 @@ export async function solveTask(
   let lastContent = "";
   let turnsUsed = 0;
   let turn = 0;
+  let flagSummaryDone = false; // 单 flag：flag_summary 总结轮已产出收尾（跳过 closingSummary）
   let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
   const nowSec = () => Date.now() / 1000;
 
@@ -575,6 +582,7 @@ export async function solveTask(
     // 取 trunk 当前引用：压缩重写会把 br.messages 换成新数组，旧引用会丢压缩态
     messages: bm.get(0)?.messages ?? messages,
     branches: branchLite(),
+    flagSummaryDone,
   });
 
   // 剪枝：corelog/flag 双停滞 → 回收分支 + 摘要注入 trunk（尾部追加保缓存）
@@ -858,7 +866,6 @@ export async function solveTask(
     // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）。
     // 多 flag 总结轮（submit 后要求的 flag 探索总结）→ kind_note 标记（rebuild 压缩锚之一）。
     const isFlagSummaryTurn =
-      flagTotal > 1 &&
       !toolCallsRaw.length &&
       flagSummariesPending.has(br.id) &&
       !!(msg.content && msg.content.trim());
@@ -893,38 +900,45 @@ export async function solveTask(
     br.messages.push(clean);
 
     if (!toolCallsRaw.length) {
-      // 多 flag 总结轮（submit 后系统要求的该 flag 探索总结）→ 压缩此前过程，继续
+      // 总结轮（submit 后系统要求的该 flag 探索总结）——conv 已标 kind_note=flag_summary
       const pendIdx = flagSummariesPending.get(br.id)?.idx;
-      if (flagTotal > 1 && pendIdx !== undefined && msg.content && msg.content.trim()) {
+      if (pendIdx !== undefined && msg.content && msg.content.trim()) {
         br.flagSummaries.push({ idx: pendIdx, text: msg.content.trim() });
         flagSummariesPending.delete(br.id);
-        // 压缩重写：[system, 任务卡] + 总结链（asst 总结 + 继续指令交替）——
-        // 探索过程段整体丢弃；conv 已记 flag_summary（assistant）与下面的 flag_continue
-        const head = br.messages.slice(0, 2);
-        const chain: ChatMessage[] = [];
-        for (const fs of br.flagSummaries) {
-          chain.push({ role: "assistant", content: fs.text });
-          chain.push({ role: "user", content: FLAG_CONTINUE_NOTE });
+        if (flagTotal > 1) {
+          // 多 flag：压缩重写 = [system, 任务卡] + 总结链（asst 总结 + 继续指令交替）——
+          // 最近一段探索过程被该总结替换，历史总结累积保留；conv 记 flag_continue（压缩锚）
+          const head = br.messages.slice(0, 2);
+          const chain: ChatMessage[] = [];
+          for (const fs of br.flagSummaries) {
+            chain.push({ role: "assistant", content: fs.text });
+            chain.push({ role: "user", content: FLAG_CONTINUE_NOTE });
+          }
+          br.messages = [...head, ...chain];
+          conv.write("user", {
+            branch: br.id,
+            kind_note: "flag_continue",
+            content: FLAG_CONTINUE_NOTE,
+          });
+          rec().event("flag_summary_compacted", {
+            code,
+            branch: br.id,
+            idx: pendIdx,
+            kept: br.flagSummaries.length,
+          });
+          log(
+            `[${code}] flag#${pendIdx} summary recorded; context compacted ` +
+              `(${br.flagSummaries.length} summaries kept, ${br.messages.length} msgs)`,
+          );
+          continue; // 不 park：继续下一个 flag
         }
-        br.messages = [...head, ...chain];
-        conv.write("user", {
-          branch: br.id,
-          kind_note: "flag_continue",
-          content: FLAG_CONTINUE_NOTE,
-        });
-        rec().event("flag_summary_compacted", {
-          code,
-          branch: br.id,
-          idx: pendIdx,
-          kept: br.flagSummaries.length,
-        });
-        log(
-          `[${code}] flag#${pendIdx} summary recorded; context compacted ` +
-            `(${br.flagSummaries.length} summaries kept, ${br.messages.length} msgs)`,
-        );
-        continue; // 不 park：继续下一个 flag
+        // 单 flag：同样产出总结但**不执行替换**（无新内容要接，原文保留），
+        // 该总结即收尾 → flagSummaryDone，worker 跳过 closingSummary（精简版留作兜底）
+        flagSummaryDone = true;
+        log(`[${code}] single-flag closing summary recorded (context kept as-is)`);
+      } else {
+        flagSummariesPending.delete(br.id); // 未按指示输出总结 → 放弃（不纠缠）
       }
-      flagSummariesPending.delete(br.id); // 未按指示输出总结 → 本 flag 放弃压缩（不纠缠）
       if (!multiOn) return finish("done"); // 单分支语义不变：无工具总结 = 本题上下文收束
       // fork 模式：该分支 parked（无收尾权），其他分支继续；全 parked 时循环顶部收束
       bm.park(br.id);
@@ -1024,10 +1038,14 @@ export async function solveTask(
               });
               bm.recordCore(br.id, nowSec());
               log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
-              // 多 flag 且未全部完成 → 要求输出该 flag 探索总结（压缩触发器）
+              // 总结轮触发器（单/多分流）：多 flag 未全齐→总结后压缩继续；
+              // 单 flag→同样产出总结但不替换、即收尾（跳过 closingSummary）
               if (out.totalCount > 1 && out.correctCount < out.totalCount) {
                 flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
-                extra = FLAG_SUMMARY_HINT;
+                extra = FLAG_SUMMARY_HINT_MULTI;
+              } else if (out.totalCount === 1) {
+                flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
+                extra = FLAG_SUMMARY_HINT_SINGLE;
               }
             }
             result = out.result + extra;
@@ -1456,6 +1474,7 @@ async function runParallel(
     const conv = rec().conversation(code);
     let messages: ChatMessage[] | null = null;
     let branches: BranchLite[] = []; // fork 模式跨段分支状态
+    let flagSummaryDone = false; // 单 flag 收尾总结已产出（跳过 closingSummary，精简版作兜底）
     const meta = resumeMeta[code] ?? {};
     let pauses = Number(meta.pauses ?? 0);
     let gives = Number(meta.gives ?? 0);
@@ -1540,6 +1559,7 @@ async function runParallel(
         used = r.turnsUsed;
         messages = r.messages;
         branches = r.branches;
+        flagSummaryDone = r.flagSummaryDone;
 
         // 校验平台状态（快照失败重试，避免误判）
         let itemsNow: Challenge[] | null = null;
@@ -1618,7 +1638,7 @@ async function runParallel(
           }
         }
         running.delete(code); // 槽位从并发计数中摘除——总结期间调度器可开新题
-        if (messages) {
+        if (messages && !flagSummaryDone) {
           closingText = await closingSummary(client, code, messages, conv);
         }
       } else if (["llm_error", "context_overflow", "vpn_abandon", "deadline"].includes(status)) {
