@@ -16,7 +16,7 @@
 | L1 | Staircase Streaming（流式半成品驱动下游） | `solver/gov/stream.py` + `orchestrator/streams.py` | TTFT = flag 产出 → 提交的延迟；下游不等上游整批完成 | 已落地 |
 | L2 | ReActNet（优化拓扑 → 图工程） | `solver/gov/graphplan.py` | planner 自由文本 → 显式 stage 图 + 逐跳 why/how 指令 | 已落地 |
 | L3 | EvoSOP（SOP 生命周期） | `orchestrator/sop.py` | 成功轨迹 → 脱敏 SOP → 记账检索 → 剪枝 | 已落地 |
-| L4 | GraphRAG（TriviumDB / TSNG 三信号） | 接驳位（见 §6） | prior 双图 JSON → 单引擎 `.tdb` | 阻塞，P0 只留接口 |
+| L4 | GraphRAG（TriviumDB / TSNG 三信号） | `orchestrator/memory.py` | prior 双图 JSON → 单引擎 `.tdb` | **已落地**（原「阻塞」记录有误，见 §6.2） |
 | L5 | EVOSTER（在线修复 + 锚定轨迹平衡） | `orchestrator/repair.py` | 失败片信号化 → 有界动作 + 权重演化，不直接放弃 | 已落地 |
 
 不变式（对本文件全篇生效）：BENCHMARK_TOKEN 绝不进 solver 环境

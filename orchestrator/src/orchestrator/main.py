@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from .api import (
 from .config import RuntimeConfig, resolve_config
 from .harvester import harvest, submit_candidates
 from .journal import Journal, score_summary
+from .memory import AttackMemory
 from .registry import ChallengeRecord, Registry
 from .repair import BASE_WEIGHTS, choose_repair, update_weights
 from .scheduler import can_start, eligible, plan_phase, slice_for
@@ -67,6 +69,8 @@ class RunContext:
     repair_notes: dict[str, str] = field(default_factory=dict)  # code → 换面指令
     repair_weights: dict[str, float] = field(default_factory=lambda: dict(BASE_WEIGHTS))
     last_repair: dict[str, str] = field(default_factory=dict)  # code → 上轮修复动作
+    # 攻击图记忆（harness-v2.md §6）：triviumdb 缺失即降级为空操作
+    memory: AttackMemory | None = None
 
 
 # ---------------------------------------------------------------- helpers ----
@@ -198,6 +202,8 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
 
     rec.state = "HARVESTING"
     ctx.priors[code] = _merge_prior(ctx.priors.get(code), collect_prior(ws))
+    if ctx.memory is not None:
+        ctx.memory.record(code, ctx.priors[code])  # 攻击图记忆：单写者=编排器
     candidates = [f for f in harvest(ws) if f not in rec.submitted]
 
     rec.state = "SUBMITTING"
@@ -289,6 +295,11 @@ async def run_agent(
     workspace = (workspace or Path("./workspaces")).resolve()
     journal = Journal(journal_path or (workspace / "journal.jsonl"))
     client = PlatformClient(base_url.rstrip("/"), token, qps=qps)
+    # 攻击图记忆（harness-v2.md §6）：MEMORY_TDB=off 或 triviumdb 缺失 → 空操作降级
+    memory = AttackMemory(
+        workspace / "attack.tdb",
+        enabled=os.environ.get("MEMORY_TDB", "on").strip().lower() != "off",
+    )
     ctx = RunContext(
         config=config,
         client=client,
@@ -298,6 +309,7 @@ async def run_agent(
         solver_cmd=solver_cmd,
         env=env,
         t0=time.time(),
+        memory=memory,
     )
     tasks: set[asyncio.Task] = set()
     reconciled = False
@@ -374,11 +386,13 @@ async def run_agent(
             code: {"state": rec.state, "attempts": rec.attempts}
             for code, rec in sorted(ctx.registry.records.items())
         }
+        summary["memory"] = memory.stats()  # 攻击图记忆：节点数/边数（降级时为 enabled: False）
         journal.append("run_end", **{k: v for k, v in summary.items() if k != "per_challenge"})
         return summary
     finally:
         for task in tasks:
             task.cancel()
+        memory.close()
         journal.close()
 
 

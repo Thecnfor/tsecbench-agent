@@ -209,6 +209,12 @@ wheels = [
 name = "orchestrator"
 version = "0.0.1"
 source = { editable = "orchestrator" }
+dependencies = [
+    { name = "triviumdb" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "triviumdb", specifier = ">=0.8.8,<0.9" }]
 
 [[package]]
 name = "packaging"
@@ -423,6 +429,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
+
+[[package]]
+name = "triviumdb"
+version = "0.8.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/f6/2728948ac43a69608aca46ef0831fec7eb6c0957ff8dc5d29cfc06498688/triviumdb-0.8.8.tar.gz", hash = "sha256:4ea0b79c0dabebf6ae7f30dc2cfaa32dbdba14bad81639e818f0edc9a066780f", size = 1563356, upload-time = "2026-09-10T15:06:22.516Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/94/beb67673db86099efddffedf8d07a0375850e72b60ce1b1a75eb3ae8209c/triviumdb-0.8.8-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:108492f18e9fe23f2b2708648279e03f44b29c52dddc64b1dd11e57ab991bd9a", size = 2811079, upload-time = "2026-09-10T15:06:13.309Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/6c/08b84cf9ef255fe5842dc6889c77c8b8787583083eeaf194a9561f44376b/triviumdb-0.8.8-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:99d728ac07ad2cd5c480945d044b85fd6aa54dff33a2de61a1b8df3a7cc3c98e", size = 2481728, upload-time = "2026-09-10T15:06:14.992Z" },
+    { url = "https://files.pythonhosted.org/packages/88/08/aa6ece6e6797023b8a854a66b447882796f34462a57a61820841244f2209/triviumdb-0.8.8-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2bae6cb8c01c400897cdeb3bb6b386a4f0e700641d0b7c8079a779bfd14db8f3", size = 2862102, upload-time = "2026-09-10T15:06:17.136Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/77/703f36dd9c16b638f9f2e63cbe3f6ea809c62d945d50a9c886ff3eb7b741/triviumdb-0.8.8-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:0186089463c12b5ac9fb1ac20294dbf92fc163367df6d5364a172fc62ad4d96b", size = 2548280, upload-time = "2026-09-10T15:06:19.208Z" },
+    { url = "https://files.pythonhosted.org/packages/21/ae/4d0ca3b64b26865a39d5ce1db5dce8bacbe35fb0eea9d1676ccfcc57f9ea/triviumdb-0.8.8-cp39-abi3-win_amd64.whl", hash = "sha256:1607d42c4b80ea8cf6f8e502ab1b287b498258febde131ec99321ffbd7947674", size = 2756531, upload-time = "2026-09-10T15:06:20.779Z" },
 ]
 
 [[package]]

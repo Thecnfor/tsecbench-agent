@@ -3,7 +3,10 @@ name = "orchestrator"
 version = "0.0.1"
 description = "L0 deterministic orchestrator: platform API, state machine, scheduling, harvest, submit"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # 攻击图记忆层（harness-v2.md §6）。Rust 内核，PyO3 绑定，py3.13/3.14 均可装。
+    "triviumdb>=0.8.8,<0.9",
+]
 
 [build-system]
 requires = ["hatchling"]
