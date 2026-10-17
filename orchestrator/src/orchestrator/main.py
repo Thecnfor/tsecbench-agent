@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -687,6 +688,26 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
 
 
 # ------------------------------------------------------------------ run ----
+def _kill_stale_solvers() -> None:
+    """启动兜底：杀掉上一个编排器留下的 solver（重启竞态会绕过 Makefile 等待）。"""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except OSError:
+            continue
+        if "solver/main.py" not in cmd:
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
 async def run_agent(
     *,
     base_url: str,
@@ -720,6 +741,7 @@ async def run_agent(
         workspace / "attack.tdb",
         enabled=os.environ.get("MEMORY_TDB", "on").strip().lower() != "off",
     )
+    _kill_stale_solvers()
     ctx = RunContext(
         config=config,
         client=client,
