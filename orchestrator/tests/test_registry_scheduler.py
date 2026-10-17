@@ -236,3 +236,15 @@ def test_short_slice_gate_exempts_easy_and_progress():
     assert should_start(rec("t", difficulty="easy"), 80, has_progress=False, gate=True) is True
     assert should_start(rec("t", difficulty="hard"), 80, has_progress=True, gate=True) is True
     assert should_start(rec("t", difficulty="hard"), 80, has_progress=False, gate=False) is True
+
+
+def test_empty_slice_env_falls_back_to_defaults(monkeypatch):
+    import importlib
+
+    import orchestrator.scheduler as scheduler
+
+    monkeypatch.setenv("PHASE1_SLICE_MAX_S", "")
+    monkeypatch.setenv("MIN_USEFUL_SLICE_S", "")
+    reloaded = importlib.reload(scheduler)
+    assert reloaded.PHASE1_SLICE_MAX_S == 420
+    assert reloaded.MIN_USEFUL_SLICE_S == 150

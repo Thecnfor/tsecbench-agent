@@ -26,7 +26,7 @@ SLICE_MAX_S = 1200
 # b-01/b-02/b-03 连续独占 30 分钟，其余 60 题全部排队。压到 420s 后，一个槽位
 # 30 分钟能周转 ~4 题。Phase 2 深挖不受此限（用 SLICE_MAX_S）。
 # 可经 PHASE1_SLICE_MAX_S 覆盖：短窗口/追分阶段压到 180s，先扫完简单题。
-PHASE1_SLICE_MAX_S = int(os.environ.get("PHASE1_SLICE_MAX_S", "420"))
+PHASE1_SLICE_MAX_S = int(os.environ.get("PHASE1_SLICE_MAX_S") or "420")
 
 # 时间片按剩余分数加权（§4.3 修订）：多阶段高分题（b-01 1200 / b-02 1800）
 # 与 200 分单题拿同样的片，实测 300s 下必死 —— 用 sqrt 缩放，避免 1800 分题
@@ -44,7 +44,7 @@ _MULTI_FLAG_COST = 1.5
 
 _ATTEMPT_PENALTY = 0.75  # 每次失败尝试的成本放大系数
 
-MIN_USEFUL_SLICE_S = float(os.environ.get("MIN_USEFUL_SLICE_S", "150"))
+MIN_USEFUL_SLICE_S = float(os.environ.get("MIN_USEFUL_SLICE_S") or "150")
 SHORT_SLICE_GATE = os.environ.get("SHORT_SLICE_GATE", "on").strip().lower() in (
     "1",
     "on",
