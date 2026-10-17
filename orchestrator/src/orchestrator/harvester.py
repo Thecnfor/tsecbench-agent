@@ -49,6 +49,8 @@ def _is_plausible(flag: str) -> bool:
         return False
     if "<" in body or ">" in body:
         return False
+    if any(ch in body for ch in "[]^()|\\*+?"):
+        return False
     return not set(body) <= set(".*-_ ")
 
 

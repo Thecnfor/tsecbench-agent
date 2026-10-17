@@ -148,5 +148,5 @@ def test_extract_rejects_code_identifier_prefixes():
 
 
 def test_extract_rejects_placeholder_flags():
-    text = "FLAG{...} FLAG{<flag>} FLAG{xxx} flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
+    text = "FLAG{...} FLAG{<flag>} FLAG{xxx} FLAG{[^} flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
     assert extract_flags(text) == ["flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"]

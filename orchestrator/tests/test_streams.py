@@ -78,8 +78,10 @@ def test_early_harvest_submits_before_solver_exits(tmp_path):
     assert client.submitted == ["FLAG{early}"]
     assert "FLAG{early}" in rec.submitted
     assert outcome.exit_code == 0 and not outcome.timed_out
+    assert outcome.duration_s < 0.9  # early stop must not wait for the fake 1.0s sleep
     events = [json.loads(ln) for ln in (tmp_path / "journal.jsonl").read_text().splitlines()]
     assert any(e["event"] == "early_submit" and e["new_matches"] == 1 for e in events)
+    assert any(e["event"] == "early_stop" for e in events)
 
 
 def test_no_new_candidates_no_early_submit(tmp_path):

@@ -1122,6 +1122,9 @@ def is_plausible_flag(flag: str) -> bool:
         return False
     if "<" in body or ">" in body:
         return False
+    # 正则/代码片段（如 flag{[^}）不是 flag
+    if any(ch in body for ch in "[]^()|\\*+?"):
+        return False
     return not set(body) <= set(".*-_ ")
 
 

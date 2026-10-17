@@ -154,6 +154,27 @@ async def run_solver_with_stream(
                 journal.append(
                     "early_submit", unique_code=unique_code, new_matches=report.new_matches
                 )
+                # 单 flag 题一旦命中就立即停 solver，释放槽；多 flag 继续找剩余。
+                if report.completed or rec.flag_count == 1:
+                    solver_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await solver_task
+                    journal.append(
+                        "early_stop",
+                        unique_code=unique_code,
+                        elapsed_s=round(time.monotonic() - started, 1),
+                    )
+                    return (
+                        SolverOutcome(
+                            exit_code=0,
+                            timed_out=False,
+                            duration_s=time.monotonic() - started,
+                            stdout_path=ws / "stdout.log",
+                            stderr_path=ws / "stderr.log",
+                        ),
+                        early_new,
+                        True,
+                    )
     except BaseException:
         # 提交异常（WAF/网络）不能让 solver 成为孤儿：取消并等待其清理进程组。
         solver_task.cancel()
