@@ -302,3 +302,21 @@ def test_main_recovers_from_context_overflow_instead_of_spinning(common, monkeyp
         for line in (tmp_path / "out" / "context.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert any(event.get("compaction") == "emergency" for event in events)
+
+
+def test_capped_tool_arguments_remain_valid_json(common):
+    huge = json.dumps({"command": "x" * 200000})
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "run_command", "arguments": huge},
+            }
+        ],
+    }
+    capped = common._cap_message(message, 1000)
+    parsed = json.loads(capped["tool_calls"][0]["function"]["arguments"])
+    assert parsed.get("_elided") is True

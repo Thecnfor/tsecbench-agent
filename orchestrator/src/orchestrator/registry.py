@@ -54,6 +54,7 @@ class ChallengeRecord:
     locked: bool = False  # 收到过 403
     attempts: int = 0
     submitted: set[str] = field(default_factory=set)  # 已提交过的候选
+    rejected_candidates: int = 0  # 平台判错的候选数（诱饵/错误 flag）
     matched_indices: set[int] = field(default_factory=set)
     active_since_reconcile: bool = False  # 本地认为该题容器活跃
     # 本地修复记账（EVOSTER，harness-v2.md §5；平台读不回来，不在对账路径）

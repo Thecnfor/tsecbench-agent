@@ -52,6 +52,12 @@ REASONER_MODEL = os.environ.get("SOLVER_REASONER_MODEL", "deepseek-reasoner")
 # reasoner 每轮 ~12s（chat ~4-5s）：短片里只会拿到 20-25 轮，实测反而更慢。
 # 只在长片（Phase 2 深挖）启用；短片/首片保持 chat。
 REASONER_MIN_SLICE_S = float(os.environ.get("REASONER_MIN_SLICE_S", "600"))
+
+REJECTION_NOTE = (
+    "A flag candidate from the previous attempt was REJECTED by the platform "
+    "(likely a decoy). Do not resubmit it or trust obvious flag locations; "
+    "re-verify the exploit chain and the true flag source."
+)
 LIST_FAIL_LIMIT = 3  # list 连续失败达此数才全局停机（瞬时 409/404 不再一击致命）
 # 等 available 的轮询退避（§4.1 修订）。原先固定 0.2s：3 个 pipeline 同时轮询 =
 # 15 req/s 需求，而全局令牌桶只有 3 req/s —— 轮询把桶吃满，submit/close 排在
@@ -262,6 +268,9 @@ def _is_new_endpoint(value: str, endpoints: set, hosts: set) -> bool:
     host, port = _endpoint_of(value)
     if not host:
         return False
+    # 目标只给了 host 时，该 host 任何端口都算“目标回显”，不是新信息。
+    if (host, None) in endpoints:
+        return False
     if port is not None:
         return (host, port) not in endpoints
     return host not in hosts
@@ -359,6 +368,7 @@ async def _salvage_candidates(ctx: RunContext, rec: ChallengeRecord, ws: Path, c
 async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     rec = ctx.registry.records[code]
     rec.attempts += 1
+    rejected_before = rec.rejected_candidates
     rec.state = "STARTING"
     try:
         await ctx.client.start(code)
@@ -533,6 +543,15 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
 
     rec.state = "SUBMITTING"
     report = await submit_candidates(ctx.client, rec, candidates)
+    if report.new_matches or report.rejected or report.duplicates:
+        ctx.journal.append(
+            "submit_result",
+            unique_code=code,
+            matched=report.new_matches,
+            rejected=report.rejected,
+            duplicates=report.duplicates,
+            source="final",
+        )
     if report.task_ended:
         # 单题 submit 撞 409/404 ≠ 全场结束（与 start 同类：对已停容器提交
         # 也会 409）。降级为关题重排队；token 真死由下一轮 _safe_list 兜底。
@@ -590,6 +609,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         rec.next_slice_s = repair.next_slice_s
     if repair.note and repair.action == "recompile":
         ctx.repair_notes[code] = repair.note
+    if rec.rejected_candidates > rejected_before:
+        ctx.repair_notes[code] = (ctx.repair_notes.get(code, "") + " " + REJECTION_NOTE).strip()
     rec.state = "RETRY"
     await _safe_close(ctx, rec)
     rec.state = "QUEUED"  # 按修复计划重投（换策略/更大时间片）

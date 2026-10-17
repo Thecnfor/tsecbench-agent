@@ -98,6 +98,7 @@ def test_rejected_candidate_is_not_resubmitted():
     rejecting = RejectingClient()
     report = asyncio.run(submit_candidates(rejecting, rec, ["body{color:red}"]))
     assert report.rejected == 1
+    assert rec.rejected_candidates == 1
     assert "body{color:red}" in rec.submitted
     assert [f for f in ["body{color:red}"] if f not in rec.submitted] == []
 

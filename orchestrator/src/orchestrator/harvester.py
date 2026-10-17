@@ -141,6 +141,7 @@ async def submit_candidates(
             continue
         except FlagRejected:
             report.rejected += 1
+            rec.rejected_candidates += 1
             rec.submitted.add(flag)  # 失败也是终态；否则 45s 后会重复投递
             continue
         except TaskEnded:

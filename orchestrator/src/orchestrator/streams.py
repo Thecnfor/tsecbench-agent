@@ -60,6 +60,15 @@ async def run_solver_with_stream(
             if not candidates:
                 continue
             report = await submit_candidates(client, rec, candidates)
+            if report.new_matches or report.rejected or report.duplicates:
+                journal.append(
+                    "submit_result",
+                    unique_code=unique_code,
+                    matched=report.new_matches,
+                    rejected=report.rejected,
+                    duplicates=report.duplicates,
+                    source="stream",
+                )
             early_completed = early_completed or report.completed
             if report.new_matches:
                 early_new += report.new_matches

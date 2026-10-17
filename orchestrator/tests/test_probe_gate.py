@@ -78,3 +78,8 @@ def test_missing_prior_and_flags_dir_is_not_progress(tmp_path):
     ws = tmp_path / "bare"
     ws.mkdir()
     assert _slice_has_progress(ws) is False
+
+
+def test_host_only_target_any_port_is_not_progress(tmp_path):
+    ws = _workspace(tmp_path, prior={"assets": ["10.0.0.5:80"]}, targets=("10.0.0.5",))
+    assert _slice_has_progress(ws) is False

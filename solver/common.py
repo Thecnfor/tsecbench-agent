@@ -461,6 +461,7 @@ def _kb_query(text: str, fingerprint: str = "") -> str:
 
 
 _AUTO_PROBED: set[str] = set()
+_AUTO_PROBED_LOCK = threading.Lock()
 
 
 def _with_kb(result: dict) -> dict:
@@ -482,8 +483,12 @@ def _with_kb(result: dict) -> dict:
             remaining = remaining_seconds()
             if remaining is not None and remaining < 5:
                 probes = []
-            if probes and playbook["id"] not in _AUTO_PROBED:
-                _AUTO_PROBED.add(playbook["id"])
+            if probes:
+                with _AUTO_PROBED_LOCK:
+                    should_probe = playbook["id"] not in _AUTO_PROBED
+                    if should_probe:
+                        _AUTO_PROBED.add(playbook["id"])
+            if probes and should_probe:
                 total_budget = 24 if remaining is None else max(2, min(24, int(remaining / 3)))
                 per_probe = max(2, min(6, total_budget // max(1, len(probes))))
                 deadline = time.time() + total_budget
@@ -758,6 +763,13 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
+def _cap_arguments(raw: str, max_tokens: int) -> str:
+    """参数超限时替换为合法 JSON 占位；截断原字符串会把历史 tool_call 变成坏 JSON。"""
+    if estimate_tokens(raw) <= max_tokens:
+        return raw
+    return json.dumps({"_elided": True, "reason": "context budget"})
+
+
 def _cap_message(message: dict, max_tokens: int) -> dict:
     out = dict(message)
     if out.get("content"):
@@ -770,7 +782,7 @@ def _cap_message(message: dict, max_tokens: int) -> dict:
             call = dict(call)
             function = dict(call.get("function") or {})
             if function.get("arguments"):
-                function["arguments"] = _truncate_to_tokens(str(function["arguments"]), per_call)
+                function["arguments"] = _cap_arguments(str(function["arguments"]), per_call)
             call["function"] = function
             capped.append(call)
         out["tool_calls"] = capped
@@ -945,7 +957,22 @@ def _write_spill(text: str, label: str) -> Path:
     name = f"{os.getpid()}-{int(time.time())}-{next(_SPILL_SEQ):03d}-{safe}.log"
     path = _spill_dir() / name
     path.write_text(text, encoding="utf-8", errors="replace")
+    _prune_spills(path.parent)
     return path
+
+
+def _prune_spills(base: Path, max_files: int = 200, max_bytes: int = 200 * 1024 * 1024) -> None:
+    """限制 out/tool_outputs 体积：保留最新文件，删最旧。"""
+    try:
+        files = sorted(base.glob("*.log"), key=lambda item: item.stat().st_mtime)
+        total = sum(item.stat().st_size for item in files)
+    except OSError:
+        return
+    while files and (len(files) > max_files or (total > max_bytes and len(files) > 1)):
+        old = files.pop(0)
+        with contextlib.suppress(OSError):
+            total -= old.stat().st_size
+            old.unlink()
 
 
 def prepare_tool_output(
