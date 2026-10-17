@@ -177,6 +177,7 @@ def main() -> int:
     factless_turns = 0
     last_fact_turn = 0
     fact_nudged = False
+    no_fact_nudges = 0
     turn = 0
 
     while turn < common.turn_limit() and time.time() < deadline:
@@ -324,6 +325,13 @@ def main() -> int:
             factless_turns += 1
         if factless_turns >= common.NO_FACT_NUDGE_TURNS and not fact_nudged:
             fact_nudged = True
+            no_fact_nudges += 1
+            if no_fact_nudges >= common.MAX_NO_FACT_NUDGES and not common._reported:
+                print(
+                    f"[solver] second no-fact window ({factless_turns} turns); stopping",
+                    flush=True,
+                )
+                break
             print(
                 f"[solver] no new facts for {factless_turns} turns; switching surface",
                 flush=True,
@@ -339,6 +347,9 @@ def main() -> int:
                     ),
                 }
             )
+        if turn >= common.MAX_TURNS_NO_FLAG and not common._reported:
+            print(f"[solver] turn cap without flag ({turn}); stopping", flush=True)
+            break
         if turn - last_fact_turn >= common.STALE_HARD_TURNS and not common._reported:
             print(
                 f"[solver] stale surface for {turn - last_fact_turn} turns; stopping",

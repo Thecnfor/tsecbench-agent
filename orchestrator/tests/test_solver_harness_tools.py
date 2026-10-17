@@ -194,3 +194,9 @@ def test_recon_attaches_fast_path(common, monkeypatch):
     monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
     out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
     assert "# FAST PATH" in out["fast_path"]
+
+
+def test_no_fact_guard_constants(common):
+    assert common.NO_FACT_NUDGE_TURNS >= 8
+    assert common.MAX_NO_FACT_NUDGES >= 2
+    assert common.MAX_TURNS_NO_FLAG >= 30

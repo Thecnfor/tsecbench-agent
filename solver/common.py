@@ -62,6 +62,8 @@ MAX_PLAIN_NUDGES = int(cfg("SOLVER_MAX_PLAIN_NUDGES", "6"))
 # 收敛守卫：连续多少轮没有新资产/凭据/端点就提示换面；多少轮无新事实直接收尾。
 NO_FACT_NUDGE_TURNS = int(cfg("SOLVER_NO_FACT_NUDGE_TURNS", "8"))
 STALE_HARD_TURNS = int(cfg("SOLVER_STALE_HARD_TURNS", "30"))
+MAX_NO_FACT_NUDGES = int(cfg("SOLVER_MAX_NO_FACT_NUDGES", "2"))
+MAX_TURNS_NO_FLAG = int(cfg("SOLVER_MAX_TURNS_NO_FLAG", "45"))
 
 
 def effective_command_timeout(
@@ -270,11 +272,20 @@ def build_tool_specs() -> list[dict]:
     ]
 
 
+def _kb_query(text: str, fingerprint: str = "") -> str:
+    """题面 + 指纹 + 产品名扩展（Dify/HugeGraph/S3/Lambda …）。"""
+    try:
+        from kb.query import build_query
+
+        return build_query(text, fingerprint)
+    except Exception:  # noqa: BLE001 - 扩展失败退回原始拼接
+        return f"{text} {fingerprint}".strip()
+
+
 def _with_kb(result: dict) -> dict:
     """recon 结果附带离线 KB 命中与 FAST PATH：把「发现指纹 → 第一批动作」压到同一回合。"""
-    query = " ".join(
-        [str(TASK.get("description") or ""), json.dumps(result, ensure_ascii=False)[:1500]]
-    ).strip()
+    fingerprint = json.dumps(result, ensure_ascii=False)[:1500]
+    query = _kb_query(str(TASK.get("description") or ""), fingerprint)
     hits = kb_snippets(query, top_k=2)
     if hits:
         result["kb"] = hits[:4000]
@@ -653,7 +664,11 @@ def setup_orch_mode() -> None:
     # 启动期知识注入：main.py 是线上入口，不像 dual_main 有 profile/skills 层；
     # 先把与题面最相关的离线 KB 片段直接放进 prompt，减少「盲目 curl」。
     knowledge = kb_snippets(
-        " ".join(str(x) for x in (task.get("description") or "", *targets)), top_k=2
+        _kb_query(
+            str(task.get("description") or ""),
+            " ".join(str(target) for target in targets),
+        ),
+        top_k=2,
     )
     if knowledge:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" + knowledge).strip()
