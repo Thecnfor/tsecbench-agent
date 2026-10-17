@@ -11,7 +11,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { type BranchCfg, type BranchLite, BranchManager } from "./branch.js";
+import { type BranchCfg, type BranchLite, BranchManager, type BranchState } from "./branch.js";
 import {
   afterForkMaterialized,
   BRANCH_TOOL_NAMES,
@@ -34,7 +34,8 @@ import { CFG, env, resolveAsync } from "./config.js";
 import { extractFlagIndex, FlagLedger, readCorelog } from "./corelog.js";
 import {
   CLOSING_SUMMARY_PROMPT,
-  FLAG_CONTINUE_NOTE,
+  COMPACT_NOTE,
+  COMPACTION_PROMPT,
   fill,
   formatTaskCard,
   GIVEUP_NOTE,
@@ -44,7 +45,6 @@ import {
 import { getTaskCwd, setTaskCwd } from "./shell.js";
 import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
 import {
-  FLAG_SUMMARY_HINT_MULTI,
   FLAG_SUMMARY_HINT_SINGLE,
   integrateSubmit,
   SUBMIT_FLAG_TOOL_SCHEMA,
@@ -65,7 +65,7 @@ import {
   setStopCheck,
   tryReauth,
 } from "./llm.js";
-import { initRecords, RECORDS_DIR, type RunRecords, readFlagSummaries, rec } from "./records.js";
+import { initRecords, RECORDS_DIR, type RunRecords, rec } from "./records.js";
 import type { Challenge, ChatMessage, ChatResponse, ContentPart, LlmClient } from "./types.js";
 
 // 日志落记录根目录（容器=/work）：曾相对 cwd 写 → cwd=/agent 时经挂载暴露给模型
@@ -526,14 +526,9 @@ export async function solveTask(
   const ledger = new FlagLedger();
   const flagTotal = opts.flagTotal ?? 0;
   if (flagTotal) ledger.setTotal(flagTotal);
-  // 多 flag 压缩：pending 总结轮（branchId→flag_index）+ 段启动从 conv 恢复总结链
+  // 单 flag 收尾总结轮（branchId→flag_index+设置轮次）；多 flag 不再逐 flag 总结——
+  // 上下文压缩由 maybeCompact 按阈值自动触发（与 flag 无关，单/多 flag 同机制）
   const flagSummariesPending = new Map<number, { idx: number; turn: number }>();
-  if (flagTotal > 1) {
-    for (const [bid, list] of readFlagSummaries(conv.path)) {
-      const br = bm.get(bid);
-      if (br && !br.flagSummaries.length) br.flagSummaries = list;
-    }
-  }
   const taskClass = opts.taskClass ?? "short";
   const stallSec = taskClass === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
   // 思考档位分档：短题 low 省 thinking（实测占成本 37-69%），长题不发=模型默认档；
@@ -747,6 +742,62 @@ export async function solveTask(
     );
   };
 
+  /** 通用上下文压缩（与 flag 无关，单/多 flag 同机制）：超 AGENT_COMPACT_CHARS 阈值时
+   *  把该分支此前过程压缩为**交接文档**（已确认事实原值/产物文件清单/死路/进度）并整体
+   *  替换——治两类实测断层：①逐 flag 总结 120 字太瘦，压缩后要重新信息收集；
+   *  ② shell 产物（workdir 文件）无人交接。文档同步落 corelog 当【压缩交接】卡
+   *  （压缩点 = 强制采集点，顺带治"对话大量信息不进黑板"）。失败退避 3 轮重试。 */
+  const compactFailedAt = new Map<number, number>();
+  const maybeCompact = async (br: BranchState): Promise<boolean> => {
+    const limit = CFG.compact_chars;
+    if (limit <= 0) return false;
+    const before = estMsgChars(br.messages);
+    if (before < limit) return false;
+    if (turn - (compactFailedAt.get(br.id) ?? -99) < 3) return false;
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), Math.max(CFG.summary_timeout_sec, 60) * 1000);
+      let doc = "";
+      try {
+        const resp = await callLlm(
+          client,
+          [...br.messages, { role: "user", content: COMPACTION_PROMPT }],
+          false,
+          { signal: ac.signal, thinking: { type: "disabled" } },
+        );
+        doc = (resp.choices?.[0]?.message?.content ?? "").trim();
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!doc) return false;
+      const head = br.messages.slice(0, 2); // system + 任务卡
+      const injected = fill(COMPACT_NOTE, { summary: doc });
+      br.messages = [...head, { role: "user", content: injected }];
+      // conv 记录 = 实际注入的全文（重建三方同文 + 对话忠诚不变量）；corelog 卡存原文
+      conv.write("user", {
+        branch: br.id,
+        kind_note: "context_compact",
+        content: injected,
+        turn: `${code}:${turn}`,
+      });
+      corelog?.write({ branch: br.id, kind: "core", note: `【压缩交接】${doc}` });
+      rec().event("context_compacted", {
+        code,
+        branch: br.id,
+        beforeChars: before,
+        afterChars: estMsgChars(br.messages),
+      });
+      log(
+        `[${code}] branch ${br.id} compacted: ${before} -> ${estMsgChars(br.messages)} chars (turn ${turn})`,
+      );
+      return true;
+    } catch (e) {
+      compactFailedAt.set(br.id, turn);
+      log(`[${code}] compaction failed (branch ${br.id}): ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+  };
+
   while (true) {
     if (STOP) return finish("stopped");
     // A 策略：每轮开头查通关（watcher 缓存）——平台已确认满 flag 就立刻收束，
@@ -811,6 +862,7 @@ export async function solveTask(
       log(`[${code}] all branches parked (turn ${turn}); closing segment`);
       return finish("done");
     }
+    await maybeCompact(br); // 超阈值先压缩交接再发本轮请求（失败退避不阻塞）
 
     turn++;
     const roundsAtTurnStart = br.roundsSinceCore; // core_log 轮计数基准（轮末比较用）
@@ -899,40 +951,11 @@ export async function solveTask(
     br.messages.push(clean);
 
     if (!toolCallsRaw.length) {
-      // 总结轮（submit 后系统要求的该 flag 探索总结）——conv 已标 kind_note=flag_summary
+      // 单 flag 收尾总结轮（submit 后系统要求的探索总结）：**不执行替换**（原文保留），
+      // 该总结即收尾 → flagSummaryDone，worker 跳过 closingSummary（精简版留作兜底）
       const pendIdx = flagSummariesPending.get(br.id)?.idx;
       if (pendIdx !== undefined && msg.content?.trim()) {
-        br.flagSummaries.push({ idx: pendIdx, text: msg.content.trim() });
         flagSummariesPending.delete(br.id);
-        if (flagTotal > 1) {
-          // 多 flag：压缩重写 = [system, 任务卡] + 总结链（asst 总结 + 继续指令交替）——
-          // 最近一段探索过程被该总结替换，历史总结累积保留；conv 记 flag_continue（压缩锚）
-          const head = br.messages.slice(0, 2);
-          const chain: ChatMessage[] = [];
-          for (const fs of br.flagSummaries) {
-            chain.push({ role: "assistant", content: fs.text });
-            chain.push({ role: "user", content: FLAG_CONTINUE_NOTE });
-          }
-          br.messages = [...head, ...chain];
-          conv.write("user", {
-            branch: br.id,
-            kind_note: "flag_continue",
-            content: FLAG_CONTINUE_NOTE,
-          });
-          rec().event("flag_summary_compacted", {
-            code,
-            branch: br.id,
-            idx: pendIdx,
-            kept: br.flagSummaries.length,
-          });
-          log(
-            `[${code}] flag#${pendIdx} summary recorded; context compacted ` +
-              `(${br.flagSummaries.length} summaries kept, ${br.messages.length} msgs)`,
-          );
-          continue; // 不 park：继续下一个 flag
-        }
-        // 单 flag：同样产出总结但**不执行替换**（无新内容要接，原文保留），
-        // 该总结即收尾 → flagSummaryDone，worker 跳过 closingSummary（精简版留作兜底）
         flagSummaryDone = true;
         log(`[${code}] single-flag closing summary recorded (context kept as-is)`);
       } else {
@@ -1111,12 +1134,9 @@ export async function solveTask(
             });
             bm.recordCore(br.id, nowSec());
             log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
-            // 总结轮触发器（单/多分流）：多 flag 未全齐→总结后压缩继续；
-            // 单 flag→同样产出总结但不替换、即收尾（跳过 closingSummary）
-            if (out.totalCount > 1 && out.correctCount < out.totalCount) {
-              flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
-              extra = FLAG_SUMMARY_HINT_MULTI;
-            } else if (out.totalCount === 1) {
+            // 单 flag：要求收尾总结（总结即收尾，跳过 closingSummary）；多 flag 不再
+            // 逐 flag 总结——上下文压缩是系统自动的（maybeCompact，交接文档形式）
+            if (out.totalCount === 1) {
               flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
               extra = FLAG_SUMMARY_HINT_SINGLE;
             }
@@ -1444,6 +1464,16 @@ function taskWorkdir(code: string): string {
   const d = path.join(base, code);
   fs.mkdirSync(d, { recursive: true });
   return d;
+}
+
+/** 消息序列的字符估算（压缩阈值判定用；content 与 tool_calls 参数都计入）。 */
+function estMsgChars(msgs: ChatMessage[]): number {
+  let n = 0;
+  for (const m of msgs) {
+    n += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content ?? "").length;
+    if (m.tool_calls) n += JSON.stringify(m.tool_calls).length;
+  }
+  return n;
 }
 
 /** 并行调度器：并发解多题，自动扩容直到平台拒绝（max active）。 */

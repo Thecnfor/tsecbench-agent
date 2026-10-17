@@ -153,53 +153,25 @@ export function rebuildMessages(
   return recordsToMessages(applyCompactFilter(filtered, true));
 }
 
-/** 多 flag 压缩锚过滤：保留头（system+card，keepHead）∪ 全部 flag_summary/
- * flag_continue ∪ 最后一条 flag_continue 之后的过程记录——与运行时「head+总结链+继续」
- * 的压缩重写等价（多 flag 分段压缩的重建规则）。无压缩记录（单 flag/未压缩）原样返回，
+/** 压缩锚过滤：保留头（system+card，keepHead）∪ **最后一条**压缩锚记录
+ * （context_compact 交接文档；旧记录 flag_continue 兼容）∪ 锚之后的过程记录——
+ * 与运行时「每次压缩整体替换为最新交接文档」等价（只有最新文档留在上下文里，
+ * 更早的压缩记录随替换丢弃，重建同理）。无压缩记录（未超阈值）原样返回，
  * 既有行为零变化。 */
 export function applyCompactFilter(recs: ConvRecord[], keepHead: boolean): ConvRecord[] {
-  const lastCont = recs.reduce(
-    (m, r) => (r.kind_note === "flag_continue" ? Math.max(m, Number(r.seq)) : m),
-    -1,
-  );
-  if (lastCont < 0) return recs; // 未压缩 → 原样
+  let lastAnchor = -1;
+  for (const r of recs) {
+    if (r.kind_note === "context_compact" || r.kind_note === "flag_continue") {
+      lastAnchor = Math.max(lastAnchor, Number(r.seq));
+    }
+  }
+  if (lastAnchor < 0) return recs; // 未压缩 → 原样
   return recs.filter(
     (r, i) =>
       (keepHead && i <= 1) ||
-      r.kind_note === "flag_summary" ||
-      r.kind_note === "flag_continue" ||
-      Number(r.seq) > lastCont,
+      (r.kind_note === "context_compact" && Number(r.seq) >= lastAnchor) ||
+      Number(r.seq) > lastAnchor,
   );
-}
-
-/** 从 conv 解析各分支的 flag 总结链（段启动时恢复压缩素材，多 flag 才需要）。 */
-export function readFlagSummaries(file: string): Map<number, Array<{ idx: number; text: string }>> {
-  const out = new Map<number, Array<{ idx: number; text: string }>>();
-  let lines: string[];
-  try {
-    lines = fs.readFileSync(file, "utf8").split("\n");
-  } catch {
-    return out;
-  }
-  for (const l of lines) {
-    if (!l.trim()) continue;
-    try {
-      const r = JSON.parse(l) as ConvRecord;
-      if (
-        r.kind === "assistant" &&
-        r.kind_note === "flag_summary" &&
-        typeof r.output === "string"
-      ) {
-        const bid = Number(r.branch ?? 0);
-        const list = out.get(bid) ?? [];
-        list.push({ idx: Number(r.flag_index ?? -1), text: r.output });
-        out.set(bid, list);
-      }
-    } catch {
-      /* skip */
-    }
-  }
-  return out;
 }
 
 /** 纯函数：记录列表 → 消息序列（role 映射 + 孤儿过滤 + 配对校验）。 */

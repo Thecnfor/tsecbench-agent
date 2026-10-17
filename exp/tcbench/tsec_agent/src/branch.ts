@@ -40,8 +40,6 @@ export interface BranchState {
   recentHardFails: boolean[]; // 最近 shell 结果是否「连接/解析/命令缺失」类硬失败（信号④）
   wrongSubmits: number; // 连续 correct:false 次数（信号⑤ 幻觉提交）
   roundsSinceCore: number; // 连续无 core_log/flag 的轮数（轮级轻推信号）
-  /** 多 flag 压缩素材（flag_summary 轮累积）：压缩重写 = head + 这条链 + 继续指令 */
-  flagSummaries: Array<{ idx: number; text: string }>;
   nudgesUsed: number; // 本段 core_log 轻推次数
 }
 
@@ -103,7 +101,6 @@ export class BranchManager {
       recentHardFails: [],
       wrongSubmits: 0,
       roundsSinceCore: 0,
-      flagSummaries: [],
       nudgesUsed: 0,
     });
   }
@@ -130,7 +127,6 @@ export class BranchManager {
         recentHardFails: [],
         wrongSubmits: 0,
         roundsSinceCore: 0,
-        flagSummaries: [],
         nudgesUsed: 0,
       });
       this.nextId = Math.max(this.nextId, st.id + 1);
@@ -237,7 +233,6 @@ export class BranchManager {
       recentHardFails: [],
       wrongSubmits: 0,
       roundsSinceCore: 0,
-      flagSummaries: [],
       nudgesUsed: 0,
     };
     this.branches.set(id, branch);

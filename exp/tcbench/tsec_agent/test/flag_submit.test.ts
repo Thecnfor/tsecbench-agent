@@ -6,15 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { solveTask } from "../src/agent.js";
 import { CFG } from "../src/config.js";
 import { FlagLedger } from "../src/corelog.js";
-import { CLOSING_SUMMARY_PROMPT, FLAG_CONTINUE_NOTE } from "../src/prompt.js";
+import {
+  CLOSING_SUMMARY_PROMPT,
+  COMPACT_NOTE,
+  COMPACTION_PROMPT,
+  systemPromptWithExtras,
+} from "../src/prompt.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
 import { dispatchShell } from "../src/shell_tool.js";
-import {
-  FLAG_SUMMARY_HINT_MULTI,
-  FLAG_SUMMARY_HINT_SINGLE,
-  integrateSubmit,
-  isSubmitCurl,
-} from "../src/submit_flag.js";
+import { FLAG_SUMMARY_HINT_SINGLE, integrateSubmit, isSubmitCurl } from "../src/submit_flag.js";
 import type { ChatMessage, LlmClient } from "../src/types.js";
 
 const SNAP = { ...CFG };
@@ -82,15 +82,18 @@ describe("submitFlag 平台响应集成", () => {
     expect(bad.newFlag).toBe(false);
   });
 
-  it("两版总结指示：多 flag（压缩+继续）/ 单 flag（即收尾）", () => {
-    expect(FLAG_SUMMARY_HINT_MULTI).toContain("≤120");
-    expect(FLAG_SUMMARY_HINT_MULTI).toContain("不调用工具");
-    expect(FLAG_SUMMARY_HINT_MULTI).toContain("压缩");
-    expect(FLAG_SUMMARY_HINT_MULTI).toContain("继续下一个 flag");
+  it("单 flag 收尾总结指示 + 压缩交接文档要求（治太简略/shell 无交接）", () => {
     expect(FLAG_SUMMARY_HINT_SINGLE).toContain("≤120");
     expect(FLAG_SUMMARY_HINT_SINGLE).toContain("不调用工具");
     expect(FLAG_SUMMARY_HINT_SINGLE).toContain("作为本题收尾");
-    expect(FLAG_SUMMARY_HINT_SINGLE).not.toContain("压缩");
+    // 交接文档五节结构：凭据原值保留 + 产物文件清单 + 死路 + 进度 + flag 进度
+    expect(COMPACTION_PROMPT).toContain("产物与在途");
+    expect(COMPACTION_PROMPT).toContain("未完成的后台 shell");
+    expect(COMPACTION_PROMPT).toContain("生命周期系统自管");
+    expect(COMPACTION_PROMPT).toContain("原值保留");
+    expect(COMPACTION_PROMPT).toContain("已证伪死路");
+    expect(COMPACT_NOTE).toContain("{summary}");
+    expect(COMPACT_NOTE).toContain("不要重新收集");
   });
 });
 
@@ -102,104 +105,115 @@ describe("复盘精简（单 flag 收尾省输出）", () => {
   });
 });
 
-describe("多 flag 总结压缩（solveTask 集成）", () => {
-  /** submit 响应脚本 + 总结轮配合的假 client。 */
-  function scriptedClient(script: Array<(msgs: ChatMessage[], tools: boolean) => any>) {
+describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
+  const readJsonl = (recdir: string, rel: string): Record<string, unknown>[] => {
+    try {
+      return fs
+        .readFileSync(path.join(recdir, rel), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+    } catch {
+      return [];
+    }
+  };
+  /** 按最后一条消息分流：压缩元调用（COMPACTION_PROMPT）→ 交接文档；任务轮 → 脚本序列。 */
+  function makeClient(script: Array<Record<string, unknown>>, compactDoc: string) {
     let i = 0;
     return {
       client: {
         async create(opts: { messages: ChatMessage[]; tools?: unknown[] }) {
-          const r = script[i % script.length];
+          const last = String(opts.messages.at(-1)?.content ?? "");
+          if (last.includes("即将被压缩为一份")) {
+            return { choices: [{ message: { role: "assistant", content: compactDoc } }] };
+          }
+          const r = script[Math.min(i, script.length - 1)];
           i++;
-          return {
-            choices: [{ message: { role: "assistant", ...r(opts.messages, !!opts.tools) } }],
-          };
+          return { choices: [{ message: { role: "assistant", ...r } }] };
         },
       } as LlmClient,
-      calls: () => i,
+      taskCalls: () => i,
     };
   }
+  const COMPACT_DOC =
+    "交接：①已确认凭据 admin:Admin@123（/admin/login.php 登录成功）②产物 " +
+    "/work/tasks/t-c2/ffuf.log（目录爆破结果）③死路：news.php 无注入（intval 判定）" +
+    "④进度：后台已登录待枚举 ⑤flag 进度 0/2";
 
-  it("双 flag：submit→总结轮→压缩→继续→第二 flag→正常收尾；rebuild 等价", async () => {
+  it("多 flag：超阈值自动压缩交接（黑板落卡）+ 最后 flag 响应即收束；rebuild 等价", async () => {
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact_"));
     setRecordsDir(recdir);
     resetRecords();
     initRecords("local", "deepseek-flash");
-    // 平台 API stub：只 submitFlag 走 fetch
-    const submitResp = (idx: number, cnt: number) =>
-      new Response(
-        JSON.stringify({
-          correct: true,
-          matched_flag_index: idx,
-          correct_flag_count: cnt,
-          total_flag_count: 2,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
     let submitN = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
         submitN++;
-        return submitResp(submitN - 1, submitN);
+        return new Response(
+          JSON.stringify({
+            correct: true,
+            matched_flag_index: submitN - 1,
+            correct_flag_count: submitN,
+            total_flag_count: 2,
+          }),
+          { status: 200 },
+        );
       }),
     );
     CFG.benchmark_token = "t";
     CFG.benchmark_base_url = "http://bench.test";
-
-    const { client } = scriptedClient([
-      // 轮1：submit flag#0 → correct 1/2 → 带总结指示
-      () => ({ content: null, tool_calls: [tc("s1", "submit_flag", { flag: "flag{aaa}" })] }),
-      // 轮2：配合输出总结（无 tool）
-      () => ({ content: "走登录注入拿到 flag0：弱口令 admin 注入进后台。" }),
-      // 轮3：submit flag#1 → correct 2/2 → 无总结指示（全部完成）
-      () => ({ content: null, tool_calls: [tc("s2", "submit_flag", { flag: "flag{bbb}" })] }),
-      // 轮4：收尾（无 pending → 普通 park → done）
-      () => ({ content: "两枚 flag 均已提交，收束。" }),
-    ]);
+    // 阈值：系统提示词 + 卡 + 轮1 的 assistant/tool 越线；压缩后（短交接文档）回线内
+    CFG.compact_chars = systemPromptWithExtras(false, false).length + 600;
+    const { client, taskCalls } = makeClient(
+      [
+        // 任务轮 1：shell 长输出推高上下文
+        {
+          content: null,
+          tool_calls: [tc("s1", "shell", { command: `echo "${"x".repeat(700)}"`, wait_ms: 3000 })],
+        },
+        // 任务轮 2：submit flag#0（1/2——多 flag 不再要求逐 flag 总结）
+        { content: null, tool_calls: [tc("s2", "submit_flag", { flag: "flag{aaa}" })] },
+        // 任务轮 3：submit flag#1（2/2）→ 响应即收束（不等模型尾轮）
+        { content: null, tool_calls: [tc("s3", "submit_flag", { flag: "flag{bbb}" })] },
+      ],
+      COMPACT_DOC,
+    );
     const conv = rec().conversation("t-c2");
     const r = await solveTask(client, "t-c2", "卡", 600, conv, { flagTotal: 2 });
-
     expect(r.status).toBe("done");
-    // 立即收束（衔接优化）：最后 flag 的 submit 响应即权威，回合末直接 done——
-    // 模型尾轮（脚本第 4 条）不被消耗，不再等 watcher 缓存
-    expect(r.turnsUsed).toBe(3);
-    expect(r.messages.some((m) => String(m.content ?? "").includes("两枚 flag"))).toBe(false);
-    expect(r.messages[0].role).toBe("system");
-    expect(r.messages.some((m) => String(m.content ?? "") === FLAG_CONTINUE_NOTE)).toBe(true);
-    // 压缩边界：总结 assistant 在头之后、继续指令之前，其后才是轮3 的 submit（tool_calls）
-    const contIdx = r.messages.findIndex((m) => String(m.content ?? "") === FLAG_CONTINUE_NOTE);
-    const sumIdx = r.messages.findIndex(
-      (m, i) =>
-        i >= 2 &&
-        m.role === "assistant" &&
-        !m.tool_calls?.length &&
-        String(m.content ?? "").includes("登录注入"),
+    expect(r.turnsUsed).toBe(3); // 压缩是元调用，不占轮次
+    // 压缩发生：末尾 = [head…, 交接文档, 最后 flag 的 submit, tool]；文档前无过程残留
+    const notes = r.messages.filter((m) =>
+      String(m.content ?? "").startsWith("【系统·上下文压缩】"),
     );
-    expect(sumIdx).toBeGreaterThan(1);
-    expect(contIdx).toBe(sumIdx + 1);
-    const firstToolAssistant = r.messages.findIndex(
-      (m) => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0,
+    expect(notes.length).toBeGreaterThanOrEqual(1);
+    const lastNoteIdx = r.messages.lastIndexOf(notes.at(-1)!);
+    expect(r.messages.slice(0, lastNoteIdx).some((m) => (m.tool_calls?.length ?? 0) > 0)).toBe(
+      false,
+    ); // 压缩点前的过程（轮1 shell）已被替换
+    expect(r.messages.slice(lastNoteIdx + 1).some((m) => (m.tool_calls?.length ?? 0) > 0)).toBe(
+      true,
+    ); // 文档后是最后一次提交
+    // conv 锚 + 提交记录 + corelog【压缩交接】卡（凭据原值不截断）
+    const convRecs = readJsonl(recdir, "tasks/t-c2/conversation.jsonl");
+    expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBeGreaterThanOrEqual(
+      1,
     );
-    expect(firstToolAssistant).toBeGreaterThan(contIdx); // 轮1 的 submit 已被压掉，轮3 的在继续之后
-    // 中间探索过程（轮1 的 submit assistant 不在头部后……）——等价断言走 rebuild
-    const rebuilt = rec().loadMessages("t-c2");
-    expect(rebuilt.map((m) => `${m.role}|${String(m.content ?? "").slice(0, 10)}`)).toEqual(
-      r.messages.map((m) => `${m.role}|${String(m.content ?? "").slice(0, 10)}`),
-    );
-    // conv：flag_summary 恰 1、flag_continue 恰 1（第二 flag 无总结=设计）
-    const convRecs = fs
-      .readFileSync(path.join(recdir, "tasks", "t-c2", "conversation.jsonl"), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
-    expect(convRecs.filter((x) => x.kind_note === "flag_continue").length).toBe(1);
     expect(convRecs.filter((x) => x.kind === "tool" && x.tool === "submit_flag").length).toBe(2);
-    expect(submitN).toBe(2); // 平台只被调了2次（结构化通道）
+    const coreRecs = readJsonl(recdir, "tasks/t-c2/corelog.jsonl");
+    const handoff = coreRecs.filter((x) => String(x.note ?? "").startsWith("【压缩交接】"));
+    expect(handoff.length).toBeGreaterThanOrEqual(1);
+    expect(String(handoff[0].note)).toContain("Admin@123");
+    // 重建等价（锚 = 最后一条 context_compact）
+    const rebuilt = rec().loadMessages("t-c2");
+    expect(rebuilt.map((m) => m.role + "|" + String(m.content ?? "").slice(0, 8))).toEqual(
+      r.messages.map((m) => m.role + "|" + String(m.content ?? "").slice(0, 8)),
+    );
+    expect(submitN).toBe(2);
   });
 
-  it("单 flag：不压（无总结轮/无继续指令），收尾走精简复盘语义", async () => {
+  it("单 flag：默认阈值不压（无交接文档），收尾总结轮照旧", async () => {
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact1_"));
     setRecordsDir(recdir);
     resetRecords();
@@ -221,27 +235,45 @@ describe("多 flag 总结压缩（solveTask 集成）", () => {
     );
     CFG.benchmark_token = "t";
     CFG.benchmark_base_url = "http://bench.test";
-    const { client } = scriptedClient([
-      () => ({ content: null, tool_calls: [tc("s1", "submit_flag", { flag: "flag{single}" })] }),
-      () => ({ content: "注入拿到，收束。" }),
-    ]);
+    // 单 flag 脚本：submit → 收尾总结（无工具）
+    const scripted: LlmClient = {
+      async create(opts: { messages: ChatMessage[]; tools?: unknown[] }) {
+        const last = String(opts.messages.at(-1)?.content ?? "");
+        if (last.includes("即将被压缩为一份")) {
+          throw new Error("单 flag 短上下文不应触发压缩");
+        }
+        const hasSubmitTool = opts.messages.some(
+          (m) =>
+            (m.tool_calls?.length ?? 0) > 0 &&
+            String(m.tool_calls?.[0]?.function?.name) === "submit_flag",
+        );
+        if (!hasSubmitTool) {
+          return {
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [tc("s1", "submit_flag", { flag: "flag{single}" })],
+                },
+              },
+            ],
+          };
+        }
+        return { choices: [{ message: { role: "assistant", content: "注入拿到，收束。" } }] };
+      },
+    } as LlmClient;
     const conv = rec().conversation("t-c1");
-    const r = await solveTask(client, "t-c1", "卡", 600, conv, { flagTotal: 1 });
+    const r = await solveTask(scripted, "t-c1", "卡", 600, conv, { flagTotal: 1 });
     expect(r.status).toBe("done");
-    // 单 flag：同样产出总结（机制一致），但不执行替换——无继续指令、原文保留
     expect(r.flagSummaryDone).toBe(true);
-    expect(r.messages.some((m) => String(m.content ?? "") === FLAG_CONTINUE_NOTE)).toBe(false);
-    expect(r.messages.some((m) => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0)).toBe(
-      true,
-    ); // submit 的过程 assistant 仍在（原文未被替换）
-    const convRecs = fs
-      .readFileSync(path.join(recdir, "tasks", "t-c1", "conversation.jsonl"), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(r.messages.some((m) => String(m.content ?? "").startsWith("【系统·上下文压缩】"))).toBe(
+      false,
+    );
+    const convRecs = readJsonl(recdir, "tasks/t-c1/conversation.jsonl");
+    expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBe(0);
     expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
-    expect(convRecs.filter((x) => x.kind_note === "flag_continue").length).toBe(0);
-    // 过程完整保留（单 flag 不压缩）；rebuild 仍等价（flag_summary 无 continue 锚 → 原样规则）
+    // 过程完整保留（单 flag 短上下文不压缩）
     expect(rec().loadMessages("t-c1").length).toBe(r.messages.length);
   });
 });

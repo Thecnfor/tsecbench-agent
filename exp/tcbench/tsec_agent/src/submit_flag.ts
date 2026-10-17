@@ -65,10 +65,7 @@ export function integrateSubmit(resp: any, ledger: FlagLedger, branchId: number)
   };
 }
 
-/** flag 成功后的总结轮指示（附加在 submit_flag 结果尾）——两版按题型分流：
- * 多 flag：总结用于压缩（原文→总结，累积链）并继续；
- * 单 flag：同样产出总结，但不执行替换（无新内容要接），**该总结即收尾**。 */
-export const FLAG_SUMMARY_HINT_MULTI =
-  "\n【系统】该 flag 已确认。请输出此 flag 的探索总结（≤120 字：走了哪条路径/用什么手法/踩了什么坑），只输出这段总结文字、不调用工具——系统会用它压缩此前的探索上下文并让你继续下一个 flag。";
+/** 单 flag 成功后的收尾总结指示（附加在 submit_flag 结果尾）：这段总结即本题收尾。
+ * 多 flag 不再要求逐 flag 总结——上下文压缩是系统自动的（agent.ts maybeCompact）。 */
 export const FLAG_SUMMARY_HINT_SINGLE =
   "\n【系统】全部 flag 已确认。请输出本题的探索总结（≤120 字：走了哪条路径/用什么手法/踩了什么坑），只输出这段总结文字、不调用工具——它将作为本题收尾。";
