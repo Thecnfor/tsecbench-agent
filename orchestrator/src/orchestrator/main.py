@@ -37,9 +37,17 @@ from .config import RuntimeConfig, resolve_config
 from .harvester import harvest, submit_candidates
 from .journal import Journal, score_summary
 from .memory import AttackMemory
+from .priority_history import expected_seconds
 from .registry import ChallengeRecord, Registry
 from .repair import BASE_WEIGHTS, choose_repair, update_weights
-from .scheduler import can_start, eligible, plan_phase, should_start, slice_for
+from .scheduler import (
+    FAST_RETRY_S,
+    can_start,
+    eligible,
+    plan_phase,
+    should_start,
+    slice_for,
+)
 from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
@@ -503,6 +511,9 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         else:
             remaining_slice = slice_s
             probe_slice = min(PROBE_SLICE_S, remaining_slice)
+            if rec.zero_progress_passes > 0 and expected_seconds(code) <= FAST_RETRY_S:
+                # 快题重试不再只给 60s 试探：给完整片，配合 prior/relay 再试一次。
+                probe_slice = remaining_slice
             early_new, early_completed = 0, False
             outcome = None
             stage = 1

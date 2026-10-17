@@ -32,5 +32,19 @@ def test_zero_progress_allowed_when_nothing_else_is_left():
 
 def test_zero_progress_sorts_after_fresh_even_with_more_score():
     fresh = _rec("a-01", score=100)
-    zero = _rec("a-02", zero=1, score=2000)
+    zero = _rec("a-05", zero=1, score=2000)
     assert priority_key(fresh) < priority_key(zero)
+
+
+def test_fast_zero_retry_allowed_before_fresh_slow():
+    fast_retry = _rec("f1-03", zero=1, score=300)  # history 119s
+    slow_fresh = _rec("b-02", zero=0, score=1800)  # category prior 300s
+    out = eligible({"fast_retry": fast_retry, "slow_fresh": slow_fresh})
+    assert [rec.unique_code for rec in out] == ["f1-03", "b-02"]
+
+
+def test_zero_after_two_passes_sinks():
+    sunk = _rec("f1-03", zero=2, score=300)
+    slow_fresh = _rec("b-02", zero=0, score=1800)
+    out = eligible({"sunk": sunk, "slow_fresh": slow_fresh})
+    assert [rec.unique_code for rec in out] == ["b-02"]
