@@ -66,17 +66,22 @@ export const BROADCAST_TOOL_SCHEMA = {
   function: {
     name: "broadcast",
     description:
-      "Send a one-line message to other branches (tail-appended into their conversations at " +
-      "the next turn). Use for: sharing a discovery they need, warning about a destructive " +
-      "action you are about to take on the shared target (service restarts, port binding, " +
-      "config changes — outside your namespace, keep read-only unless coordinated), or " +
-      "asking for help. Near-duplicate broadcasts are suppressed; rate-limited per segment.",
+      "Send a one-line message (tail-appended into targets' conversations at the next " +
+      "turn). Topology: a non-trunk branch may only send UP to the trunk (branch 0) — " +
+      "lateral/sibling targets are rerouted there, the trunk coordinates redistribution " +
+      "(children never message each other directly); the trunk may broadcast to any branch. " +
+      "Use for: sharing a discovery, warning about a destructive action you are about to " +
+      "take on the shared target (service restarts, port binding, config changes — outside " +
+      "your namespace, keep read-only unless coordinated via trunk), or asking for help. " +
+      "Near-duplicate broadcasts are suppressed; rate-limited per segment.",
     parameters: {
       type: "object",
       properties: {
         note: { type: "string", description: "One line to share." },
         to: {
-          description: 'Targets: "all" (default), "trunk", or an array of branch ids like [0,2].',
+          description:
+            'Targets: "all" (default), "trunk", or an array of branch ids like [0,2]. ' +
+            "For non-trunk senders everything resolves to trunk (0).",
           oneOf: [
             { type: "string", enum: ["all", "trunk"] },
             { type: "array", items: { type: "integer" } },

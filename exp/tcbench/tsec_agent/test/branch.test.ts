@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { type BranchCfg, BranchManager, normalizeNote } from "../src/branch.js";
 import {
+  BYSTANDER_SYSTEM,
   buildBystanderInput,
   bystanderMessage,
   bystanderShouldFire,
@@ -20,6 +21,7 @@ import {
   FlagLedger,
   readCorelog,
 } from "../src/corelog.js";
+import { FORK_PROMPT_EXTRA } from "../src/prompt.js";
 import { rebuildBranches, rebuildMessages } from "../src/records.js";
 import type { ChatMessage } from "../src/types.js";
 
@@ -154,6 +156,36 @@ describe("broadcast", () => {
     expect(bm.broadcast(1, "收到", "trunk", 1100).delivered).toEqual([0]);
     expect(bm.broadcast(1, "hi", [0], 1101).delivered).toEqual([0]);
     expect(bm.broadcast(1, "hi", [99], 1102).ok).toBe(false);
+  });
+
+  it("子分支广播只上行主分支（横向改投 0；主→任意不受限）", () => {
+    const bm = mkBm();
+    const f1 = bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    const f2 = bm.materializeFork(2, 0, "B", 3, 1002, (id) => `/w/br/${id}`);
+    expect(f1?.directive).toContain("只上行给主分支（分支 0）");
+    expect(f2).not.toBeNull();
+    // 子 → "all"：只落主分支，兄弟收不到（星型拓扑）
+    const all = bm.broadcast(1, "全局发现需要扩散", "all", 1100);
+    expect(all.ok).toBe(true);
+    expect(all.delivered).toEqual([0]);
+    expect(all.message).toContain("子分支仅可上行主分支");
+    expect(bm.get(2)!.messages.some((m) => String(m.content ?? "").includes("[分支 1 广播]"))).toBe(
+      false,
+    );
+    expect(bm.get(0)!.messages.at(-1)?.content).toContain("[分支 1 广播] 全局发现需要扩散");
+    // 子 → 具体兄弟 [2]：改投主分支，由它转发
+    const lat = bm.broadcast(1, "点对点给兄弟分支", [2], 1101);
+    expect(lat.ok).toBe(true);
+    expect(lat.delivered).toEqual([0]);
+    expect(lat.message).toContain("横向协同由主分支转发");
+    // 子 → "trunk"：原语义原文案
+    expect(bm.broadcast(1, "直接上行汇报", "trunk", 1102).message).toBe("已广播给分支 0（1 个）");
+    // 无效 id 照旧拒绝（不因夹取变通投）
+    expect(bm.broadcast(1, "无效目标", [99], 1103).ok).toBe(false);
+    // 主分支下行全连保留
+    const down = bm.broadcast(0, "统筹：先暂停副作用操作", "all", 1104);
+    expect(down.ok).toBe(true);
+    expect([...down.delivered].sort()).toEqual([1, 2]);
   });
 
   it("限频 + 近似重复去重", () => {
@@ -599,5 +631,40 @@ describe("旁观者越权建议检测（run5 真实判例集）", () => {
     });
     expect(input).toContain("只准是当前题目内");
     expect(input).toContain("越权");
+  });
+
+  it("输入带「各分支分工」+ 硬约束禁止改派（界由 fork 划定）", () => {
+    const input = buildBystanderInput({
+      taskCard: "拿掉目标全部 flag",
+      entries: [],
+      branchId: 1,
+      branchNames: new Map([
+        [0, "主分支"],
+        [1, "穷举 31 字节 blob 的流密码/LFSR"],
+        [2, "服务端响应头与隐藏路径"],
+      ]),
+      ledger: null,
+      recentDigest: "",
+      recentCmds: [],
+      segElapsedSec: 10,
+      signals: {
+        flagStall: false,
+        stall: false,
+        repeat: false,
+        hardFail: false,
+        hallucSubmit: false,
+        count: 0,
+      },
+    });
+    expect(input).toContain("各分支分工");
+    expect(input).toContain("分支 0（主分支）：题面整体，无专属方向");
+    expect(input).toContain("分支 1：穷举 31 字节 blob 的流密码/LFSR");
+    expect(input).toContain("分支 2：服务端响应头与隐藏路径");
+    // 系统硬约束：不得让已分工分支弃用方向/转做他人工作（实测教训回锁）
+    expect(BYSTANDER_SYSTEM).toContain("不得重分配已分工的分支");
+    expect(BYSTANDER_SYSTEM).toContain("服务它的方向");
+    // 执行侧同样声明：界由 fork 划定、broadcast 只上行主分支
+    expect(FORK_PROMPT_EXTRA).toContain("不要轻易跨界");
+    expect(FORK_PROMPT_EXTRA).toContain("只上行给主分支");
   });
 });

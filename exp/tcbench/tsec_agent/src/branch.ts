@@ -215,7 +215,8 @@ export class BranchManager {
       `- 读任意路径都允许（含父/其他分支目录，通报产物路径时写全路径）；` +
       `**写入只写自己的目录**；命名空间之外与容器级操作（重启服务/监听共享端口/改系统/iptables）` +
       `默认只读，确需改动先用 broadcast 协调。\n` +
-      `- 关键发现/新方向随手 \`core_log\` 一句话；与其他分支互通用 \`broadcast\`；` +
+      `- 关键发现/新方向随手 \`core_log\` 一句话；\`broadcast\` **只上行给主分支（分支 0）**——` +
+      `子分支之间不直连，横向协同由主分支统筹转发；` +
       `**停滞过久（无 core_log/flag）的分支会被系统回收**，发现摘要会汇入主分支。\n` +
       `- 你没有收尾权：不要输出无工具总结（那会暂停你的分支）；持续推进，进度用 core_log 记录。`;
     const branch: BranchState = {
@@ -271,6 +272,22 @@ export class BranchManager {
     } else {
       targets = [Number(to)];
     }
+    // 拓扑夹取（思想：界由 fork 划定，子分支只**上行主分支**）——横向目标（活着的兄弟）
+    // 改投 0、由主分支统筹转发，子分支之间不直连；无效 id 照旧过滤（拒绝语义不变）；
+    // 主分支（0）→ 任意的下行广播不改（全连保留）。
+    let clamped = false;
+    if (fromId !== 0) {
+      const up = new Set<number>();
+      for (const t of new Set(targets)) {
+        if (t === fromId) continue; // 自投照旧无效
+        if (t === 0) up.add(0);
+        else if (this.get(t)) {
+          up.add(0);
+          clamped = true;
+        }
+      }
+      targets = [...up];
+    }
     const content = `[分支 ${fromId} 广播] ${note}`;
     const delivered: number[] = [];
     for (const tid of new Set(targets)) {
@@ -290,7 +307,9 @@ export class BranchManager {
     }
     return {
       ok: true,
-      message: `已广播给分支 ${delivered.join(", ")}（${delivered.length} 个）`,
+      message: clamped
+        ? "已广播给分支 0（子分支仅可上行主分支；横向协同由主分支转发）"
+        : `已广播给分支 ${delivered.join(", ")}（${delivered.length} 个）`,
       delivered,
     };
   }

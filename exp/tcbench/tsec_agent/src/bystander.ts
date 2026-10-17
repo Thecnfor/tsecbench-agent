@@ -20,6 +20,11 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 硬约束（不可违反）：
 - 只针对**当前题目**给题内建议；**严禁换题、跳过/放弃当前题、调用或探测平台接口**
   ——选题是编排控制器的职责，执行者被任务卡锁定在单题上、没有换题能力。
+- **不得重分配已分工的分支**：非主分支都有专属方向（见输入「各分支分工」），你的指引
+  必须**服务它的方向**——给方向内更细的角度/工具/验证手段；**不得让它弃用方向去做别的**，
+  更不得让它转做其他分支已负责的工作（重复劳动比卡塞更糟）。判断其方向已走死时：
+  就地方向内做最小证伪、把结论 core_log 一句（证伪也是产出），然后待系统回收——
+  **不要**给它布置其他方向的实质任务；换方向是 fork 出新分支的事，不是你的事。
 - 你只读运行时派生的信息——不猜测题目答案、不编造日志里没有的事实、
   **不替执行者给最终答案/flag 值**（那是它从目标读出来的）。
 - 语感带置信：有把握就直说；没把握就提示"先验证 X"，别把猜测说成事实。
@@ -94,6 +99,14 @@ export function buildBystanderInput(args: {
     `重复${args.signals.repeat ? "✓" : "✗"} 连接空转${args.signals.hardFail ? "✓" : "✗"} ` +
     `错提交${args.signals.hallucSubmit ? "✓" : "✗"}\n`;
   parts.push(head);
+  // 分工必须显眼（run 实测：分支方向只在括号注脚里，旁观者无视它给卡塞分支改派任务）
+  const roster = [...args.branchNames.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([id, name]) =>
+      id === 0 ? `- 分支 0（主分支）：题面整体，无专属方向` : `- 分支 ${id}：${name}`,
+    )
+    .join("\n");
+  parts.push(`# 各分支分工（指引必须尊重此分工，见系统硬约束）\n${roster}\n`);
   parts.push(
     `# 各分支核心日志（按分支分组）\n${buildBystanderLogView(args.entries, { branches: args.branchNames }) || "（暂无）"}\n`,
   );

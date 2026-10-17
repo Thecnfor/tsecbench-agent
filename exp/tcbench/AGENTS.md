@@ -173,10 +173,10 @@
 | `tsec_agent/src/llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换 | 网关协议/鉴权变化 |
 | `tsec_agent/src/prompt.ts` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl（+corelog.jsonl）；`rebuildMessages`/`rebuildBranches` 从对话重建续跑上下文（分支按 fork_seq 截断） | 记录字段调整、续跑上下文 |
-| `tsec_agent/src/branch.ts` | fork 多分支执行面：分支状态/护栏（存活≤3、总数≤5、冷却 180s、剪枝 600s）/轮转调度/广播（尾部追加+限频+去重） | 分支策略调整 |
+| `tsec_agent/src/branch.ts` | fork 多分支执行面：分支状态/护栏（存活≤3、总数≤5、冷却 180s、剪枝 1200s）/轮转调度/广播（尾部追加+限频+去重；**星型拓扑**：非主分支只上行主分支，横向目标改投 0 由主转发） | 分支策略调整 |
 | `tsec_agent/src/branch_tools.ts` | fork/core_log/broadcast 三工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize 保证 tool 配对完整） | 工具契约变化 |
 | `tsec_agent/src/corelog.ts` | corelog.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ 旁观者分组视图 | 核心日志格式 |
-| `tsec_agent/src/bystander.ts` | 旁观者：卡塞组合信号（停滞/重复/预算任二）+ 输入构建（按分支分组防交错难读）+ 插嘴指令 | 卡塞判定/提示词 |
+| `tsec_agent/src/bystander.ts` | 旁观者：flag 主时钟一票 + 四信号任二 + 输入构建（**各分支分工名册**、按分支分组防交错难读）+ 插嘴指令（硬约束：**不给已分工分支改派范畴外任务**，界由 fork 划定） | 卡塞判定/提示词 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
 | `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/旁观者开关 `AGENT_FORK`/`AGENT_BYSTANDER`（默认 0）及护栏阈值 | 加配置项 |
 | `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
