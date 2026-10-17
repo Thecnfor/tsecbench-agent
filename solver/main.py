@@ -69,9 +69,8 @@ def _messages_as_events(messages: list[dict]) -> list[dict]:
         if role == "assistant":
             for call in message.get("tool_calls") or []:
                 fn = call.get("function") or {}
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (TypeError, ValueError):
+                args, _error = common.parse_tool_arguments(fn.get("arguments") or "{}")
+                if args is None:
                     args = {}
                 if fn.get("name") == "run_command":
                     events.append({"text": "$ " + str(args.get("command") or "")})
@@ -135,6 +134,21 @@ def _flag_nudge(common_mod, reported_before: int) -> str | None:
     )
 
 
+def _structured_tool_message(turn: int, call, tool: str, args: dict, result: dict) -> dict:
+    label = args.get("mode") or str(args.get("query") or "")[:40]
+    print(f"[solver] turn {turn} {tool} {label}", flush=True)
+    text = truncate(json.dumps(result, ensure_ascii=False))
+    for flag in find_flags(text):
+        report_candidate(flag)
+    remaining = common.remaining_seconds()
+    note = f" | slice_time_left={int(remaining)}s" if remaining is not None else ""
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": f"[{tool}{note}]\n{text}",
+    }
+
+
 # --------------------------------------------------------------------- main ---
 def main() -> int:
     if common.ORCH_MODE:
@@ -187,6 +201,7 @@ def main() -> int:
     fact_nudged = False
     no_fact_nudges = 0
     turn = 0
+    last_idea = ""
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
@@ -224,6 +239,7 @@ def main() -> int:
 
         if content:
             print(f"[solver] assistant (turn {turn}): {content[:1500]}", flush=True)
+            last_idea = content[:300]
             for flag in find_flags(content):
                 report_candidate(flag)
 
@@ -245,43 +261,52 @@ def main() -> int:
                 break
             continue
 
+        # 一轮内全部是结构化工具（recon/rea/kb）时并发执行；run_command 有顺序语义，
+        # 混合或单独的 run_command 仍走下面的串行路径。
+        prefetched: dict[str, dict] = {}
+        if len(calls) > 1 and all(call.function.name in common.STRUCTURED_TOOLS for call in calls):
+            parsed_batch = {
+                call.id: common.parse_tool_arguments(call.function.arguments) for call in calls
+            }
+            if all(error is None for _args, error in parsed_batch.values()):
+                results = common.run_structured_batch(
+                    [
+                        {"name": call.function.name, "args": parsed_batch[call.id][0]}
+                        for call in calls
+                    ]
+                )
+                prefetched = {call.id: result for call, result in zip(calls, results, strict=True)}
+
         for call in calls:
-            try:
-                args = json.loads(call.function.arguments or "{}")
-            except Exception as exc:
+            args, error = common.parse_tool_arguments(call.function.arguments)
+            if error:
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": error})
+                continue
+            if call.function.name not in ("run_command", "recon", "rea", "kb"):
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": f"invalid tool arguments: {exc}",
+                        "content": (
+                            f"unknown tool: {call.function.name!r}; "
+                            "use run_command, recon, rea, or kb"
+                        ),
                     }
                 )
                 continue
 
-            if call.function.name in ("recon", "rea", "kb"):
+            if call.function.name in common.STRUCTURED_TOOLS:
                 tool = call.function.name
-                print(
-                    f"[solver] turn {turn} {tool} {args.get('mode') or args.get('query', '')[:40]}",
-                    flush=True,
-                )
-                if tool == "recon":
+                common.note_tool_use(tool)
+                if call.id in prefetched:
+                    result = prefetched.pop(call.id)
+                elif tool == "recon":
                     result = common.run_recon(args)
                 elif tool == "rea":
                     result = common.run_rea(args)
                 else:
                     result = common.run_kb(args)
-                text = truncate(json.dumps(result, ensure_ascii=False))
-                for flag in find_flags(text):
-                    report_candidate(flag)
-                remaining = common.remaining_seconds()
-                note = f" | slice_time_left={int(remaining)}s" if remaining is not None else ""
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": f"[{tool}{note}]\n{text}",
-                    }
-                )
+                messages.append(_structured_tool_message(turn, call, tool, args, result))
                 continue
 
             command = str(args.get("command", "")).strip()
@@ -298,6 +323,7 @@ def main() -> int:
 
             remaining = common.remaining_seconds()
             t = common.effective_command_timeout(requested, remaining)
+            common.note_tool_use("run_command")
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
             out = truncate(result["output"])
@@ -406,7 +432,7 @@ def main() -> int:
         f"candidates={sorted(common._reported)}",
         flush=True,
     )
-    write_result("solved" if common._reported else "failed")
+    write_result("solved" if common._reported else "failed", next_idea=last_idea)
     return 0
 
 

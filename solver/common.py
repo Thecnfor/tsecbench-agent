@@ -105,7 +105,12 @@ SOLVER_TASK_PATH = cfg("SOLVER_TASK", "") or ""
 ORCH_MODE = bool(SOLVER_TASK_PATH) and not TASK_PROMPT
 _flag_seq = 0
 TOTALS: dict = {}  # LLM 用量统计（write_result 收尾用）
+TOOL_USAGE: dict[str, int] = {}  # 各工具调用次数（write_result 收尾用）
 TASK: dict = {}  # 当前 task.json（setup_orch_mode 写入）
+
+
+def note_tool_use(name: str) -> None:
+    TOOL_USAGE[name] = TOOL_USAGE.get(name, 0) + 1
 
 
 def turn_limit() -> int:
@@ -162,7 +167,10 @@ class _PersistentShell:
                 self.stop()
                 self.start()
             sentinel = f"__TSEC_DONE_{os.getpid()}_{time.time_ns()}__"
-            payload = f"{command}\nprintf '\\n%s%s\\n' '{sentinel}' \"$?\"\n"
+            # 命令组 + stdin 重定向：交互式命令（cat/nc/mysql）若直接继承 shell 的
+            # stdin，会吞掉下一条命令与哨兵，导致整条命令超时或伪造 exit 0。
+            # 组内变量仍然保留（不破持久 shell 语义），heredoc 也不受影响。
+            payload = f"{{ {command}\n}} </dev/null\nprintf '\\n%s%s\\n' '{sentinel}' \"$?\"\n"
             started = time.time()
             try:
                 assert self.proc.stdin is not None
@@ -238,18 +246,19 @@ def reset_shell_session() -> None:
 atexit.register(reset_shell_session)
 
 
-def run_command(command: str, timeout: int) -> dict:
+def run_command(command: str, timeout: int, *, isolated: bool = False) -> dict:
     """Run a shell command inside the challenge container (or locally).
 
     **默认使用长驻 bash**（变量/cwd 跨命令保留）；每条命令带唯一 sentinel
-    与 `$?`，超时杀整个进程组并重启。容器模式/关闭开关时退回逐条
-    `timeout -k` 执行。
+    与 `$?`，超时杀整个进程组并重启。容器模式/关闭开关/`isolated=True`
+    时退回逐条 `timeout -k` 执行（harness 内部探针用 isolated，避免探针
+    超时重启用户会话、丢掉 cwd/变量）。
 
     逐条路径的说明：实测 solver 常写无超时的命令（如 `curl -s -i http://T/`），
     目标挂死时只有宿主侧 `t+20` 的粗杀兜底 —— 一条命令白烧 120s+ 时间片。
     内层 timeout 让超时精确到 t；外层仍 kill 整个进程组防孤儿。
     """
-    if PERSISTENT_SHELL and not CONTAINER:
+    if PERSISTENT_SHELL and not CONTAINER and not isolated:
         global _SHELL
         if _SHELL is None:
             _SHELL = _PersistentShell()
@@ -309,6 +318,17 @@ def truncate(text: str, limit: int = OUTPUT_LIMIT) -> str:
 
 
 # ------------------------------------------------------------- tool surface ---
+def parse_tool_arguments(raw: str) -> tuple[dict | None, str | None]:
+    """解析模型给的工具参数；非对象/坏 JSON 一律返回可回填的 tool error。"""
+    try:
+        args = json.loads(raw or "{}")
+    except (TypeError, ValueError) as exc:
+        return None, f"invalid tool arguments: {exc}"
+    if not isinstance(args, dict):
+        return None, "tool arguments must be a JSON object"
+    return args, None
+
+
 def build_tool_specs() -> list[dict]:
     """模型可见的工具面（能力在 harness 里，不靠提示词叮嘱）。"""
     return [
@@ -317,8 +337,14 @@ def build_tool_specs() -> list[dict]:
             "function": {
                 "name": "run_command",
                 "description": (
-                    "Run a shell command and return combined stdout/stderr. "
-                    "Non-interactive commands only."
+                    "Run a shell command and return combined stdout/stderr. stdin is closed "
+                    "(non-interactive only; pass input via arguments, heredocs, or files). "
+                    + (
+                        "Commands share one persistent bash session (cwd/vars persist until a "
+                        "timeout restarts it)."
+                        if PERSISTENT_SHELL and not CONTAINER
+                        else "Each command runs in a fresh shell."
+                    )
                 ),
                 "parameters": {
                     "type": "object",
@@ -341,10 +367,11 @@ def build_tool_specs() -> list[dict]:
             "function": {
                 "name": "recon",
                 "description": (
-                    "Deterministic recon returning compact JSON: mode=host runs a capped "
-                    "nmap service scan; mode=web fetches headers/title/tech and runs a "
-                    "time-capped, 404-filtered directory sweep. Prefer this over "
-                    "hand-writing long nmap/gobuster pipelines."
+                    "Start here on any new target: deterministic recon returning compact JSON. "
+                    "mode=host runs a capped nmap service scan; mode=web fetches headers/title/tech "
+                    "and runs a time-capped, 404-filtered directory sweep; mode=all does both and "
+                    "derives the web URL from open ports. Prefer this FIRST over hand-writing long "
+                    "nmap/gobuster pipelines; use run_command for targeted follow-up requests."
                 ),
                 "parameters": {
                     "type": "object",
@@ -386,9 +413,10 @@ def build_tool_specs() -> list[dict]:
             "function": {
                 "name": "kb",
                 "description": (
-                    "Search the offline security knowledge base (payloads, CVE notes, "
-                    "SOP checklists) and return the best matching snippets. Use it for "
-                    "exact payload syntax / N-day techniques instead of guessing."
+                    "Search the offline security knowledge base (payloads, CVE notes, SOP "
+                    "checklists) and return the best matching snippets. Call it when you are "
+                    "stuck, or before crafting a payload for a known product/CVE, to get exact "
+                    "syntax instead of guessing."
                 ),
                 "parameters": {
                     "type": "object",
@@ -435,11 +463,20 @@ def _with_kb(result: dict) -> dict:
         if playbook:
             result["fast_path"] = playbooks.render(playbook, target)
             probes = playbooks.safe_probes(playbook, target)
+            remaining = remaining_seconds()
+            if remaining is not None and remaining < 5:
+                probes = []
             if probes and playbook["id"] not in _AUTO_PROBED:
                 _AUTO_PROBED.add(playbook["id"])
+                total_budget = 24 if remaining is None else max(2, min(24, int(remaining / 3)))
+                per_probe = max(2, min(6, total_budget // max(1, len(probes))))
+                deadline = time.time() + total_budget
                 collected = []
                 for probe_cmd in probes:
-                    probe = run_command(probe_cmd, 6)
+                    left = deadline - time.time()
+                    if left <= 0:
+                        break
+                    probe = run_command(probe_cmd, max(2, min(per_probe, int(left))), isolated=True)
                     output = str(probe.get("output") or "").strip()
                     if output:
                         collected.append({"cmd": probe_cmd, "output": truncate(output, 1200)})
@@ -500,14 +537,18 @@ def run_rea(args: dict) -> dict:
         return {"error": f"unknown mode: {mode!r}"}
     env = dict(os.environ)
     env.setdefault("GHIDRA_INSTALL_DIR", "/opt/tsecbench/ghidra")
+    remaining = remaining_seconds()
+    if remaining is not None and remaining < 5:
+        return {"error": "insufficient slice time for rea"}
+    timeout = 180 if remaining is None else max(5, min(180, int(remaining * 0.5)))
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=180, env=env
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env
         )
     except FileNotFoundError:
         return {"error": "rea not installed"}
     except subprocess.TimeoutExpired:
-        return {"error": "rea timed out (180s)"}
+        return {"error": f"rea timed out ({timeout}s)"}
     if not proc.stdout.strip():
         return {"error": f"rea failed: {proc.stderr[-500:]}"}
     if mode == "inspect":
@@ -538,6 +579,34 @@ def run_kb(args: dict) -> dict:
     return {"query": query, "snippets": text[:8000]}
 
 
+STRUCTURED_TOOLS = ("recon", "rea", "kb")
+
+
+def run_structured_tool(name: str, args: dict) -> dict:
+    if name == "recon":
+        return run_recon(args)
+    if name == "rea":
+        return run_rea(args)
+    if name == "kb":
+        return run_kb(args)
+    return {"error": f"unknown structured tool: {name}"}
+
+
+def run_structured_batch(calls: list[dict]) -> list[dict]:
+    """一轮内的结构化工具调用并发执行，结果顺序与输入一致。
+
+    仅限 recon/rea/kb（只读或本地、无共享 shell 状态）。run_command 有执行
+    顺序语义，仍由主循环串行执行。
+    """
+    items = list(calls)
+    if len(items) <= 1:
+        return [run_structured_tool(item["name"], item["args"]) for item in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+        return list(pool.map(lambda item: run_structured_tool(item["name"], item["args"]), items))
+
+
 # ------------------------------------------------------- tool message hygiene ---
 def summarize_history(messages: list[dict], limit: int = 12) -> str:
     """压缩前保留高密度执行状态：最近命令 → 退出码/耗时 → 首行输出。
@@ -553,9 +622,8 @@ def summarize_history(messages: list[dict], limit: int = 12) -> str:
             for call in msg.get("tool_calls") or []:
                 fn = call.get("function") or {}
                 name = fn.get("name") or "tool"
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (TypeError, ValueError):
+                args, _error = parse_tool_arguments(fn.get("arguments") or "{}")
+                if args is None:
                     args = {}
                 if name == "run_command":
                     cmd = str(args.get("command") or "").strip().replace("\n", " ")[:180]
@@ -701,7 +769,7 @@ def report_candidate(flag: str) -> None:
         _flag_seq += 1
 
 
-def write_result(status: str, evidence: str = "") -> None:
+def write_result(status: str, evidence: str = "", next_idea: str = "") -> None:
     """编排器模式收尾：写 out/result.json（编排器不信任它，仅用于日志/回灌）。"""
     if not ORCH_MODE:
         return
@@ -710,8 +778,10 @@ def write_result(status: str, evidence: str = "") -> None:
         "candidates": sorted(_reported),
         "evidence": evidence,
         "tokens_used": TOTALS.get("prompt", 0) + TOTALS.get("completion", 0),
-        "tools_used": [],
-        "next_idea": "",
+        "tools_used": [
+            {"name": name, "calls": count} for name, count in sorted(TOOL_USAGE.items()) if count
+        ],
+        "next_idea": next_idea,
     }
     out = Path(SOLVER_TASK_PATH).parent / "out"
     out.mkdir(parents=True, exist_ok=True)
@@ -762,7 +832,23 @@ def kb_snippets(text: str, top_k: int = 3) -> str:
 # ------------------------------------------------------------------- prompt ---
 def build_system_prompt() -> str:
     base = TASK_PROMPT.strip()
-    contract = """
+    if PERSISTENT_SHELL and not CONTAINER:
+        shell_rule = (
+            "- Each run_command shares ONE persistent bash session: shell variables and cwd "
+            "persist across calls. A command that times out restarts the session and discards "
+            "them, so write critical values (tokens, cookies, session ids) to files "
+            "(e.g. `/tmp/sas`) as well.\n"
+            "- stdin is closed (/dev/null): never run interactive tools (nc/ftp/mysql REPLs). "
+            "Pass input via arguments, heredocs, or files."
+        )
+    else:
+        shell_rule = (
+            "- Each run_command is a FRESH shell: shell variables and cwd do NOT persist. Write "
+            "reusable values (SAS tokens, cookies, session ids) to files (e.g. `/tmp/sas`) and "
+            "read them in later commands.\n"
+            "- stdin is closed: never run interactive tools; pass input via arguments or files."
+        )
+    contract = f"""
 # OPERATING CONTRACT
 You drive a lean Linux box through four tools:
 - run_command: shell (bash/python3), non-interactive, bounded.
@@ -774,8 +860,7 @@ Hard rules:
 - No internet, no installs, no OOB callbacks; the only reachable endpoints are the target(s) and the LLM API.
 - Target connectivity is preconfigured. A first timeout usually means cold start: retry once after ~20s, then change vector. Do not debug VPN/DNS/routing.
 - Bound every network command (`curl -m 5`, `timeout 30`). One high-information command beats many small ones.
-- Each run_command is a FRESH shell: shell variables and cwd do NOT persist. Write reusable values
-  (SAS tokens, cookies, session ids) to files (e.g. `/tmp/sas`) and read them in later commands.
+{shell_rule}
 - Flags: report exactly as found; multi-flag challenges continue until all flags are submitted.
 - No hints exist. Solve from local analysis; never probe the platform or LLM side.
 - The harness enforces a per-command wall cap and reports remaining slice time; pace yourself.

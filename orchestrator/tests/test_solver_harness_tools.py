@@ -197,7 +197,12 @@ def test_recon_attaches_fast_path(common, monkeypatch):
     monkeypatch.setattr(
         common,
         "run_command",
-        lambda cmd, timeout: {"output": "", "exit_code": 0, "seconds": 0.0, "timed_out": False},
+        lambda cmd, timeout, isolated=False: {
+            "output": "",
+            "exit_code": 0,
+            "seconds": 0.0,
+            "timed_out": False,
+        },
     )
     out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
     assert "# FAST PATH" in out["fast_path"]
@@ -221,7 +226,7 @@ def test_recon_auto_probes_first_get_step(common, monkeypatch):
     monkeypatch.setattr(common, "TARGET_INFO", "10.0.0.1:3000")
     seen = {}
 
-    def fake_run(cmd, timeout):
+    def fake_run(cmd, timeout, isolated=False):
         seen["cmd"] = cmd
         return {
             "output": "HTTP/1.1 200 OK\n{}",
@@ -259,3 +264,141 @@ def test_persistent_shell_timeout_restarts(common):
     assert out["timed_out"] is True
     assert "ok" in common.run_command("echo ok", 5)["output"]
     common.reset_shell_session()
+
+
+def test_persistent_shell_does_not_swallow_next_command(common):
+    """交互式命令读 stdin 时不能吞掉下一条命令或伪造哨兵。"""
+    common.reset_shell_session()
+    first = common.run_command("cat", 2)
+    assert first["timed_out"] is False
+    assert first["exit_code"] == 0
+    second = common.run_command("echo after-cat", 3)
+    assert second["output"].strip() == "after-cat"
+    assert "printf" not in second["output"]
+    common.reset_shell_session()
+
+
+def test_persistent_shell_heredoc_still_works(common):
+    common.reset_shell_session()
+    out = common.run_command("python3 - <<'PY'\nprint('heredoc-ok')\nPY", 5)
+    assert "heredoc-ok" in out["output"]
+    common.reset_shell_session()
+
+
+def test_prompt_matches_persistent_shell_mode(common):
+    prompt = common.build_system_prompt()
+    if common.PERSISTENT_SHELL and not common.CONTAINER:
+        assert "persist" in prompt.lower()
+        assert "FRESH shell" not in prompt
+    else:
+        assert "FRESH shell" in prompt
+    assert "stdin" in prompt.lower()
+
+
+def test_parse_tool_arguments_rejects_non_object(common):
+    args, error = common.parse_tool_arguments("[]")
+    assert args is None
+    assert "JSON object" in error
+    args, error = common.parse_tool_arguments("null")
+    assert args is None
+    assert error
+
+
+def test_parse_tool_arguments_accepts_object_and_reports_bad_json(common):
+    args, error = common.parse_tool_arguments('{"command": "id"}')
+    assert args == {"command": "id"}
+    assert error is None
+    args, error = common.parse_tool_arguments("{not json")
+    assert args is None
+    assert "invalid tool arguments" in error
+
+
+def test_fast_probe_respects_remaining_slice(common, monkeypatch):
+    monkeypatch.setattr(common, "TASK", {"description": "gradio app"})
+    monkeypatch.setattr(common, "TARGET_INFO", "10.0.0.1:7860")
+    monkeypatch.setattr(common, "_AUTO_PROBED", set())
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
+    monkeypatch.setattr(common, "remaining_seconds", lambda: 9.0)
+    seen = []
+
+    def fake_run(cmd, timeout, isolated=False):
+        seen.append((timeout, isolated))
+        return {"output": "ok", "exit_code": 0, "seconds": 0.0, "timed_out": False}
+
+    monkeypatch.setattr(common, "run_command", fake_run)
+    fake = types.SimpleNamespace(recon_web=lambda url: {"url": url})
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    common.run_recon({"mode": "web", "url": "http://10.0.0.1:7860/"})
+    assert seen, "fast probes should run while slice time remains"
+    assert all(isolated for _timeout, isolated in seen)
+    assert all(timeout <= 9 for timeout, _isolated in seen)
+
+
+def test_fast_probe_skipped_when_slice_almost_over(common, monkeypatch):
+    monkeypatch.setattr(common, "TASK", {"description": "gradio app"})
+    monkeypatch.setattr(common, "TARGET_INFO", "10.0.0.1:7860")
+    monkeypatch.setattr(common, "_AUTO_PROBED", set())
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
+    monkeypatch.setattr(common, "remaining_seconds", lambda: 4.0)
+    seen = []
+    monkeypatch.setattr(
+        common, "run_command", lambda cmd, timeout, isolated=False: seen.append(cmd)
+    )
+    fake = types.SimpleNamespace(recon_web=lambda url: {"url": url})
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    common.run_recon({"mode": "web", "url": "http://10.0.0.1:7860/"})
+    assert seen == []
+
+
+def test_rea_timeout_respects_remaining_slice(common, monkeypatch, tmp_path):
+    target = tmp_path / "bin"
+    target.write_bytes(b"\x7fELF")
+    captured = {}
+
+    class _Proc:
+        stdout = '{"normalized_result": "main(){}"}'
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _Proc()
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    monkeypatch.setattr(common, "remaining_seconds", lambda: 8.0)
+    common.run_rea({"mode": "inspect", "path": str(target)})
+    assert captured["timeout"] <= 5
+
+
+def test_structured_tool_batch_runs_concurrently_in_order(common, monkeypatch):
+    import time as _time
+
+    def slow_kb(args):
+        _time.sleep(0.3)
+        return {"query": args["query"]}
+
+    monkeypatch.setattr(common, "run_kb", slow_kb)
+    started = _time.time()
+    results = common.run_structured_batch(
+        [
+            {"name": "kb", "args": {"query": "a"}},
+            {"name": "kb", "args": {"query": "b"}},
+        ]
+    )
+    elapsed = _time.time() - started
+    assert [result["query"] for result in results] == ["a", "b"]
+    assert elapsed < 0.55
+
+
+def test_structured_tool_batch_single_call_is_inline(common, monkeypatch):
+    monkeypatch.setattr(common, "run_kb", lambda args: {"query": args["query"]})
+    results = common.run_structured_batch([{"name": "kb", "args": {"query": "solo"}}])
+    assert results == [{"query": "solo"}]
+
+
+def test_structured_tool_descriptions_teach_when_to_use(common):
+    specs = {
+        spec["function"]["name"]: spec["function"]["description"]
+        for spec in common.build_tool_specs()
+    }
+    assert "first" in specs["recon"].lower()
+    assert "stuck" in specs["kb"].lower() or "before" in specs["kb"].lower()

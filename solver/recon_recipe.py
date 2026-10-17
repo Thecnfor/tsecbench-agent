@@ -59,6 +59,21 @@ def derive_web_url(target: str, open_ports: list[str]) -> str:
     return f"http://{target}"
 
 
+def parse_dirbust_lines(tool: str, out: str, limit: int = 50) -> list[str]:
+    """归一化 gobuster / feroxbuster 输出（feroxbuster --silent 只打印完整 URL）。"""
+    lines: list[str] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        first = parts[0]
+        if first.startswith(("http://", "https://", "/")) or first.isdigit():
+            lines.append(line.strip()[:160])
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def _kb_hits(*parts: str, top_k: int = 2) -> list[dict]:
     query = " ".join(part for part in parts if part).strip()
     if not query:
@@ -214,11 +229,7 @@ def recon_web(url: str, budget_s: float | None = None) -> dict:
                 "3s",
             ]
         out = _run(argv, timeout=DIRBUST_TIMEOUT)
-        for line in out.splitlines():
-            parts = line.split()
-            if parts and (parts[0].isdigit() or parts[0].startswith("/")):
-                result["dirs"].append(line.strip()[:160])
-        result["dirs"] = result["dirs"][:50]
+        result["dirs"] = parse_dirbust_lines(dirbust, out)
     else:
         result["dirs"] = ["[tool-error] neither feroxbuster nor gobuster installed"]
     hits = _kb_hits(

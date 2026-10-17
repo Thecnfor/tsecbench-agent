@@ -69,3 +69,18 @@ def test_low_budget_uses_small_nmap(monkeypatch):
     rr.recon_host("10.0.0.1", budget_s=10)
     assert "--top-ports" in seen["argv"] and "100" in seen["argv"]
     assert seen["timeout"] <= 10
+
+
+def test_parse_dirbust_lines_accepts_feroxbuster_urls():
+    rr = load_recipe()
+    lines = rr.parse_dirbust_lines(
+        "feroxbuster",
+        "http://h:8080/admin\nhttp://h:8080/login?next=/\n",
+    )
+    assert lines == ["http://h:8080/admin", "http://h:8080/login?next=/"]
+
+
+def test_parse_dirbust_lines_keeps_gobuster_entries():
+    rr = load_recipe()
+    line = "/admin                (Status: 301) [Size: 312]"
+    assert rr.parse_dirbust_lines("gobuster", line + "\n\n") == [line]
