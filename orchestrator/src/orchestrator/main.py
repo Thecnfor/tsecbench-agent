@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from .scheduler import can_start, eligible, plan_phase, should_start, slice_for
 from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
+# 首片试探：先给 60s，有进展才续片；无进展立即释放并发槽。
+PROBE_SLICE_S = float(os.environ.get("PROBE_SLICE_S", "60"))
 AVAILABLE_TIMEOUT_S = 120.0
 # TCP 就绪预检上限（c-08 实测 7860 冷启 >45s；编排器等待免费，solver 等待烧片）
 TARGET_READY_TIMEOUT_S = 120.0
@@ -255,6 +258,11 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
             pass
 
 
+def _should_extend(remaining_s: float, completed: bool, has_progress: bool) -> bool:
+    """60s 试探后续片条件：未完成、还有预算、且已有资产/凭据/线索。"""
+    return not completed and remaining_s > 5.0 and has_progress
+
+
 def _active_slots(ctx: RunContext) -> int:
     """并发槽真值 = 在飞 pipeline 数。
 
@@ -337,6 +345,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     if rec.difficulty == "hard" or rec.attempts > 1:
         ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
+    solver_started = time.monotonic()
+    slice_count = 0
     try:
         if config_module.HARNESS_V2:
             from types import SimpleNamespace
@@ -363,22 +373,64 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                 base_environ=solver_env,
                 slice_s=min(slice_s, streams.STREAM_INTERVAL_S * 20),
             )
+            slice_count = 1
             outcome = SimpleNamespace(
                 exit_code=0, timed_out=False, duration_s=time.monotonic() - v2_started
             )
             early_new, early_completed = 0, False
         else:
-            outcome, early_new, early_completed = await streams.run_solver_with_stream(
-                solver_cmd=ctx.solver_cmd,
-                ws=ws,
-                deadline_epoch=deadline_epoch,
-                slice_s=slice_s,
-                environ=solver_env,
-                client=ctx.client,
-                journal=ctx.journal,
-                unique_code=code,
-                rec=rec,
-            )
+            remaining_slice = slice_s
+            probe_slice = min(PROBE_SLICE_S, remaining_slice)
+            early_new, early_completed = 0, False
+            outcome = None
+            first = True
+            while True:
+                run_slice = max(
+                    5.0, min(probe_slice if first else remaining_slice, remaining_slice)
+                )
+                slice_count += 1
+                sub_deadline = min(time.time() + run_slice, ctx.t0 + ctx.config.total_time_limit_s)
+                outcome, sub_new, sub_completed = await streams.run_solver_with_stream(
+                    solver_cmd=ctx.solver_cmd,
+                    ws=ws,
+                    deadline_epoch=sub_deadline,
+                    slice_s=run_slice,
+                    environ=solver_env,
+                    client=ctx.client,
+                    journal=ctx.journal,
+                    unique_code=code,
+                    rec=rec,
+                )
+                early_new += sub_new
+                early_completed = early_completed or sub_completed
+                remaining_slice -= run_slice
+                if early_completed or rec.is_completed or remaining_slice <= 5.0:
+                    break
+                prior = _merge_prior(ctx.priors.get(code), collect_prior(ws))
+                ctx.priors[code] = prior
+                has_progress = _slice_has_progress(ws) or bool(prior.get("credentials"))
+                if not _should_extend(remaining_slice, early_completed, has_progress):
+                    ctx.journal.append(
+                        "probe_stop", unique_code=code, remaining_s=round(remaining_slice, 1)
+                    )
+                    break
+                ctx.journal.append(
+                    "probe_extend", unique_code=code, remaining_s=round(remaining_slice, 1)
+                )
+                for name in ("stdout.log", "stderr.log"):
+                    source = ws / name
+                    if source.is_file():
+                        with contextlib.suppress(OSError):
+                            shutil.copyfile(source, ws / f"{name}.slice1")
+                prepare_workspace(
+                    ctx.workspace_root,
+                    rec,
+                    attempt=rec.attempts,
+                    prior=prior,
+                    sops=sops,
+                    repair_note=ctx.repair_notes.get(code),
+                )
+                first = False
     except BaseException:
         # 提交/WAF/网络异常不能让 solver 已产出的候选随重排丢失（run-35236 c-06）。
         with contextlib.suppress(Exception):
@@ -389,7 +441,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         unique_code=code,
         exit_code=outcome.exit_code,
         timed_out=outcome.timed_out,
-        duration_s=round(outcome.duration_s, 1),
+        duration_s=round(time.monotonic() - solver_started, 1),
+        slices=slice_count,
     )
 
     rec.state = "HARVESTING"
