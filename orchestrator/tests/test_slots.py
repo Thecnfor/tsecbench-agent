@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from orchestrator.main import _active_slots
@@ -37,3 +38,21 @@ def test_probe_decision_tiers():
     assert _probe_decision(2, True, True, 240) == "full"
     assert _probe_decision(3, True, False, 240) == "full"
     assert _probe_decision(1, True, True, 0) == "stop"
+
+
+def test_pass_progress_only_counts_flag_candidates(tmp_path):
+    from orchestrator.main import _pass_progress
+
+    ws = tmp_path / "ws"
+    (ws / "out").mkdir(parents=True)
+    (ws / "out" / "prior.json").write_text(
+        json.dumps({"credentials": ["Passw0rd!123"], "assets": ["10.0.0.1:80"]}),
+        encoding="utf-8",
+    )
+    report = SimpleNamespace(new_matches=0)
+    assert _pass_progress(report, 0, ws) is False
+    (ws / "out" / "flags").mkdir()
+    (ws / "out" / "flags" / "000.txt").write_text(
+        "flag{93a3880a-5dfa-4bcb-8ee7-ea93bac9d214}", encoding="utf-8"
+    )
+    assert _pass_progress(report, 0, ws) is True

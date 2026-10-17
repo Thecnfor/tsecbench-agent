@@ -284,6 +284,16 @@ def _is_new_endpoint(value: str, endpoints: set, hosts: set) -> bool:
     return host not in hosts
 
 
+def _pass_progress(report, early_new: int, ws: Path) -> bool:
+    """pass 级进展只认 flag 候选/命中；未验证的 credentials 不算。
+
+    c-03 的 prior 里长期留着 JS 串里的 Passw0rd!123，zero-progress 调度
+    因此永远认为它“有进展”，把 fresh 的 e1/e2 题挤掉；pass 级必须用
+    可验证的 flag 信号，候选凭据只影响 probe 续片，不影响槽位经济学。
+    """
+    return bool(report.new_matches or early_new) or bool(harvest(ws))
+
+
 def _slice_has_progress(ws: Path) -> bool:
     """widen/续片门控的进展信号：只认**新信息**。
 
@@ -595,7 +605,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
 
     # 槽位经济学：pass 级进展信号。无新 flag 且无新事实 → 零进展次数 +1，
     # 调度器会把该题沉底并停止补位；一旦出现事实/flag 则清零。
-    pass_progress = bool(report.new_matches or early_new) or _slice_has_progress(ws)
+    pass_progress = _pass_progress(report, early_new, ws)
     if pass_progress:
         rec.zero_progress_passes = 0
     elif not (rec.is_completed or report.completed or early_completed):
