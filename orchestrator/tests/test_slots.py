@@ -8,9 +8,7 @@ from orchestrator.main import _active_slots
 
 
 def test_active_slots_counts_running_pipelines_only():
-    ctx = SimpleNamespace(
-        running={"a", "b"}, registry=SimpleNamespace(active_count=lambda: 99)
-    )
+    ctx = SimpleNamespace(running={"a", "b"}, registry=SimpleNamespace(active_count=lambda: 99))
     assert _active_slots(ctx) == 2
 
 
