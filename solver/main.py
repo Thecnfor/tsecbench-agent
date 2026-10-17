@@ -108,6 +108,14 @@ def _persist_harness_state(messages: list[dict]) -> None:
         pass
 
 
+def _foreign_workspace_output(text: str) -> bool:
+    code = str(common.TASK.get("unique_code") or "")
+    for match in re.finditer(r"workspaces/workspaces/([A-Za-z0-9-]+)_attempt", text):
+        if code and match.group(1) != code:
+            return True
+    return False
+
+
 def _fact_signature(text: str) -> set[str]:
     """高价值事实签名：凭据 / 新 host:port / flag。
 
@@ -443,8 +451,9 @@ def main() -> int:
             print(f"[solver]   -> {meta}", flush=True)
             if out.strip():
                 print(out, flush=True)
-            for flag in find_flags(raw_output):
-                report_candidate(flag)
+            if not _foreign_workspace_output(raw_output):
+                for flag in find_flags(raw_output):
+                    report_candidate(flag)
 
             remaining = common.remaining_seconds()
             # 剩余预算是 harness 状态：每条结果都带，模型自定节奏（不靠提示词叮嘱）
