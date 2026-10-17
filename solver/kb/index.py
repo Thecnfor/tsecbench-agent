@@ -101,8 +101,9 @@ class Index:
             import sqlite3
 
             self._db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
-        else:
-            self._build()
+        # curated md 始终进内存索引：unified.db 只含外部语料，忽略 md 会让
+        # solver/kb/*.md 在运行期不可检索。
+        self._build()
 
     def _query_fts(self, text: str, top_k: int) -> list[dict]:
         toks = _tokenize(text)
@@ -117,7 +118,12 @@ class Index:
             (match, top_k),
         ).fetchall()
         return [
-            {"doc": row[0], "section": row[1], "score": round(-row[3], 2), "body": row[2][:MAX_SNIPPET_CHARS]}
+            {
+                "doc": row[0],
+                "section": row[1],
+                "score": round(-row[3], 2),
+                "body": row[2][:MAX_SNIPPET_CHARS],
+            }
             for row in rows
         ]
 
@@ -132,14 +138,21 @@ class Index:
                     self.postings.setdefault(token, {})[idx] = 3.0 if token in title_tokens else 1.0
 
     def query(self, text: str, top_k: int = 3) -> list[dict]:
-        """IDF 加权打分：标题 3 倍权重，**稀有词权重更高**。
+        """curated md 命中优先，其后接 FTS 语料命中。
 
         纯词频会被长片段刷分 —— 实测「格式校验」这类长节靠通用词
         （系统/功能/部署）压过真正相关的节。IDF 让 `pydash` 这种稀有词
         一票顶过十几个「系统」。
         """
-        if self._db is not None:
-            return self._query_fts(text, top_k)
+        local = self._query_local(text, top_k)
+        if self._db is None:
+            return local
+        remote = self._query_fts(text, top_k)
+        seen = {(hit["doc"], hit["section"]) for hit in local}
+        merged = local + [hit for hit in remote if (hit["doc"], hit["section"]) not in seen]
+        return merged[:top_k]
+
+    def _query_local(self, text: str, top_k: int) -> list[dict]:
         n = max(1, len(self.sections))
         scores: dict[int, float] = {}
         for token in _tokenize(text):
