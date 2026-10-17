@@ -10,7 +10,7 @@ import { solveTask } from "../src/agent.js";
 import { CFG } from "../src/config.js";
 import { callLlm, LlmHttpError, resetEffortState } from "../src/llm.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
-import type { ChatMessage, LlmClient } from "../src/types.js";
+import type { LlmClient } from "../src/types.js";
 
 const SNAP = { ...CFG };
 

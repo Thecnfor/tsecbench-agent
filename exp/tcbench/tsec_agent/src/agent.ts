@@ -866,9 +866,7 @@ export async function solveTask(
     // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）。
     // 多 flag 总结轮（submit 后要求的 flag 探索总结）→ kind_note 标记（rebuild 压缩锚之一）。
     const isFlagSummaryTurn =
-      !toolCallsRaw.length &&
-      flagSummariesPending.has(br.id) &&
-      !!(msg.content && msg.content.trim());
+      !toolCallsRaw.length && flagSummariesPending.has(br.id) && !!msg.content?.trim();
     conv.write("assistant", {
       branch: br.id,
       turn: tlabel,
@@ -902,7 +900,7 @@ export async function solveTask(
     if (!toolCallsRaw.length) {
       // 总结轮（submit 后系统要求的该 flag 探索总结）——conv 已标 kind_note=flag_summary
       const pendIdx = flagSummariesPending.get(br.id)?.idx;
-      if (pendIdx !== undefined && msg.content && msg.content.trim()) {
+      if (pendIdx !== undefined && msg.content?.trim()) {
         br.flagSummaries.push({ idx: pendIdx, text: msg.content.trim() });
         flagSummariesPending.delete(br.id);
         if (flagTotal > 1) {

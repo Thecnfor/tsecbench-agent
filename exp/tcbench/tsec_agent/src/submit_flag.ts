@@ -8,8 +8,7 @@
  *   flag 账本/flag 主时钟/corelog flag 卡——不再依赖 shell 输出正则（保留兜底）。
  * - unique_code 由 controller 填（模型只给 flag 值，防跨题误提交）。 */
 
-import type { BranchManager } from "./branch.js";
-import type { CorelogWriter, FlagLedger } from "./corelog.js";
+import type { FlagLedger } from "./corelog.js";
 
 export const SUBMIT_FLAG_TOOL_SCHEMA = {
   type: "function",

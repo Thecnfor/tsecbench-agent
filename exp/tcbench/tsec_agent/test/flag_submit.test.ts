@@ -180,8 +180,8 @@ describe("多 flag 总结压缩（solveTask 集成）", () => {
     expect(firstToolAssistant).toBeGreaterThan(contIdx); // 轮1 的 submit 已被压掉，轮3 的在继续之后
     // 中间探索过程（轮1 的 submit assistant 不在头部后……）——等价断言走 rebuild
     const rebuilt = rec().loadMessages("t-c2");
-    expect(rebuilt.map((m) => m.role + "|" + String(m.content ?? "").slice(0, 10))).toEqual(
-      r.messages.map((m) => m.role + "|" + String(m.content ?? "").slice(0, 10)),
+    expect(rebuilt.map((m) => `${m.role}|${String(m.content ?? "").slice(0, 10)}`)).toEqual(
+      r.messages.map((m) => `${m.role}|${String(m.content ?? "").slice(0, 10)}`),
     );
     // conv：flag_summary 恰 1、flag_continue 恰 1（第二 flag 无总结=设计）
     const convRecs = fs

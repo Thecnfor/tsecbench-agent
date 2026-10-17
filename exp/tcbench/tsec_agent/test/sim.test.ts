@@ -48,7 +48,7 @@ describe("调度模拟：防饿死（用户核心诉求）", () => {
     let worstLag = 0;
     let worstBound = 0;
     for (let seed = 0; seed < 50; seed++) {
-      const gen = SCENARIOS["realistic"]({ seed });
+      const gen = SCENARIOS.realistic({ seed });
       // 分区下长题占 cap-1，短题长期只有 1 槽——尾部启动的物理下界 = 短题总工作量/1
       const shortWork = gen
         .filter((g) => !(g.pub.flag_count >= 2 || g.pub.difficulty === "hard" || g.pub.level >= 3))
