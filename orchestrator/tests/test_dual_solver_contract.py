@@ -77,6 +77,7 @@ def test_build_pi_cmd_override(dual_module):
 def test_build_pi_cmd_default_npx(dual_module, monkeypatch):
     mod, _ = dual_module
     monkeypatch.delenv("SOLVER_PI_CMD", raising=False)
+    monkeypatch.delenv("PI_BIN", raising=False)  # 本地 .env 可能设置 vendored pi
     monkeypatch.setenv("PI_PACKAGE", "@earendil-works/pi-coding-agent")
     monkeypatch.setenv("PI_VERSION", "1.1.0")
     cmd = mod.build_pi_cmd("solve it")

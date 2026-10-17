@@ -9,6 +9,7 @@ task.json 不带 targets → recon 步零外部命令，纯离线。
 from __future__ import annotations
 
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -29,6 +30,7 @@ print("FLAG{ts_stub_1234}")
 """
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node 不在 PATH（环境性）")
 def test_ts_workflow_contract(tmp_path, monkeypatch, capsys):
     task = tmp_path / "task.json"
     task.write_text(json.dumps({"unique_code": "ts1"}), encoding="utf-8")  # 无 targets → recon 跳过
