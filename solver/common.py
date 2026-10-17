@@ -167,6 +167,11 @@ class _PersistentShell:
             bufsize=0,
             start_new_session=True,
         )
+        with contextlib.suppress(OSError):
+            if SOLVER_TASK_PATH:
+                pid_path = Path(SOLVER_TASK_PATH).parent / "out" / "shell.pid"
+                pid_path.parent.mkdir(parents=True, exist_ok=True)
+                pid_path.write_text(str(self.proc.pid), encoding="utf-8")
 
     def stop(self) -> None:
         if self.proc is None:
@@ -175,6 +180,9 @@ class _PersistentShell:
             os.killpg(self.proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             self.proc.wait(timeout=2)
+        with contextlib.suppress(OSError):
+            if SOLVER_TASK_PATH:
+                (Path(SOLVER_TASK_PATH).parent / "out" / "shell.pid").unlink()
         self.proc = None
 
     def run(self, command: str, timeout: int) -> dict:
@@ -262,6 +270,11 @@ def reset_shell_session() -> None:
 atexit.register(reset_shell_session)
 
 
+_ROOT_SCAN_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:find|grep|rg|du|tar)\s+(?:-[^\s]+\s+)*/(?:\s|$|mnt\b)"
+)
+
+
 def run_command(command: str, timeout: int, *, isolated: bool = False) -> dict:
     """Run a shell command inside the challenge container (or locally).
 
@@ -274,6 +287,16 @@ def run_command(command: str, timeout: int, *, isolated: bool = False) -> dict:
     目标挂死时只有宿主侧 `t+20` 的粗杀兜底 —— 一条命令白烧 120s+ 时间片。
     内层 timeout 让超时精确到 t；外层仍 kill 整个进程组防孤儿。
     """
+    if _ROOT_SCAN_RE.search(command):
+        return {
+            "exit_code": 126,
+            "output": (
+                "root-wide scan blocked: search /challenge, /app, /root, /tmp, "
+                "or the workspace only (never / or /mnt)"
+            ),
+            "timed_out": False,
+            "seconds": 0.0,
+        }
     if PERSISTENT_SHELL and not CONTAINER and not isolated:
         global _SHELL
         if _SHELL is None:
@@ -1277,6 +1300,8 @@ Hard rules:
   Verify any credential with a real login/200 before building a chain.
 - 127.0.0.1/localhost URLs in HTML/JS are server-side references; you cannot reach them.
   Only the target host/port is reachable; use the frontend as a proxy if needed.
+- Never scan `/` or `/mnt`: root-wide find/grep/du is blocked. Search /challenge, /app,
+  /root, /tmp, or the workspace only.
 {shell_rule}
 - Flags: report exactly as found; multi-flag challenges continue until all flags are submitted.
 - No hints exist. Solve from local analysis; never probe the platform or LLM side.

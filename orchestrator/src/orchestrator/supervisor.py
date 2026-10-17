@@ -203,6 +203,18 @@ def collect_prior(ws: Path) -> dict:
 
 
 # ---------------------------------------------------------------- spawn ----
+def _kill_shell(ws: Path) -> None:
+    pid_path = ws / "out" / "shell.pid"
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        pid_path.unlink()
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     """杀整个进程组（POSIX）；Windows 退化杀单进程。"""
     if os.name == "posix":
@@ -283,6 +295,7 @@ async def run_solver(
     finally:
         # 超时 / 任务取消（pipeline 异常）都必须杀掉进程组：否则 solver 与它
         # 拉起的 nmap/curl 会变成孤儿继续跑（run-35236 c-06 实测）。
+        _kill_shell(ws)
         if proc.poll() is None:
             _kill_now(proc)
         stdout_f.close()

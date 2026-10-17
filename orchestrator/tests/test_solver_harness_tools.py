@@ -445,3 +445,11 @@ def test_detect_known_terms_and_known_issue_snippet(common, monkeypatch):
 def test_command_failed_and_hypothesis_key_removed_after_merge():
     """1234 helpers were dropped by the upgrade-ab merge; see test suite history."""
     pass
+
+
+def test_root_wide_scan_is_blocked(common):
+    out = common.run_command("find / -name flag", 5)
+    assert out["exit_code"] == 126
+    assert "blocked" in out["output"]
+    ok = common.run_command("find /challenge -name flag", 5)
+    assert ok["exit_code"] != 126

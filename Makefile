@@ -48,6 +48,7 @@ run: clean-tmp
 ## 只有改 orchestrator/ 才需要这个（进程启动即把代码载入内存）。
 ## 重启走崩溃恢复：journal + 平台对账续跑，已解出的题不会丢。
 rerun:
+	-@scripts/kill_orphan_shells.sh
 	-@pkill -f '/solver/main\.py$$' 2>/dev/null
 	-@pkill -f 'python -m orchestrator$$' 2>/dev/null
 	@for i in $$(seq 1 20); do pgrep -f '/solver/main\.py$$' >/dev/null || break; sleep 0.5; done
