@@ -179,7 +179,7 @@ export interface Config {
   stall_long_sec: number;
   flag_stall_short_sec: number;
   flag_stall_long_sec: number;
-  // core_log 轮级轻推（执行层兜底）
+  // log 轮级轻推（执行层兜底）
   core_log_nudge_rounds: number;
   core_log_nudge_max: number;
   // 思考档位分档（空=不发=模型默认档）
@@ -254,7 +254,7 @@ export const CFG: Config = {
   branch_prune_sec: num("AGENT_BRANCH_PRUNE_SEC", "1200"), // corelog/flag 双停滞剪枝
   broadcast_max: num("AGENT_BROADCAST_MAX", "8"), // 每段每分支广播上限
 
-  // --- 旁观者（默认关；依赖 core_log 工具，可单独于 fork 打开） ---
+  // --- 旁观者（默认关；依赖 log 工具，可单独于 fork 打开） ---
   bystander_enabled: ["1", "on", "true"].includes(env("AGENT_BYSTANDER", "0").toLowerCase()),
   bystander_max: num("AGENT_BYSTANDER_MAX", "2"), // 每段每分支旁观者上限
   bystander_cooldown_sec: num("AGENT_BYSTANDER_COOLDOWN_SEC", "400"),
@@ -264,7 +264,7 @@ export const CFG: Config = {
   // flag 主时钟（题级，旁观者核心信号）：长时间没 flag 就介入
   flag_stall_short_sec: num("AGENT_FLAG_STALL_SHORT_SEC", "400"),
   flag_stall_long_sec: num("AGENT_FLAG_STALL_LONG_SEC", "900"),
-  // core_log 执行层兜底（轮级轻推，零 LLM 调用）：连续 N 轮无 core_log →
+  // log 执行层兜底（轮级轻推，零 LLM 调用）：连续 N 轮无 log →
   // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给旁观者。
   core_log_nudge_rounds: num("AGENT_CORE_LOG_NUDGE_ROUNDS", "3"),
   core_log_nudge_max: num("AGENT_CORE_LOG_NUDGE_MAX", "2"),

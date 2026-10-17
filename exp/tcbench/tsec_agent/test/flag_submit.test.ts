@@ -193,7 +193,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     const convRecs = readJsonl(recdir, "tasks/t-c2/conversation.jsonl");
     expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBe(1); // 仅 flag#0 后一次
     expect(convRecs.filter((x) => x.kind === "tool" && x.tool === "submit_flag").length).toBe(2);
-    const coreRecs = readJsonl(recdir, "tasks/t-c2/corelog.jsonl");
+    const coreRecs = readJsonl(recdir, "tasks/t-c2/log.jsonl");
     const handoff = coreRecs.filter((x) => String(x.note ?? "").startsWith("【压缩交接】"));
     expect(handoff.length).toBeGreaterThanOrEqual(1);
     expect(String(handoff[0].note)).toContain("Admin@123");
@@ -327,7 +327,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     );
     expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
     // 自动黑板：进展叙述（≥8 字 content）落卡；【压缩交接】卡同步
-    const core = readJsonl(recdir, "tasks/t-c3/corelog.jsonl");
+    const core = readJsonl(recdir, "tasks/t-c3/log.jsonl");
     expect(core.some((x) => String(x.note ?? "").includes("注入拿到"))).toBe(true);
     expect(core.some((x) => String(x.note ?? "").startsWith("【压缩交接】"))).toBe(true);
   });

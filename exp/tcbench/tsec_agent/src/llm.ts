@@ -271,7 +271,7 @@ export function setStopCheck(fn: () => boolean): void {
  * - finite：最多 api_max_retries 次后抛出。
  * - 4xx（认证/参数错误，非 429）：立即抛出，不重试。
  * - useTools=false：复盘总结轮/旁观者轮用——不下发工具，模型只能输出文本。
- * - extra.tools：动态工具集（fork/core_log/broadcast 开启时由 solveTask 组装）；
+ * - extra.tools：动态工具集（fork/log/broadcast 开启时由 solveTask 组装）；
  *   缺省仍只有 shell（默认行为不变）。
  * - extra.thinking：轻调用（旁观者/复盘）传 {type:"disabled"} 省 completion——
  *   实测 thinking 占 completion 68-87%、占单题成本 37-69%（跨 4 run 归档统计）。

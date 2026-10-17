@@ -1,4 +1,4 @@
-/** fork / core_log / broadcast 三工具的 schema 与分发。
+/** fork / log / broadcast 三工具的 schema 与分发。
  *
  * 全分支同一套 schema（稳定前缀 → 缓存不炸，见 ../cache_exp/README.md 结论 2）；
  * 只有 AGENT_FORK / AGENT_BYSTANDER 打开时才把对应工具挂进请求（callLlm 动态组装）。
@@ -21,7 +21,7 @@ export const FORK_TOOL_SCHEMA = {
       "The new branch inherits everything you have seen so far and gets its own working " +
       "directory; you keep going down your current path. Only a few branches are allowed " +
       "per task (refusals return a reason — continue then). Communicate findings to other " +
-      "branches with broadcast; record key discoveries with core_log.",
+      "branches with broadcast; record key discoveries with log.",
     parameters: {
       type: "object",
       properties: {
@@ -40,11 +40,11 @@ export const FORK_TOOL_SCHEMA = {
 export const CORE_LOG_TOOL_SCHEMA = {
   type: "function",
   function: {
-    name: "core_log",
+    name: "log",
     description:
       "Record a key finding, new direction, dead end, or a captured flag as ONE short line " +
       "in the task's core log. Use it often: the log is how other branches and the outer " +
-      "observer understand progress, and branches that go quiet without core_log/flag " +
+      "observer understand progress, and branches that go quiet without log/flag " +
       "activity get recycled. After submitting a flag, log `flag idx=N` (the " +
       "matched_flag_index from the submit response).",
     parameters: {
@@ -93,7 +93,7 @@ export const BROADCAST_TOOL_SCHEMA = {
   },
 };
 
-export const BRANCH_TOOL_NAMES = ["fork", "core_log", "broadcast"];
+export const BRANCH_TOOL_NAMES = ["fork", "log", "broadcast"];
 
 /** fork 分发的结果：待 materialize 的 pending（由 solveTask 在轮末处理）。 */
 export interface PendingFork {
@@ -136,13 +136,13 @@ export function dispatchBranchTool(
       result:
         `branch ${res.id} reserved for direction: ${direction.slice(0, 120)}. ` +
         `It will start with your context copied so far; you continue on branch ${branchId}. ` +
-        `Findings flow between branches via broadcast/core_log.`,
+        `Findings flow between branches via broadcast/log.`,
       pendingFork: { reservation: res, parentId: branchId, direction, callId },
     };
   }
-  if (name === "core_log") {
+  if (name === "log") {
     const note = String(args.note ?? "").trim();
-    if (!note) return { result: "error: `note` is required for core_log" };
+    if (!note) return { result: "error: `note` is required for log" };
     corelog?.write({ branch: branchId, kind: "core", note: note.slice(0, 400) });
     bm.recordCore(branchId, now());
     // flag idx=N 的自述也进账本（权威仍以 watcher 快照 + submit 响应对账）
@@ -150,8 +150,8 @@ export function dispatchBranchTool(
     if (m && ledger) ledger.add(Number(m[1]), branchId);
     return {
       result:
-        `logged to core log (branch ${branchId}): ${note.slice(0, 120)}` +
-        `（黑板 tasks/<题目编号>/corelog.jsonl 全分支可读）`,
+        `logged (branch ${branchId}): ${note.slice(0, 120)}` +
+        `（黑板 tasks/<题目编号>/log.jsonl 全分支可读）`,
     };
   }
   if (name === "broadcast") {

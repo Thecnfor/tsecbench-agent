@@ -5,18 +5,18 @@
 +prompt.ts FORK_PROMPT_EXTRA、§3→branch.ts `prune`、§4→branch.ts `reserveFork` 护栏、
 §5→bystander.ts + agent.ts `maybeBystander`、§6→records.ts `rebuildBranches`/corelog.ts。
 缓存红线全部落实：分支指令 append 不动 system、广播/旁观者/剪枝摘要一律尾部追加、
-轮转单飞天然串行（分支首请求并发竞争已被实测否决）。面板：LiveView 带分支名册与 corelog 尾部。
+轮转单飞天然串行（分支首请求并发竞争已被实测否决）。面板：LiveView 带分支名册与 黑板 尾部。
 
 ## 总纲（协作思想，行为改动先对齐这里）
 
 - **界由 fork 划定，不轻越**：分支的范畴/任务只由 fork 指令规定；旁观者、广播、轻推等
   一切注入**不得给已分工的分支改派范畴外任务**——旁观者输入必须带「各分支分工」、
   系统提示有对应硬约束（实测教训：旁观者曾让已分工的分支 1「停手转去做主分支的活」，
-  方向被弃用 + 重复劳动）；执行侧同理「不要轻易跨界，范畴外的发现走 core_log/上行广播」。
+  方向被弃用 + 重复劳动）；执行侧同理「不要轻易跨界，范畴外的发现走 log/上行广播」。
   换方向 = 主分支 fork 新分支，不是改道别人。
 - **广播拓扑是星型（单向上行），不是全连网**：非主分支只发主分支（branch 0），
   横向目标自动改投主分支、由它统筹转发，子分支之间不直连；主分支 → 任意分支的下行
-  保留。信息共享的主通道是 core_log 黑板，broadcast 只做「需要对方知道/协调」的点对点。
+  保留。信息共享的主通道是 log 黑板，broadcast 只做「需要对方知道/协调」的点对点。
 
 ## 0. 依据（cache_exp 实测，deepseek-flash）
 
@@ -39,11 +39,11 @@
   活跃 >`AGENT_MAX_BRANCHES`(3) / 总数 ≥`AGENT_FORK_MAX`(5) / 冷却
   <`AGENT_FORK_COOLDOWN_SEC`(180s)。新分支记录 `parent`（面板树视图/审计）；
   首请求排队（并发首发护栏）
-- **`core_log(note: str)`**：落 `corelog.jsonl` `{ts, branch, seq, note}`。旁观者与面板的
+- **`log(note: str)`**：落 `log.jsonl` `{ts, branch, seq, note}`。旁观者与面板的
   唯一抽象层；不注入其他分支；controller 天然携带 branch，无文本解析
 - **flag 事件（controller + 模型混合权威）**：flag 的稳定 ID = submit 响应的
   **`matched_flag_index`**——flag **内容**会因靶机重启/重置而变，**索引不变**
-  （`1..total_flag_count`）。分工：**模型**在 submit 后立即 `core_log` 记
+  （`1..total_flag_count`）。分工：**模型**在 submit 后立即 `log` 记
   `flag idx=<matched_flag_index>`（模型能从 curl 响应直接看到该字段）；
   **controller** 以 watcher 快照的 `correct_flag_count` 跳变为权威触发
   `{kind:"flag", branch, flag_index, correct_flag_count, total_flag_count}` 落账
@@ -76,7 +76,7 @@
   **fork 权不限 trunk**（护栏兜底，见 §4）
 - **不存在历史合并**：各分支 messages 永不互插中段（缓存红线）。合并 = 发现层：
   ① broadcast 星型互通（子→主上行、主→任意下行，横向经主中转）② 剪枝/分支自停时
-  controller 把该分支 corelog 尾部摘要 append 进 trunk
+  controller 把该分支 黑板 尾部摘要 append 进 trunk
 - 分支自停条件：拿满 flag（→ 全停收束）/ 主动放弃 / 被剪枝
 
 ## 4. 防无止境分支（护栏，全部 env 可调）
@@ -87,7 +87,7 @@
 | `AGENT_FORK_MAX` | 5 | 每题 fork 总数硬上限（含分支再分叉；树大小有界） |
 | `AGENT_FORK_COOLDOWN_SEC` | 180 | fork 冷却（对所有分支生效） |
 | 预算共享 | 固定 | **fork 不增预算**：全分支共享段墙钟与轮数，分支越多每线越薄 |
-| `AGENT_BRANCH_PRUNE_SEC` | 1200 | 分支 corelog/flag 双停滞 → 自动剪枝 + 摘要注入 trunk（**B 方案 2026-10-16**：曾为 600=与长题停滞阈值同值，剪枝先执行令分支旁观者窗口为0；1200 使 900s 触发后仍有 300s 救治窗） |
+| `AGENT_BRANCH_PRUNE_SEC` | 1200 | 分支 黑板/flag 双停滞 → 自动剪枝 + 摘要注入 trunk（**B 方案 2026-10-16**：曾为 600=与长题停滞阈值同值，剪枝先执行令分支旁观者窗口为0；1200 使 900s 触发后仍有 300s 救治窗） |
 
 > 分支可再分叉：深度不单独设限——活跃上限 3 + 总数上限 5 + 冷却 + 预算共享
 > 四道闸叠加后树天然有界（最坏 3 层：trunk→b1→b2 且总数 5 截断）。
@@ -106,17 +106,17 @@
   仅 flag 时钟触发（分支在干活但没 flag，如记卡型空转）→ 盯**最新鲜推进线**
   （lastCoreTs 最新）；无可选 → trunk
 - **时钟必须跨段持久（2026-10-16 run4 实测修复）**：flag/停滞时钟锚在
-  **题起点（TASK_START_TS，跨段不重置）+ corelog 最后事件**，solveTask 启动时恢复——
+  **题起点（TASK_START_TS，跨段不重置）+ 黑板 最后事件**，solveTask 启动时恢复——
   旧实现锚在 BranchManager 构造（每段归零），而段墙钟 = min(段上限, 剩余时限/6)
   会被短限时压到 ~192s（arena 2400s 实测），900s flag 主时钟与 600s 停滞在段内
   **数学上永不可达**（run4 旁观者全程静默的真相）。诊断日志：`flag-stall ARMED` /
   `bystander SKIPPED` 各每段一条，定位时钟与限频问题。
 - **输入构建（处理交错，按分支分组）**：**各分支分工**（id→方向名册，见总纲「不轻越」）
-  → 分支 A corelog（时序）→ 分支 B corelog（时序）
+  → 分支 A 黑板（时序）→ 分支 B 黑板（时序）
   → 全局进度（**flag 索引账本** `2/5 (idx:1,3)` + 耗时/分支数）→ 卡塞分支最近 10 条消息摘要
 - **分工尊重（2026-10-17 实测修正）**：非主分支有专属 fork 方向时，指引必须**服务该方向**
   （方向内更细的角度/工具/验证），**不得弃用方向改派别的任务**、不得让它转做其他分支
-  已负责的工作；方向已死 → 就地最小证伪 + core_log 记结论待回收，换方向是 fork 的事
+  已负责的工作；方向已死 → 就地最小证伪 + log 记结论待回收，换方向是 fork 的事
   （实测：旁观者曾连续让已分工分支改做主分支的枚举活）。
 - **本体**：同款 deepseek-flash 换 system（抽象全局视角；hosted 已验证可用）；
   独立短上下文，与主对话缓存互不干扰
@@ -126,46 +126,46 @@
 ## 6. 记录与续跑
 
 - `conversation.jsonl`：单流追加 + **`branch` 字段**（对话忠实落盘不变量保持）
-- `corelog.jsonl`：新增，独立文件，
+- `log.jsonl`：新增，独立文件，
   `{ts, branch, seq, kind: core|broadcast|bystander|flag, note?, flag_index?,
   correct_flag_count?, total_flag_count?}`——flag 以 **index 为 ID**（内容随靶机重启变，索引不变）
 - `rebuildMessages` 按 branch 重建多份 messages；tasks.jsonl 生命周期不变
-- panel：分支泳道（甘特图 llm/tool 泳道按 branch 分色）、corelog 视图、旁观者事件标记
+- panel：分支泳道（甘特图 llm/tool 泳道按 branch 分色）、黑板 视图、旁观者事件标记
 
 ## 7. 开关与默认
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `AGENT_FORK` | 0 | fork 工具与分支调度 |
-| `AGENT_BYSTANDER` | 0 | 旁观者（依赖 core_log 工具，可单独开） |
+| `AGENT_BYSTANDER` | 0 | 旁观者（依赖 log 工具，可单独开） |
 | 其余 | 上表 | 全部可 env 覆盖 |
 
 初赛镜像保持两开关默认 off；决赛（多智能体赛制）开启。
 
 ## 8. 合规
 
-- 旁观者只读运行时派生的 corelog，不引入任何历史题解/题目特化内容
-- 广播与旁观者消息全部落 conversation.jsonl/corelog.jsonl，审计友好
+- 旁观者只读运行时派生的 黑板，不引入任何历史题解/题目特化内容
+- 广播与旁观者消息全部落 conversation.jsonl/log.jsonl，审计友好
 - 不改动平台流程、flag 收割、VPN/预检等既有不变量
 
 ## 9. arena 实测修正（2026-10-16 首跑）
 
-**现象**：f2-05 跑 8 分钟 28 轮、反复使用 VM_KEY07（146 处），却 0 core_log / 0 fork
-（同 run 的 web_sqli_01 正常调用 core_log → 工具链无 bug，tools 每轮随请求下发）；
+**现象**：f2-05 跑 8 分钟 28 轮、反复使用 VM_KEY07（146 处），却 0 log / 0 fork
+（同 run 的 web_sqli_01 正常调用 log → 工具链无 bug，tools 每轮随请求下发）；
 旁观者未触发 = 停滞阈值 600s 而 run 494s 即停，三信号均未成立（按设计）。
 
 **结论与修正**：
-- **A. prompt 触发判据具体化**（prompt.ts）：core_log 从抽象「关键发现」改为
+- **A. prompt 触发判据具体化**（prompt.ts）：log 从抽象「关键发现」改为
   **黑板（blackboard）证据卡**语汇——证据类（凭据/密钥/中间产物如 VM_KEY07、
   端口版本、2xx 命中、校验常量）与判断类（路径证伪/新假设/阶段切换）逐项列举，
   频率「每 ≤5 轮或换方向至少一张」，后果「黑板空白=停滞回收」；
   fork 加**渗透流程时机判据**（长活挂后台 × 开第二条攻击线，典型如
   web 路径爆破 × 本地二进制逆向并行）。
-- **B. core_log 轮级轻推**（agent.ts，执行层兜底，零 LLM 调用）：分支连续
-  `AGENT_CORE_LOG_NUDGE_ROUNDS`（默认 3）轮无 core_log/flag → 在该轮**最后一个
+- **B. log 轮级轻推**（agent.ts，执行层兜底，零 LLM 调用）：分支连续
+  `AGENT_CORE_LOG_NUDGE_ROUNDS`（默认 3）轮无 log/flag → 在该轮**最后一个
   工具结果尾部**附提醒（append-only 保缓存、conv 忠实落盘）；每段每分支最多
   `AGENT_CORE_LOG_NUDGE_MAX`（默认 2）次、注入后归零给 3 轮响应期；
-  `multiOn` 闸保证只在 core_log 工具在场时注入（常规模式无该工具会诱导 unknown tool）。
+  `multiOn` 闸保证只在 log 工具在场时注入（常规模式无该工具会诱导 unknown tool）。
   分工：B = 轮级分钟级轻推；旁观者 = 时间/行为信号的重量级插嘴。
 - 观察留档：repeat 信号对「同前缀不同参数」的命令不敏感（8 条 `cd…; echo "` 系
-  内容不同，合理不算重复）；长题零 corelog 的实际介入时点 = max(第4轮轻推, 600s+二信号)。
+  内容不同，合理不算重复）；长题零 黑板 的实际介入时点 = max(第4轮轻推, 600s+二信号)。

@@ -57,7 +57,7 @@
 
 1. **单工具设计（2026-10-16 放宽）**：基础工具只有 `shell`（异步 background 模式），**无 MCP**。
    fork 多分支与旁观者是**控制器层能力**（默认关，`AGENT_FORK=0`/`AGENT_BYSTANDER=0`），
-   打开后工具集扩展为 `shell + fork + core_log + broadcast`——这是与评测方对齐后的演进
+   打开后工具集扩展为 `shell + fork + log + broadcast`——这是与评测方对齐后的演进
    （初赛镜像两开关默认 off，行为与旧版逐语义一致）。read/write/web 等文件类工具仍禁止
    （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-bystander-design.md`，
    缓存实测依据见 `../cache_exp/README.md`。
@@ -133,14 +133,14 @@
      ④当前进度⑤flag 进度，≤1500 字），整体替换为 [system, 任务卡, 文档]——
      治逐 flag 总结 120 字太瘦导致的重新收集；conv 记 `kind_note:"context_compact"`
      （**注入全文**，重建锚 = 最后一条该类记录 + 其后过程，三方同文）；
-     corelog 同步一张【压缩交接】卡；压缩是元调用不占轮次。
+     黑板同步一张【压缩交接】卡；压缩是元调用不占轮次。
      **单 flag 收尾总结轮保留**（submit 后 ≤120 字总结即收尾）。
    - **自动黑板（2026-10-17，治"提示词暗示不可靠"）**：模型每轮的**进展叙述**
-     （assistant content，不含 thinking/tool；≥8 字）由控制器**自动落 corelog 卡**
+     （assistant content，不含 thinking/tool；≥8 字）由控制器**自动落黑板卡**
      （≤400 字/轮）——b-02 实测 123 次 shell 仅 1 张实质卡，靠提示词自觉记黑板
      不可行；记卡即核心事件（停滞时钟刷新，黑板确实在长不算隐形空转）。
-     core_log 提示相应减负（撤"立刻记×3/频率/回收威胁"轰炸，保留"写凭据/证伪/flag idx
-     + 判断带置信"）；手动 core_log 仍用于证据卡与 flag idx 记账。
+     log 提示相应减负（撤"立刻记×3/频率/回收威胁"轰炸，保留"写凭据/证伪/flag idx
+     + 判断带置信"）；手动 log 仍用于证据卡与 flag idx 记账。
    - **只有三种终止**：上下文超模型窗口（`context_overflow`，立即停不重试）、
      连续 `AGENT_GIVEUP_MAX`（默认 3）段「未通关就输出总结」、真失败累计
      `AGENT_MAX_FAILURES`（默认 2）次；其余情况一律续跑到通关或平台终态。
@@ -164,7 +164,7 @@
      埋点在 `solve_task`/`closing_summary`）——直接可画甘特图（llm/tool 泳道）；
    - **fork 分支记录（2026-10-16 增）**：conversation.jsonl 单流追加 + `branch` 字段
      （0=trunk，缺省视为 0 兼容旧记录）；分支创建写 `kind_note:"fork_directive"`
-     （含 parent_branch/fork_seq/fork_label）；**`corelog.jsonl` 独立文件**记
+     （含 parent_branch/fork_seq/fork_label）；**`log.jsonl` 独立文件**记
      core/broadcast/bystander/flag/prune/fork 六类核心事件，**flag 以
      `matched_flag_index` 为稳定 ID**（内容随靶机重启变、索引不变）；
      暂停续跑时 trunk 用 `rebuildMessages`（branch=0 过滤）、分支用 `rebuildBranches`
@@ -199,10 +199,10 @@
 | `tsec_agent/src/shell.ts` + `shell_tool.ts` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parseToolArguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
 | `tsec_agent/src/llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换 | 网关协议/鉴权变化 |
 | `tsec_agent/src/prompt.ts` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
-| `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl（+corelog.jsonl）；`rebuildMessages`/`rebuildBranches` 从对话重建续跑上下文（分支按 fork_seq 截断） | 记录字段调整、续跑上下文 |
+| `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl（+log.jsonl）；`rebuildMessages`/`rebuildBranches` 从对话重建续跑上下文（分支按 fork_seq 截断） | 记录字段调整、续跑上下文 |
 | `tsec_agent/src/branch.ts` | fork 多分支执行面：分支状态/护栏（存活≤3、总数≤5、冷却 180s、剪枝 1200s）/轮转调度/广播（尾部追加+限频+去重；**星型拓扑**：非主分支只上行主分支，横向目标改投 0 由主转发） | 分支策略调整 |
-| `tsec_agent/src/branch_tools.ts` | fork/core_log/broadcast 三工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize 保证 tool 配对完整） | 工具契约变化 |
-| `tsec_agent/src/corelog.ts` | corelog.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ 旁观者分组视图 | 核心日志格式 |
+| `tsec_agent/src/branch_tools.ts` | fork/log/broadcast 三工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize 保证 tool 配对完整） | 工具契约变化 |
+| `tsec_agent/src/corelog.ts` | log.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ 旁观者分组视图 | 黑板日志格式 |
 | `tsec_agent/src/bystander.ts` | 旁观者：flag 主时钟一票 + 四信号任二 + 输入构建（**各分支分工名册**、按分支分组防交错难读）+ 插嘴指令（硬约束：**不给已分工分支改派范畴外任务**，界由 fork 划定） | 卡塞判定/提示词 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
 | `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/旁观者开关 `AGENT_FORK`/`AGENT_BYSTANDER`（默认 0）及护栏阈值 | 加配置项 |

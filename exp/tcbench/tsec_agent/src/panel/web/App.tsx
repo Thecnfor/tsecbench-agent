@@ -20,7 +20,7 @@ interface TaskRow {
     running_cmds: string[];
     last_cmd: string;
     branches?: string[];
-    corelog_tail?: string[];
+    log_tail?: string[];
   };
 }
 
@@ -327,10 +327,8 @@ export function App() {
                 {(t.live.branches?.length ?? 0) > 0 && (
                   <div className="muted">⑂ {t.live.branches?.join(" ｜ ")}</div>
                 )}
-                {(t.live.corelog_tail?.length ?? 0) > 0 && (
-                  <div className="muted">
-                    corelog: {t.live.corelog_tail?.slice(0, 3).join(" ｜ ")}
-                  </div>
+                {(t.live.log_tail?.length ?? 0) > 0 && (
+                  <div className="muted">log: {t.live.log_tail?.slice(0, 3).join(" ｜ ")}</div>
                 )}
               </div>
             )}

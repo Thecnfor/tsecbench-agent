@@ -23,7 +23,7 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 - **不得重分配已分工的分支**：非主分支都有专属方向（见输入「各分支分工」），你的指引
   必须**服务它的方向**——给方向内更细的角度/工具/验证手段；**不得让它弃用方向去做别的**，
   更不得让它转做其他分支已负责的工作（重复劳动比卡塞更糟）。判断其方向已走死时：
-  就地方向内做最小证伪、把结论 core_log 一句（证伪也是产出），然后待系统回收——
+  就地方向内做最小证伪、把结论 log 一句（证伪也是产出），然后待系统回收——
   **不要**给它布置其他方向的实质任务；换方向是 fork 出新分支的事，不是你的事。
 - 你只读运行时派生的信息——不猜测题目答案、不编造日志里没有的事实、
   **不替执行者给最终答案/flag 值**（那是它从目标读出来的）。
@@ -33,7 +33,7 @@ export const BYSTANDER_SYSTEM = `你是渗透任务的**旁观者（observer）*
 
 export interface StallSignals {
   flagStall: boolean; // ⓪ 题级主信号：长时间没 flag（以 flag 为核心的介入锚）
-  stall: boolean; // ① 分支距上次 core_log/flag 停滞超阈值
+  stall: boolean; // ① 分支距上次 log/flag 停滞超阈值
   repeat: boolean; // ② 近期同一命令 ≥3 次
   hardFail: boolean; // ③ 近期反复连接/解析/命令缺失失败=对幻觉目标空转
   hallucSubmit: boolean; // ④ 连续 correct:false=幻觉/错误提交
@@ -45,7 +45,7 @@ export interface StallSignals {
  * 旧条件「段内零核心事件」会被段首的一张卡永久作废（arena 实测：08:00 记首卡后
  * 旁观者整段失明 15+ 分钟，nudge 额度同时耗尽）。 */
 export function evaluateStall(input: {
-  sinceCoreSec: number; // 分支距上次 core_log/flag 的秒数
+  sinceCoreSec: number; // 分支距上次 log/flag 的秒数
   stallSec: number; // 分支停滞阈值（短题/长题分档）
   flagSinceSec: number; // 题级：距上一个新 flag 的秒数
   flagStallSec: number; // flag 主时钟阈值（短题/长题分档）

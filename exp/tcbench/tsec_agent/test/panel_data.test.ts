@@ -208,13 +208,13 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
         tool_calls: [{ id: "c1", name: "shell", arguments: '{"command":"echo hi"}' }],
       },
     ]);
-    writeJsonl(path.join(runs, "tasks", "t-01", "corelog.jsonl"), [
+    writeJsonl(path.join(runs, "tasks", "t-01", "log.jsonl"), [
       { branch: 0, kind: "core", note: "发现注入点" },
       { branch: 1, kind: "prune", note: "stalled 600s" },
     ]);
     const v = taskLiveView(runs, "t-01");
     expect(v.branches).toEqual(["1: redis 方向（已回收）"]);
-    expect(v.corelog_tail.some((s) => s.includes("发现注入点"))).toBe(true);
+    expect(v.log_tail.some((s) => s.includes("发现注入点"))).toBe(true);
     // 无 fork 的题：空名册不炸
     fs.mkdirSync(path.join(runs, "tasks", "t-02"), { recursive: true });
     writeJsonl(path.join(runs, "tasks", "t-02", "conversation.jsonl"), [
@@ -222,6 +222,6 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
     ]);
     const v2 = taskLiveView(runs, "t-02");
     expect(v2.branches).toEqual([]);
-    expect(v2.corelog_tail).toEqual([]);
+    expect(v2.log_tail).toEqual([]);
   });
 });

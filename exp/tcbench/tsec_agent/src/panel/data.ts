@@ -12,6 +12,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { blackboardPath } from "../corelog.js";
 import type { Challenge, ConvRecord, TaskRecord } from "../types.js";
 
 export const REFRESH_DEFAULT = 5;
@@ -282,7 +283,7 @@ export interface LiveView {
   running_cmds: string[];
   last_cmd: string;
   branches: string[]; // fork 分支名册（"1: 方向…"；含已回收标记）
-  corelog_tail: string[]; // 核心日志尾部（旁观者视角缩略）
+  log_tail: string[]; // 核心日志尾部（旁观者视角缩略）
 }
 
 /** 单题对话的实时视角：最近模型输出 + 进行中/最近的 shell 调用 + fork 分支名册。 */
@@ -295,7 +296,7 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
     running_cmds: [],
     last_cmd: "",
     branches: [],
-    corelog_tail: [],
+    log_tail: [],
   };
   const pending: string[] = []; // 已发出、未回结果的 tool_call
   const finished: string[] = []; // 最近完成的命令
@@ -346,7 +347,7 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
   // fork 分支名册（conversation 的 fork_directive + corelog 的 prune）+ 核心日志尾部
   try {
     const pruned = new Set<number>();
-    for (const r of readJsonlTail(path.join(runsDir, "tasks", code, "corelog.jsonl"), 200)) {
+    for (const r of readJsonlTail(blackboardPath(path.join(runsDir, "tasks"), code), 200)) {
       if ((r as any).kind === "prune") pruned.add(Number((r as any).branch));
     }
     for (const r of msgs) {
@@ -357,8 +358,8 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
         );
       }
     }
-    const corelog = readJsonlTail(path.join(runsDir, "tasks", code, "corelog.jsonl"), 6) as any[];
-    view.corelog_tail = corelog
+    const corelog = readJsonlTail(blackboardPath(path.join(runsDir, "tasks"), code), 6) as any[];
+    view.log_tail = corelog
       .reverse()
       .map((e) => `b${e.branch} ${e.kind}${e.note ? `: ${String(e.note).slice(0, 60)}` : ""}`);
   } catch {

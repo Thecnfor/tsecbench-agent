@@ -235,7 +235,7 @@ describe("FlagLedger", () => {
 describe("corelog", () => {
   it("写读一致 + 重启 seq 接续", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "corelog_"));
-    const file = path.join(dir, "corelog.jsonl");
+    const file = path.join(dir, "log.jsonl");
     const w = new CorelogWriter(file, "t-01");
     w.write({ branch: 0, kind: "core", note: "发现注入点" });
     w.write({ branch: 1, kind: "flag", flag_index: 1, correct_flag_count: 1, total_flag_count: 2 });
@@ -670,11 +670,11 @@ describe("旁观者越权建议检测（run5 真实判例集）", () => {
   });
 });
 
-describe("core_log 检查方向归 sys（不逐次塞工具结果）", () => {
+describe("log 检查方向归 sys（不逐次塞工具结果）", () => {
   it("工具结果只回确认事实；六要素/置信要求/黑板路径在 sys extras", () => {
     const bm = mkBm();
     const out = dispatchBranchTool(
-      "core_log",
+      "log",
       { note: "方法:探测 /download 得 validator ELF(已验证)" },
       { bm, corelog: null, ledger: null, now: () => 1000, log: () => {} },
       0,
@@ -682,18 +682,18 @@ describe("core_log 检查方向归 sys（不逐次塞工具结果）", () => {
     );
     expect(out).not.toBeNull();
     // 工具结果 = 确认事实，不带教学检查行（arena 实测 8/8 结果重复下发——归 sys）
-    expect(out!.result).toContain("logged to core log (branch 0)");
+    expect(out!.result).toContain("logged (branch 0)");
     expect(out!.result).not.toContain("六要素自查");
     expect(out!.result).not.toContain("齐了吗");
     expect(out!.result).not.toContain("判断带置信");
     // 信心要求 + 自动记黑板声明常驻 sys（fork / 旁观者两种模式都覆盖）
     expect(FORK_PROMPT_EXTRA).toContain("判断明确写信心");
     expect(FORK_PROMPT_EXTRA).toContain("自动记入黑板");
-    expect(FORK_PROMPT_EXTRA).toContain("corelog.jsonl");
+    expect(FORK_PROMPT_EXTRA).toContain("log.jsonl");
     expect(CORE_LOG_PROMPT_EXTRA).toContain("不敢保证");
     expect(CORE_LOG_PROMPT_EXTRA).toContain("自动记入黑板");
-    expect(CORE_LOG_PROMPT_EXTRA).toContain("corelog.jsonl");
-    // 六要素一行在基础 sys（core_log 工具在场时）
+    expect(CORE_LOG_PROMPT_EXTRA).toContain("log.jsonl");
+    // 六要素一行在基础 sys（log 工具在场时）
     expect(systemPromptWithExtras(true, false)).toContain("报告六要素");
   });
 });

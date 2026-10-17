@@ -538,7 +538,7 @@ export async function solveTask(
     taskClass === "long" ? CFG.reasoning_effort_long : CFG.reasoning_effort_short
   ).trim();
 
-  // 工具集：shell 恒在；fork/broadcast 仅 fork 开；core_log 两者任一开
+  // 工具集：shell 恒在；fork/broadcast 仅 fork 开；log 两者任一开
   const tools: unknown[] = [SHELL_TOOL_SCHEMA, SUBMIT_FLAG_TOOL_SCHEMA]; // submit 常驻（唯一提交通道）
   if (forkOn) tools.push(FORK_TOOL_SCHEMA, BROADCAST_TOOL_SCHEMA);
   if (multiOn) tools.push(CORE_LOG_TOOL_SCHEMA);
@@ -867,7 +867,7 @@ export async function solveTask(
     await maybeCompact(br); // 超阈值先压缩交接再发本轮请求（失败退避不阻塞）
 
     turn++;
-    const roundsAtTurnStart = br.roundsSinceCore; // core_log 轮计数基准（轮末比较用）
+    const roundsAtTurnStart = br.roundsSinceCore; // log 轮计数基准（轮末比较用）
     const tLlmStart = nowSec();
     let resp: ChatResponse | null = null;
     let err: unknown = null;
@@ -1167,9 +1167,9 @@ export async function solveTask(
       } else {
         result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
       }
-      // core_log 轮级轻推（执行层兜底，零 LLM 调用）：本轮最后一个工具结果尾部附提醒。
-      // multiOn 闸 = core_log 工具在场（常规模式无此工具，提醒会诱导 unknown tool）。
-      // 实时判定（core_log 若发生在本分支本轮更早的 tc 上，rounds 已清零 → 不注入）。
+      // log 轮级轻推（执行层兜底，零 LLM 调用）：本轮最后一个工具结果尾部附提醒。
+      // multiOn 闸 = log 工具在场（常规模式无此工具，提醒会诱导 unknown tool）。
+      // 实时判定（log 若发生在本分支本轮更早的 tc 上，rounds 已清零 → 不注入）。
       if (
         multiOn &&
         tc === toolCallsRaw[toolCallsRaw.length - 1] &&
@@ -1179,15 +1179,15 @@ export async function solveTask(
       ) {
         const n =
           result +
-          `\n[系统提醒·核心日志] 已连续 ${br.roundsSinceCore} 轮无 core_log：` +
+          `\n[系统提醒·黑板] 已连续 ${br.roundsSinceCore} 轮无 log：` +
           `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）、已证伪的路径、` +
           `或新开/切换的探索方向（方向卡），` +
-          `请立即 core_log 一张证据卡再继续——黑板空白会被判定停滞（分支回收、旁观者无从插手）。`;
+          `请立即调用 log 记一张证据卡再继续——黑板空白会被判定停滞（分支回收、旁观者无从插手）。`;
         result = n;
         br.nudgesUsed++;
         br.roundsSinceCore = 0; // 给模型 3 轮响应期
         log(
-          `[${code}] core_log nudge injected for branch ${br.id} (${br.nudgesUsed}/${CFG.core_log_nudge_max})`,
+          `[${code}] log nudge injected for branch ${br.id} (${br.nudgesUsed}/${CFG.core_log_nudge_max})`,
         );
       }
       const tToolEnd = nowSec();
@@ -1210,7 +1210,7 @@ export async function solveTask(
       br.messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
     }
 
-    // 轮末 core_log 轮计数：本轮发生过 core/flag（rounds 被 recordCore 清零）或刚被
+    // 轮末 log 轮计数：本轮发生过 core/flag（rounds 被 recordCore 清零）或刚被
     // 轻推归零时保持；否则累计（连续 N 轮触发下一轮的轻推判定）。
     if (br.roundsSinceCore === roundsAtTurnStart) br.roundsSinceCore++;
 
@@ -1316,10 +1316,12 @@ export async function closingSummary(
   return msg.content || "";
 }
 
+/** 平台下发的靶场入口：可能多个（web + db，或多台内网机器），**全部传给模型**，
+ * 不能只取第一个——丢掉的入口可能就是 flag 所在（对齐主仓库 docs/architecture.md §251）。 */
 function taskTarget(state: { container_addr?: string[] | string | null } | null): string {
   const addr = state?.container_addr ?? [];
   if (typeof addr === "string") return addr;
-  return Array.isArray(addr) && addr.length ? addr[0] : "";
+  return Array.isArray(addr) ? addr.filter((a) => a && a.trim()).join(", ") : "";
 }
 
 /** 控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close → 下一题。 */

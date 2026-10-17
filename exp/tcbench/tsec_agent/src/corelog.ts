@@ -1,7 +1,8 @@
-/** 核心日志 corelog.jsonl：分支抽象层——旁观者、面板与剪枝摘要的唯一读取源。
+/** 黑板日志 log.jsonl（曾用名 corelog.jsonl，2026-10-17 更名减负）：
+ *  分支抽象层——旁观者、面板与剪枝摘要的唯一读取源。
  *
  * 设计契约见 ../docs/fork-bystander-design.md §1（flag 事件）/§5（旁观者读取）/§6（记录）。
- * - 写入方：core_log 工具（kind=core）、broadcast 工具（kind=broadcast）、旁观者注入
+ * - 写入方：log 工具（kind=core）、broadcast 工具（kind=broadcast）、旁观者注入
  *   （kind=bystander）、flag 事件（kind=flag，controller 以 matched_flag_index / watcher
  *   快照为权威自动记，不依赖模型自述）。
  * - flag 稳定 ID = matched_flag_index：flag 内容随靶机重启变，索引（1..total_flag_count）不变，
@@ -11,6 +12,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { nowStamp } from "./records_util.js";
+
+/** 黑板文件名解析：新 run 一律写 `log.jsonl`；读旧 run（只有 `corelog.jsonl`）
+ *  时回退旧名——续跑与面板读历史归档都兼容。 */
+export function blackboardPath(tasksDir: string, code: string): string {
+  const fresh = path.join(tasksDir, code, "log.jsonl");
+  if (fs.existsSync(fresh)) return fresh;
+  const legacy = path.join(tasksDir, code, "corelog.jsonl");
+  return fs.existsSync(legacy) ? legacy : fresh;
+}
 
 export type CorelogKind = "core" | "broadcast" | "bystander" | "flag" | "prune" | "fork";
 

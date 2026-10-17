@@ -3,7 +3,7 @@
  * 覆盖维度（arena 事故后补强）：
  * 1. 常规：首段恰一次 system+task card；续段（messages 传递）不重写；真失败重启
  *    的多 system 是有意设计（rebuild 从最后一次 system 起）且 rebuild 只取末段；
- * 2. fork：fork_directive/core_log/broadcast 注入/flag 各恰一条；续段（messages+branches
+ * 2. fork：fork_directive/log/broadcast 注入/flag 各恰一条；续段（messages+branches
  *    传递）不新增；rebuild（trunk+分支）与内存 messages 无双份；
  * 3. 旁观者：插嘴在 messages 与 conv 各恰一条；续段不重复；冷却限频不二次注入；
  * 4. 通用：conv 中 (kind, branch, content) 三元组无重复（note/error 语义性重复除外）。 */
@@ -175,7 +175,7 @@ describe("常规模式完整性", () => {
 });
 
 describe("fork 模式完整性", () => {
-  it("fork/core_log/broadcast/flag 各恰一条；续段与 rebuild 无双份", async () => {
+  it("fork/log/broadcast/flag 各恰一条；续段与 rebuild 无双份", async () => {
     CFG.fork_enabled = true;
     const conv = rec().conversation("t-i3");
     const client = makeClient([
@@ -187,13 +187,13 @@ describe("fork 模式完整性", () => {
           tool_calls: [tc("f1", "fork", { direction: "redis 方向" })],
         }),
       },
-      // b1 t1：core_log + shell(submit 响应)
+      // b1 t1：log + shell(submit 响应)
       {
         when: (_m, br, own) => br === "b1" && own === 0,
         respond: () => ({
           content: null,
           tool_calls: [
-            tc("c1", "core_log", { note: "redis 无认证" }),
+            tc("c1", "log", { note: "redis 无认证" }),
             tc("s1", "shell", { command: `echo '${FLAG_JSON}'` }),
           ],
         }),
@@ -219,14 +219,11 @@ describe("fork 模式完整性", () => {
     // 精确计数：每类恰一条
     expect(count(recs, (r) => r.kind_note === "fork_directive")).toBe(1);
     expect(count(recs, (r) => r.kind === "system")).toBe(1);
-    expect(count(recs, (r) => r.kind === "tool" && r.tool === "core_log")).toBe(1);
+    expect(count(recs, (r) => r.kind === "tool" && r.tool === "log")).toBe(1);
     expect(count(recs, (r) => r.kind === "tool" && r.tool === "broadcast")).toBe(1);
     expect(count(recs, (r) => r.kind_note === "broadcast")).toBe(1); // 注入 b1 恰一条
     expect(
-      count(
-        readCorelog(path.join(recdir, "tasks", "t-i3", "corelog.jsonl")),
-        (e) => e.kind === "flag",
-      ),
+      count(readCorelog(path.join(recdir, "tasks", "t-i3", "log.jsonl")), (e) => e.kind === "flag"),
     ).toBe(1);
     assertNoDuplicateContent(recs);
 
@@ -266,8 +263,8 @@ describe("fork 模式完整性", () => {
   });
 });
 
-describe("core_log 轮级轻推（执行层兜底）", () => {
-  /** 每轮 shell、永不 core_log 的脚本。 */
+describe("log 轮级轻推（执行层兜底）", () => {
+  /** 每轮 shell、永不 log 的脚本。 */
   function shellOnlyClient() {
     let n = 0;
     const client: LlmClient = {
@@ -291,8 +288,8 @@ describe("core_log 轮级轻推（执行层兜底）", () => {
     return { client };
   }
 
-  it("连续 3 轮无 core_log → 第 4/8 轮注入提醒，每段恰 2 次", async () => {
-    CFG.bystander_enabled = true; // multiOn（core_log 工具在场）但旁观者不触发
+  it("连续 3 轮无 log → 第 4/8 轮注入提醒，每段恰 2 次", async () => {
+    CFG.bystander_enabled = true; // multiOn（log 工具在场）但旁观者不触发
     CFG.stall_short_sec = 99999; // 放大全部时间信号，专注测轮级轻推
     const conv = rec().conversation("t-n1");
     const { client } = shellOnlyClient();
@@ -301,7 +298,7 @@ describe("core_log 轮级轻推（执行层兜底）", () => {
 
     const recs = convOf("t-n1");
     const nudged = recs.filter(
-      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·核心日志]"),
+      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·黑板]"),
     );
     expect(nudged.length).toBe(2); // 恰 2 次（上限）
     // 注入落在第 4、8 轮的工具结果上（turn 后缀）
@@ -311,7 +308,7 @@ describe("core_log 轮级轻推（执行层兜底）", () => {
     // （conv 计数即忠实落盘；messages 内容由同一 result 变量写入）
   });
 
-  it("该轮 core_log 清零 → 重新累计；多模态外常规模式绝不注入", async () => {
+  it("该轮 log 清零 → 重新累计；多模态外常规模式绝不注入", async () => {
     CFG.bystander_enabled = true;
     CFG.stall_short_sec = 99999;
     const conv = rec().conversation("t-n2");
@@ -324,10 +321,10 @@ describe("core_log 轮级轻推（执行层兜底）", () => {
           throw new Error("旁观者不该触发");
         }
         n++;
-        // 轮 2 调 core_log（应把轮计数清零 → 提醒从轮 2 后重新数 3 轮 → 第 5 轮注入）
+        // 轮 2 调 log（应把轮计数清零 → 提醒从轮 2 后重新数 3 轮 → 第 5 轮注入）
         const tcs =
           n === 2
-            ? [tc("c1", "core_log", { note: "证据: 端口 8080 开放" })]
+            ? [tc("c1", "log", { note: "证据: 端口 8080 开放" })]
             : [tc(`s${n}`, "shell", { command: `echo r${n}` })];
         return {
           choices: [{ message: { role: "assistant", content: null, tool_calls: tcs } }],
@@ -338,12 +335,12 @@ describe("core_log 轮级轻推（执行层兜底）", () => {
     await solveTask(client, "t-n2", "卡", 600, conv, { taskClass: "short" });
     const recs = convOf("t-n2");
     const nudged = recs.filter(
-      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·核心日志]"),
+      (r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒·黑板]"),
     );
     expect(nudged.length).toBe(1); // 轮2 清零 → 重新累计3轮 → 轮6 注入（6 轮内恰一次）
     expect(String(nudged[0].turn)).toMatch(/:6$/);
 
-    // 常规模式（multiOn 关）：跑 8 轮绝不注入（无 core_log 工具，注入会诱导 unknown tool）
+    // 常规模式（multiOn 关）：跑 8 轮绝不注入（无 log 工具，注入会诱导 unknown tool）
     Object.assign(CFG, SNAP);
     CFG.model = "deepseek-flash";
     CFG.bystander_enabled = false;
@@ -400,7 +397,7 @@ describe("旁观者模式完整性", () => {
     expect(count(recs, (r) => r.kind_note === "bystander")).toBe(1);
     expect(
       count(
-        readCorelog(path.join(recdir, "tasks", "t-i4", "corelog.jsonl")),
+        readCorelog(path.join(recdir, "tasks", "t-i4", "log.jsonl")),
         (e) => e.kind === "bystander",
       ),
     ).toBe(1);

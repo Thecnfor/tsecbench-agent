@@ -35,12 +35,12 @@ export interface BranchState {
   broadcastsUsed: number;
   bystanderUsed: number;
   lastBystanderAt: number;
-  lastCoreTs: number; // 最近一次 core_log / flag 事件（剪枝与停滞信号共用）
+  lastCoreTs: number; // 最近一次 log / flag 事件（剪枝与停滞信号共用）
   recentCmds: string[]; // 最近 shell 命令（重复模式信号）
   recentHardFails: boolean[]; // 最近 shell 结果是否「连接/解析/命令缺失」类硬失败（信号④）
   wrongSubmits: number; // 连续 correct:false 次数（信号⑤ 幻觉提交）
-  roundsSinceCore: number; // 连续无 core_log/flag 的轮数（轮级轻推信号）
-  nudgesUsed: number; // 本段 core_log 轻推次数
+  roundsSinceCore: number; // 连续无 log/flag 的轮数（轮级轻推信号）
+  nudgesUsed: number; // 本段 log 轻推次数
 }
 
 /** 序列化给 worker 跨段持有的分支状态（计数器不跨段，恢复即重置）。 */
@@ -211,10 +211,10 @@ export class BranchManager {
       `- 读任意路径都允许（含父/其他分支目录，通报产物路径时写全路径）；` +
       `**写入只写自己的目录**；命名空间之外与容器级操作（重启服务/监听共享端口/改系统/iptables）` +
       `默认只读，确需改动先用 broadcast 协调。\n` +
-      `- 关键发现/新方向随手 \`core_log\` 一句话；\`broadcast\` **只上行给主分支（分支 0）**——` +
+      `- 关键发现/新方向随手 \`log\` 一句话；\`broadcast\` **只上行给主分支（分支 0）**——` +
       `子分支之间不直连，横向协同由主分支统筹转发；` +
-      `**停滞过久（无 core_log/flag）的分支会被系统回收**，发现摘要会汇入主分支。\n` +
-      `- 你没有收尾权：不要输出无工具总结（那会暂停你的分支）；持续推进，进度用 core_log 记录。`;
+      `**停滞过久（无 log/flag）的分支会被系统回收**，发现摘要会汇入主分支。\n` +
+      `- 你没有收尾权：不要输出无工具总结（那会暂停你的分支）；持续推进，进度用 log 记录。`;
     const branch: BranchState = {
       id,
       parent: parentId,
@@ -247,7 +247,7 @@ export class BranchManager {
     if (from.broadcastsUsed >= this.cfg.broadcastMax) {
       return {
         ok: false,
-        message: `广播已达本段上限 ${this.cfg.broadcastMax} 次，把发现写进 core_log 即可`,
+        message: `广播已达本段上限 ${this.cfg.broadcastMax} 次，把发现写进 log 即可`,
         delivered: [],
       };
     }
@@ -324,7 +324,7 @@ export class BranchManager {
     this.lastFlagTs = now;
   }
 
-  /** core_log / flag 事件到达 → 刷新停滞时钟 + 轮级轻推计数。 */
+  /** log / flag 事件到达 → 刷新停滞时钟 + 轮级轻推计数。 */
   recordCore(id: number, now: number): void {
     const b = this.branches.get(id);
     if (b && !b.pruned) {

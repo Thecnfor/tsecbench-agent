@@ -15,7 +15,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { CorelogWriter } from "./corelog.js";
+import { blackboardPath, CorelogWriter } from "./corelog.js";
 import type { ChatMessage, ContentPart, ConvRecord } from "./types.js";
 
 /** 记录根目录解析（对应 Python 版 RECORDS_DIR 语义）：
@@ -435,9 +435,9 @@ export class RunRecords {
     return new ConversationWriter(file, code);
   }
 
-  /** 核心日志 writer（fork/core_log/旁观者/flag 事件；见 corelog.ts） */
+  /** 黑板 writer（fork/log/旁观者/flag 事件；见 corelog.ts） */
   corelog(code: string): CorelogWriter {
-    const file = path.join(this.dir, "tasks", code, "corelog.jsonl");
+    const file = blackboardPath(path.join(this.dir, "tasks"), code); // 旧 run 回退 corelog.jsonl
     return new CorelogWriter(file, code);
   }
 

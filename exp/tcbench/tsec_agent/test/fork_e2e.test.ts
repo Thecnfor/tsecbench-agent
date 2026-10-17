@@ -1,7 +1,7 @@
 /** solveTask 的 fork/旁观者集成自测（假 LLM client，全离线）。
  *
  * 覆盖：fork 生命周期（reserve→materialize→轮转→broadcast→park→收束）、
- * core_log/flag 账本落盘、旁观者触发注入、剪枝摘要注入、续段分支重建。
+ * log/flag 账本落盘、旁观者触发注入、剪枝摘要注入、续段分支重建。
  * 平台层不需要（直接调 solveTask，不走 run()）。 */
 import fs from "node:fs";
 import os from "node:os";
@@ -91,7 +91,7 @@ function tc(id: string, name: string, args: Record<string, unknown>) {
 }
 
 describe("solveTask fork 集成", () => {
-  it("fork→core_log/flag→broadcast→双分支 park→done（含记录与重建断言）", async () => {
+  it("fork→log/flag→broadcast→双分支 park→done（含记录与重建断言）", async () => {
     CFG.fork_enabled = true;
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_e2e_"));
     setRecordsDir(recdir);
@@ -119,14 +119,14 @@ describe("solveTask fork 集成", () => {
           tool_calls: [tc("f1", "fork", { direction: "redis 6379 未授权排查" })],
         }),
       },
-      // branch 1 t1：core_log + shell（submit 响应含 matched_flag_index）
+      // branch 1 t1：log + shell（submit 响应含 matched_flag_index）
       {
         when: (m) =>
           m.some((x) => String(x.content ?? "").startsWith("【分支 1")) && ownTools(m) === 0,
         respond: () => ({
           content: null,
           tool_calls: [
-            tc("c1", "core_log", { note: "redis PONG 无认证" }),
+            tc("c1", "log", { note: "redis PONG 无认证" }),
             tc("s1", "shell", { command: `echo '${flagJson}'` }),
           ],
         }),
@@ -180,7 +180,7 @@ describe("solveTask fork 集成", () => {
     expect(JSON.stringify(b1First.msgs)).toContain("branch 1 reserved");
 
     // 记录：corelog 有 core/flag/broadcast/fork 四类
-    const log = readCorelog(path.join(recdir, "tasks", "t-f1", "corelog.jsonl"));
+    const log = readCorelog(path.join(recdir, "tasks", "t-f1", "log.jsonl"));
     const kinds = log.map((e) => `${e.kind}:${e.branch}`);
     expect(kinds).toContain("core:1");
     expect(kinds).toContain("flag:1");
@@ -317,7 +317,7 @@ describe("solveTask fork 集成", () => {
     const byRec = convLines.find((x) => x.kind_note === "bystander");
     expect(byRec).toBeTruthy();
     expect(String(byRec!.content)).toContain("[旁观者提示]");
-    const log = readCorelog(path.join(recdir, "tasks", "t-by1", "corelog.jsonl"));
+    const log = readCorelog(path.join(recdir, "tasks", "t-by1", "log.jsonl"));
     expect(log.some((e) => e.kind === "bystander")).toBe(true);
   });
 
@@ -391,7 +391,7 @@ describe("solveTask fork 集成", () => {
     expect(r.messages.some((m) => String(m.content ?? "").includes("[分支 1 已回收]"))).toBe(true);
     expect(r.messages.some((m) => String(m.content ?? "").includes("注定被剪枝的方向"))).toBe(true);
     // 记录：prune 事件
-    const log = readCorelog(path.join(recdir, "tasks", "t-pr1", "corelog.jsonl"));
+    const log = readCorelog(path.join(recdir, "tasks", "t-pr1", "log.jsonl"));
     expect(log.some((e) => e.kind === "prune" && e.branch === 1)).toBe(true);
     const convLines = fs
       .readFileSync(path.join(recdir, "tasks", "t-pr1", "conversation.jsonl"), "utf8")
@@ -411,13 +411,16 @@ describe("solveTask fork 集成", () => {
     const client: LlmClient = {
       async create(opts) {
         // 基础工具集 = shell + submit_flag（submit 常驻唯一提交通道）；
-        // branch 工具（fork/core_log/broadcast）与 corelog 在开关全关时不得出现
+        // branch 工具（fork/log/broadcast）与黑板在开关全关时不得出现
         expect(opts.tools?.length).toBe(2);
-        expect(JSON.stringify(opts.tools)).toContain("shell");
-        expect(JSON.stringify(opts.tools)).toContain("submit_flag");
-        expect(JSON.stringify(opts.tools)).not.toContain("fork");
-        expect(JSON.stringify(opts.tools)).not.toContain("core_log");
-        expect(JSON.stringify(opts.tools)).not.toContain("broadcast");
+        const toolNames = ((opts.tools ?? []) as Array<{ function?: { name?: string } }>).map(
+          (t) => t?.function?.name,
+        );
+        expect(toolNames).toContain("shell");
+        expect(toolNames).toContain("submit_flag");
+        expect(toolNames).not.toContain("fork");
+        expect(toolNames).not.toContain("log");
+        expect(toolNames).not.toContain("broadcast");
         const toolMsgs = opts.messages.filter((m) => m.role === "tool").length;
         if (toolMsgs === 0) {
           return {
@@ -439,7 +442,7 @@ describe("solveTask fork 集成", () => {
     expect(r.status).toBe("done");
     expect(r.branches.length).toBe(0);
     // 无 corelog 文件（多分支基础设施未启用）
-    expect(fs.existsSync(path.join(recdir, "tasks", "t-off", "corelog.jsonl"))).toBe(false);
+    expect(fs.existsSync(path.join(recdir, "tasks", "t-off", "log.jsonl"))).toBe(false);
     // system prompt 与旧版逐字节一致
     const sysRec = fs
       .readFileSync(path.join(recdir, "tasks", "t-off", "conversation.jsonl"), "utf8")
