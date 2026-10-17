@@ -74,9 +74,9 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `agent.ts` | 控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close；并行调度、分段解题、VPN 守卫、平台终态收敛、`--smoke` |
 | `shell.ts` | 异步 shell：Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（PIL 压图；网关拒图降级为元数据文本） |
 | `shell_tool.ts` | shell 工具 schema、参数容错修复（`parseToolArguments`）、动作路由；出口拦截 `curl …challenges/submit`（提交只走 `submit_flag`） |
-| `submit_flag.ts` | `submit_flag` toolcall（唯一提交通道，unique_code 由 controller 填防跨题）：平台响应→账本/flag 时钟/黑板 卡；单 flag 收尾总结指示（多 flag 压缩是系统自动的，与 flag 无关） |
+| `submit_flag.ts` | `submit_flag` toolcall（唯一提交通道，unique_code 由 controller 填防跨题）：平台响应→账本/flag 时钟/黑板 卡（duplicate 的 index 也补账，响应计数滞后时以账本为下界）；单 flag 收尾总结指示（多 flag 压缩是系统自动的，与 flag 无关） |
 | `llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换（匿名优先，标签只带尾 4 位掩码） |
-| `bench.ts` | 平台 API 客户端（fetch/start/close/选题策略/名额释放），错误码分类（含 `TaskFinishedError` 终态） |
+| `bench.ts` | 平台 API 客户端（fetch/start/close/选题策略/名额释放），错误码分类（含 `TaskFinishedError` 终态）；submit 按 unique_code 串行（平台计数非并发安全） |
 | `records.ts` | bench 级持久化：`meta.json`/`events.jsonl`/`tasks.jsonl`/`tasks/<code>/conversation.jsonl`；`rebuildMessages` 续跑重建（压缩锚：头 ∪ 最后一条 `context_compact` 交接文档 ∪ 锚后过程） |
 | `config.ts` | 全部配置与默认值（环境变量 + 项目根 `.env`）、local/hosted 模式检测、转写规则 `toGatewayUrl` |
 | `prompt.ts` | 单题 system prompt、任务卡模板、续跑/拉回/复盘通知 |

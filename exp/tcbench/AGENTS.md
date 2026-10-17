@@ -62,9 +62,12 @@
    （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-bystander-design.md`，
    缓存实测依据见 `../cache_exp/README.md`。
 2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/wait_any/status/kill/list` 收结果。
-   - **同轮多个 tool_call 并发派发**（方案 A）：一轮里多条 shell/submit 同时起跑，
-     不再串行排队；结果仍按 tool_calls 原序收割配对（`agent.ts` 两阶段：prepared 先派发、
-     再按序 await + 落副作用）。模型侧由 prompt 提示「有依赖的命令并进同一条」。
+   - **同轮多个 tool_call 并发派发**（方案 A）：一轮里多条 shell 同时起跑，结果仍按
+     tool_calls 原序收割配对（`agent.ts` 两阶段：prepared 先派发、再按序 await + 落副作用）。
+     **`submit_flag` 例外：按题串行**（`bench.ts` 的 per-unique_code 队列）——平台 submit 的
+     `correct_flag_count`/`is_completed` 不是并发安全的，同时到达的两个提交会读到同一个旧
+     计数并丢掉一次更新（平台停在 3/4、重交只得 duplicate，计数不再补回）。模型侧由 prompt
+     提示「有依赖的命令并进同一条」。
    - `run` 可带 `label` 给 job 起语义名（如 `oa-brute`）：list/status/wait 显示，
      wait/status/kill 也可按 label 寻址（唯一同名才可，重名报错提示用 job_id）。
    - 快速命令有 1.5s 同步窗口（`AGENT_SHELL_WAIT_MS`）；`run` 可带 `wait_sec`（≤300s），
@@ -96,15 +99,23 @@
      关题释放名额 → 上下文保留（`resumeMeta`；需要时由 `records.rebuildMessages` 从
      conversation.jsonl 重建）→ 之后 `start` 续跑（重启靶机），
      续跑在上下文末尾追加 `prompt.RESUME_NOTE`（新 target / 靶机内状态已重置 / workdir 保留 /
-     已提交 flag 不丢 / 从上次进度继续）。轮数 `AGENT_TASK_MAX_TURNS`（默认 120，0=关）
+     已提交 flag 不丢 / 从上次进度继续）；**本地全齐但平台复核仍未通关**（计数未同步）时
+     追加 `prompt.COMPLETION_DESYNC_NOTE`（重交已有 flag、不要重做侦察/打新入口）。
+     轮数 `AGENT_TASK_MAX_TURNS`（默认 120，0=关）
      只是安全网——实测段墙钟 p50=4.7min、p90=28.9min、max=158min，同样 60 轮墙钟差 30 倍
      （耗时由工具等待主导），所以墙钟当主闸、轮数防极端空转。
    - **通关即关容器（A）**：`solveTask` 每轮开头查 watcher 快照缓存（20s 刷新，零额外 API），
      平台确认满 flag 立刻收束 → **立即 `close` 释放槽位**（不等模型自己想起来收尾——b-02
-     实测通关后白挂 22 分钟）；**多 flag 全齐由 submit_flag 响应权威确认**（
-     correct_flag_count==total）→ 回合末立即 done，不等 watcher 缓存/模型尾轮
-     （衔接优化：槽位即刻归还调度器）；复盘总结脱槽跑（纯 LLM 调用不占并发名额），
-     限时 `AGENT_SUMMARY_TIMEOUT_SEC`（默认 300s），超时丢弃总结照常记 pass。
+     实测通关后白挂 22 分钟）；**多 flag 全齐由 submit_flag 响应确认**（
+     correct_flag_count==total，或账本全部 index 已确认——平台计数滞后时账本兜底）
+     → 回合末立即 done，不等 watcher 缓存/模型尾轮
+     （衔接优化：槽位即刻归还调度器）；**pass 前再做平台复核**：本地全齐时先等
+     `AGENT_FLAG_VERIFY_DELAY_SEC`（默认 5s）让平台计数落账，再在
+     `AGENT_FLAG_VERIFY_TIMEOUT_SEC`（默认 20s）窗口内轮询 `GET /challenges`，
+     只有 `is_completed=true` 才判通关；窗口耗尽仍为 false 记
+     `completion_unconfirmed` 事件（本地账本与平台计数不一致）；复盘总结脱槽跑
+     （纯 LLM 调用不占并发名额），限时 `AGENT_SUMMARY_TIMEOUT_SEC`（默认 300s），
+     超时丢弃总结照常记 pass。
    - **段到点处置（保留 segment_continue 收尾语义 + D 配额规则）**：
      ① 段末零新 flag 的短题**动态改判长题**（治"字段说 easy 实际 200min"）；
      ② 有短题在等时长题配额 = `cap-1`（保底 1 槽给短题防饿死）——配额**按在跑长题扣减**

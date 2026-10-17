@@ -112,6 +112,7 @@
 │    tools: 仅 shell（异步 background），无 MCP、无 subagent         │
 │      └─ run: 后台启动返回 job_id（1.5s 快速窗口，可带 wait_sec/label）  │
 │         同轮多 tool_call 并发派发（有依赖的命令并进同一条）              │
+│         （submit_flag 按题串行：平台提交计数非并发安全）                 │
 │         wait / wait_any / status / kill / list：边沿等待+分页读        │
 │         （offset/lines），可按 label 寻址；输出可 out_file 落盘，       │
 │         1800s 硬上限才 kill                                            │
@@ -141,7 +142,9 @@
   轮数 `AGENT_TASK_MAX_TURNS`（默认 120，0=关）只是安全网——实测段墙钟 p50=4.7min、
   p90=28.9min、max=158min，同样 60 轮墙钟差 30 倍（耗时由工具等待主导），轮数当主闸不合适。
 - **通关即关容器（A）**：每轮开头查 watcher 快照缓存（20s 刷新，零额外 API），平台确认
-  满 flag 立刻收束 → **立即关容器释放槽位**（不等模型自己收尾——实测通关后白挂 22 分钟）
+  满 flag 立刻收束 → **立即关容器释放槽位**（不等模型自己收尾——实测通关后白挂 22 分钟）。
+  **本地全齐后先延迟复核平台**（`AGENT_FLAG_VERIFY_DELAY_SEC` 默认 5s +
+  `AGENT_FLAG_VERIFY_TIMEOUT_SEC` 默认 20s 轮询），`is_completed=true` 才判 pass
   → 复盘总结脱槽跑（不占并发名额），限时 `AGENT_SUMMARY_TIMEOUT_SEC`（默认 300s），
   超时丢弃总结照常 pass。
 - **段到点处置**：段末零新 flag 的短题**动态改判长题**（治字段失真）；有短题在等时长题配额
@@ -223,6 +226,8 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag/hard/level≥3） | `1800` |
 | `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸） | `120` |
 | `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | `300` |
+| `AGENT_FLAG_VERIFY_DELAY_SEC` | 本地确认全齐后、复核平台前的静默等待秒（让平台计数落账） | `5` |
+| `AGENT_FLAG_VERIFY_TIMEOUT_SEC` | 复核轮询窗口秒（`is_completed` 为准；耗尽记 `completion_unconfirmed`） | `20` |
 | `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值秒（防 fresh 无限插队） | `600` |
 | `AGENT_TASKS` | 只解部分题目（测试用）：逗号/空白分隔，支持 `*`/`?` 通配，空=全部；`--task`/`AGENT_TASK_FILTER` 优先 | 空 |
 | `AGENT_PAUSE_MAX` | 每题最多暂停续跑次数（`0`=不限，一直续跑直到通关） | `0` |
@@ -333,7 +338,7 @@ pnpm dev                             # vite dev server（5173，/api 代理到 8
 2. `POST .../challenges/start?unique_code=` — 启动容器拿 `container_addr`（**10 分钟内接入**，active 上限 3）
 3. 渗透解题拿 flag（`flag_count>1` 需逐个拿）
 4. `GET .../challenges/hint` — 可选，查看后该题得分按比例扣减
-5. `POST .../challenges/submit` — 提交 flag（`409 duplicate` 幂等跳过）
+5. `POST .../challenges/submit` — 提交 flag（按题串行；`409 duplicate` 幂等跳过，响应里的 index 仍记入账本）
 6. `POST .../challenges/close` — 通关/放弃后**必须**释放名额
 7. 循环直到全部通关或任务超时
 

@@ -36,6 +36,7 @@ import {
   CLOSING_SUMMARY_PROMPT,
   COMPACT_NOTE,
   COMPACTION_PROMPT,
+  COMPLETION_DESYNC_NOTE,
   fill,
   formatTaskCard,
   GIVEUP_NOTE,
@@ -90,6 +91,35 @@ let latestSnapshot: Challenge[] | null = null;
 function confirmedComplete(code: string): boolean {
   const c = latestSnapshot?.find((x) => x.unique_code === code);
   return !!c?.is_completed;
+}
+
+/** 本地已确认全部 flag 后的平台复核：先等一档让计数落账，再轮询 GET /challenges，
+ *  直到 is_completed 或窗口耗尽。平台 submit 的计数可能异步落账（同轮并发提交甚至
+ *  丢更新）——本地账本判满 ≠ 平台已通关，**pass 只认平台 is_completed**。
+ *  窗口/间隔可由测试覆盖；生产值见 CFG（默认延迟 5s + 轮询 20s）。 */
+export async function waitPlatformCompletion(
+  snapshot: () => Promise<Challenge[] | null>,
+  code: string,
+  opts: { delaySec?: number; timeoutSec?: number; intervalSec?: number } = {},
+): Promise<{ items: Challenge[] | null; state: Challenge | null }> {
+  const delaySec = Math.max(0, opts.delaySec ?? CFG.flag_verify_delay_sec);
+  const timeoutSec = Math.max(0, opts.timeoutSec ?? CFG.flag_verify_timeout_sec);
+  const intervalMs = Math.max(0, (opts.intervalSec ?? 3) * 1000);
+  if (delaySec > 0) await sleep(delaySec * 1000);
+  const deadline = Date.now() + timeoutSec * 1000;
+  let itemsNow: Challenge[] | null = null;
+  for (;;) {
+    if (STOP) return { items: itemsNow, state: null }; // 平台已终态/全局收敛：不再等
+    // 单轮快照失败重试（网络抖动不算平台状态）
+    for (let t = 0; t < 2; t++) {
+      itemsNow = await snapshot();
+      if (itemsNow || Date.now() >= deadline) break;
+      await sleep(2000);
+    }
+    const st = itemsNow ? bench.challengeState(itemsNow, code) : null;
+    if (st?.is_completed || Date.now() >= deadline) return { items: itemsNow, state: st };
+    await sleep(intervalMs);
+  }
 }
 
 export function platformEnded(where: string, e: Error, results?: Record<string, string>): void {
@@ -418,6 +448,7 @@ export interface SolveResult {
   messages: ChatMessage[];
   branches: BranchLite[]; // fork 模式的跨段分支状态（disabled 时为空）
   flagSummaryDone: boolean; // 单 flag 的收尾总结已由 flag_summary 轮产出（worker 跳过 closingSummary）
+  flagsComplete: boolean; // submit 响应/账本已确认全部 flag（平台 is_completed 仍需延迟复核）
 }
 
 /** fork/旁观者配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
@@ -486,6 +517,7 @@ export async function solveTask(
   let turn = 0;
   let flagSummaryDone = false; // 单 flag：flag_summary 总结轮已产出收尾（跳过 closingSummary）
   let allFlagsSubmitted = false; // 多 flag 全齐（submit 响应权威）→ 回合末立即收束释放槽位
+  let flagsComplete = false; // 全部 flag 已确认（含单 flag）→ 段结束后延迟复核平台 is_completed
   let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
   const nowSec = () => Date.now() / 1000;
 
@@ -583,6 +615,7 @@ export async function solveTask(
     messages: bm.get(0)?.messages ?? messages,
     branches: branchLite(),
     flagSummaryDone,
+    flagsComplete,
   });
 
   // 剪枝：corelog/flag 双停滞 → 回收分支 + 摘要注入 trunk（尾部追加保缓存）
@@ -1141,12 +1174,20 @@ export async function solveTask(
             | undefined;
           const out = integrateSubmit(resp, ledger, br.id);
           let extra = "";
-          // 多 flag 全齐：submit 响应是权威（correct_flag_count == total）→ 回合末立即
-          // 收束——不等 watcher 缓存（20s 刷新）与模型尾轮（衔接优化，槽位早释放）；
+          // 平台确认（correct 或 duplicate 已正确提交）→ 进度以账本为准收束。
+          // 多 flag 全齐：响应计数或账本任一判满即回合末立即收束——不等 watcher 缓存
+          // （20s 刷新）与模型尾轮（衔接优化，槽位早释放）；平台计数并发丢更新时
+          // 账本仍是可靠下界，避免"实际全齐却继续解题"。
           // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
-          if (resp?.correct === true && out.totalCount > 1) {
-            if (out.correctCount >= out.totalCount) allFlagsSubmitted = true;
-            else compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
+          const confirmed = resp?.correct === true || out.duplicateConfirmed;
+          const allConfirmed =
+            confirmed &&
+            out.totalCount > 0 &&
+            (out.correctCount >= out.totalCount || ledger.done());
+          if (allConfirmed) flagsComplete = true;
+          if (confirmed && out.totalCount > 1) {
+            if (allConfirmed) allFlagsSubmitted = true;
+            else if (resp?.correct === true) compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
           }
           if (resp?.correct === true) {
             bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
@@ -1602,6 +1643,7 @@ async function runParallel(
     let status: SolveStatus = "llm_error";
     let outcome = "fail";
     let completed = false;
+    let completionUnconfirmed = false; // 本地全齐但平台复核仍未通关（计数未同步）
     let containerReleased = false; // A：通关即关容器后置位，finally 里不再重复 close
     const conv = rec().conversation(code);
     let messages: ChatMessage[] | null = null;
@@ -1638,13 +1680,22 @@ async function runParallel(
         if (loaded.length) {
           messages = loaded;
           startTurn = messages.filter((m) => m.role === "assistant").length;
-          const note = fill(meta.reason === "giveup" ? GIVEUP_NOTE : RESUME_NOTE, {
-            new_target: addr,
-            old_target: oldTarget || "（未知）",
-            workdir: getTaskCwd() || taskWorkdir(code),
-            budget_min: Math.round(budgetSec / 60),
-            turns: startTurn,
-          });
+          const note = fill(
+            meta.reason === "completion_desync"
+              ? COMPLETION_DESYNC_NOTE
+              : meta.reason === "giveup"
+                ? GIVEUP_NOTE
+                : RESUME_NOTE,
+            {
+              new_target: addr,
+              old_target: oldTarget || "（未知）",
+              workdir: getTaskCwd() || taskWorkdir(code),
+              budget_min: Math.round(budgetSec / 60),
+              turns: startTurn,
+              platform: String(meta.platform ?? "?"),
+              total_flags: task.flag_count,
+            },
+          );
           messages.push({ role: "user", content: note });
           conv.write("user", { branch: 0, turn: `${code}:${startTurn}`, content: note });
           // fork 分支重建（fork 关闭时为空）：父上下文按 fork_seq 截断，见 records.rebuildBranches
@@ -1693,15 +1744,41 @@ async function runParallel(
         branches = r.branches;
         flagSummaryDone = r.flagSummaryDone;
 
-        // 校验平台状态（快照失败重试，避免误判）
+        // 校验平台状态：本地已确认全部 flag → 先等一档再轮询 is_completed（平台计数
+        // 可能异步落账，不能拿本地账本当通关）；其余情况沿用快照失败重试，避免误判。
         let itemsNow: Challenge[] | null = null;
-        for (let t = 0; t < 3; t++) {
-          itemsNow = await snapshot();
-          if (itemsNow) {
-            state = bench.challengeState(itemsNow, code);
-            if (state) break;
+        if (status === "done" && r.flagsComplete) {
+          const v = await waitPlatformCompletion(snapshot, code);
+          itemsNow = v.items;
+          // 只有真读到平台状态才判"计数未同步"；快照全失败交给常规 giveup/续跑
+          if (v.state) {
+            state = v.state;
+            if (!v.state.is_completed) {
+              completionUnconfirmed = true;
+              const plat = `${v.state.correct_flag_count}/${v.state.flag_count}`;
+              rec().event("completion_unconfirmed", {
+                code,
+                platform: plat,
+                local: "all-flag-indices-confirmed",
+                delay_sec: CFG.flag_verify_delay_sec,
+                window_sec: CFG.flag_verify_timeout_sec,
+              });
+              log(
+                `[${code}] completion unconfirmed: local ledger has all flags, ` +
+                  `platform ${plat} (after ${CFG.flag_verify_delay_sec}s delay + ` +
+                  `${CFG.flag_verify_timeout_sec}s poll)`,
+              );
+            }
           }
-          await sleep(4000);
+        } else {
+          for (let t = 0; t < 3; t++) {
+            itemsNow = await snapshot();
+            if (itemsNow) {
+              state = bench.challengeState(itemsNow, code);
+              if (state) break;
+            }
+            await sleep(4000);
+          }
         }
         completed = !!state?.is_completed;
 
@@ -1813,19 +1890,22 @@ async function runParallel(
           );
         } else {
           outcome = "paused";
+          const desync = giveup && completionUnconfirmed;
+          const plat = state ? `${state.correct_flag_count}/${state.flag_count}` : "?";
           resumeMeta[code] = {
             pauses,
             gives,
             target: addr,
             turns: startTurn + used,
-            reason: giveup ? "giveup" : "paused",
+            reason: desync ? "completion_desync" : giveup ? "giveup" : "paused",
+            ...(desync ? { platform: plat } : {}),
             pausedAt: Date.now() / 1000, // D-aging：记录暂停时刻，续跑排序按等待时长提权
           };
           rec().event("task_paused", {
             code,
             pauses,
             gives,
-            reason: giveup ? "giveup" : "segment_budget",
+            reason: desync ? "completion_desync" : giveup ? "giveup" : "segment_budget",
             turns: startTurn + used,
             target: addr,
           });

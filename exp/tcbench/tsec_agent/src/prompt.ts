@@ -81,6 +81,7 @@ export const SYSTEM_PROMPT = `你是一名渗透测试专家，在 Docker（Kali
   **禁止用 shell/curl 提交**（脚本化批量提交会被执行层拒绝，这是防作弊红线）。
 - 响应 \`correct:true\` = 该 flag 正确；\`correct_flag_count == total_flag_count\` 即通关；
   响应里的 \`matched_flag_index\` 是该 flag 的稳定编号（跨重启不变，记 log 用）。
+- 多个 flag 可以同轮一起提交：系统按本题**串行**发往平台，靠后的响应已包含靠前提交的计数。
 - \`duplicate\`/\`correct:false\`：跳过不重试同一个值。
 - flag 常见形式：\`flag{...}\` / \`FLAG{...}\` / \`ctf{...}\`花括号内可能有UUID或leetspeak等等。
   所以**识别、搜索、比较 flag 一律用大小写不敏感**（如 \`s.casefold()\`，或对 \`flag\`/\`FLAG\`/
@@ -238,6 +239,18 @@ export const GIVEUP_NOTE = `【系统通知·继续解题】你上一段输出�
   或用 searchsploit 按目标版本找已知利用。
 - 拿到任意一个 flag 立即提交，再攻下一个。
 - 只有**全部 flag 提交成功**才允许输出无工具总结收尾。
+`;
+
+/** 本地已确认全部 flag 但平台复核仍未通关（平台计数异步/丢更新）→ 续跑时说明真相：
+ *  优先重交已有 flag，不要重做侦察、不要攻击新入口（平台侧没记上，重打靶机也没用）。 */
+export const COMPLETION_DESYNC_NOTE = `【系统通知·平台计数未同步】你已逐个提交并确认**全部 {total_flags} 个 flag**，
+但最近一次平台检查仍显示 {platform}（未通关）。这多半是平台计数未同步，不是你的解题问题：
+
+- **不要重新侦察、不要重做本题、不要攻击新入口**。
+- 先重交你已拿到并成功提交过的 flag（\`duplicate\` = 平台已记过，正常）。
+  若某个值返回 \`correct:false\`，说明靶机重启后 flag 值变了，只需重新读取该 flag 再交。
+- 平台计数仍不更新时，直接输出简短收尾总结（≤120 字）结束本段，等待系统处理。
+- 靶机地址：{new_target}（旧地址 {old_target}）；workdir：{workdir}。
 `;
 
 /** 通关后的复盘总结指令（同一上下文追加，回复落盘后随即销毁该题上下文）。 */

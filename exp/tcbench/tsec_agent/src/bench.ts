@@ -90,11 +90,33 @@ export async function closeChallenge(code: string): Promise<any> {
   return await api(`/openapi/v1/challenges/close?unique_code=${code}`, "POST");
 }
 
+/** 同一题的提交队列（unique_code → 队列尾 Promise，永不 reject）。
+ *  平台的 submit 计数不是并发安全的：同轮并发提交两个 flag 时，两个请求可能都读到
+ *  同一个旧计数（实测两次响应都是 3/4），后完成的更新被覆盖，平台永远停在 3/4 且
+ *  is_completed=false；再交只得 duplicate 而计数不会补回。因此提交按题串行化：
+ *  后一个等前一个结算（成功/失败都放行），保证每个响应看到此前所有提交的计数。 */
+const submitQueues = new Map<string, Promise<void>>();
+
 /** 提交 flag（submit_flag toolcall 的后端；唯一提交通道）。
  * 成功返回平台原始 JSON（correct/awarded/cumulative_score/correct_flag_count/
  * total_flag_count/matched_flag_index）；业务错误（409 duplicate 等）转
- * {correct:false, error:...} 返回给模型看（业务结果不抛）——评测截止终态仍穿透。 */
-export async function submitFlag(uniqueCode: string, flag: string): Promise<any> {
+ * {correct:false, error:...} 返回给模型看（业务结果不抛）——评测截止终态仍穿透。
+ * **按 unique_code 串行**：并发调用排队执行（见 submitQueues）。 */
+export function submitFlag(uniqueCode: string, flag: string): Promise<any> {
+  const prev = submitQueues.get(uniqueCode) ?? Promise.resolve();
+  const run = prev.then(() => submitFlagOnce(uniqueCode, flag));
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  submitQueues.set(uniqueCode, tail);
+  void tail.then(() => {
+    if (submitQueues.get(uniqueCode) === tail) submitQueues.delete(uniqueCode);
+  });
+  return run;
+}
+
+async function submitFlagOnce(uniqueCode: string, flag: string): Promise<any> {
   try {
     return await api("/openapi/v1/challenges/submit", "POST", 20_000, 2, {
       unique_code: uniqueCode,

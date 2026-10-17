@@ -3,13 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { solveTask } from "../src/agent.js";
+import { solveTask, waitPlatformCompletion } from "../src/agent.js";
+import { submitFlag } from "../src/bench.js";
 import { CFG } from "../src/config.js";
 import { FlagLedger } from "../src/corelog.js";
 import {
   CLOSING_SUMMARY_PROMPT,
   COMPACT_NOTE,
   COMPACTION_PROMPT,
+  COMPLETION_DESYNC_NOTE,
+  fill,
   systemPromptWithExtras,
 } from "../src/prompt.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
@@ -82,6 +85,44 @@ describe("submitFlag 平台响应集成", () => {
     expect(bad.newFlag).toBe(false);
   });
 
+  it("并发丢更新（两次响应同一计数）→ 进度取账本较大值，账本判满", () => {
+    const led = new FlagLedger();
+    led.setTotal(2);
+    const a = integrateSubmit(
+      { correct: true, matched_flag_index: 0, correct_flag_count: 1, total_flag_count: 2 },
+      led,
+      0,
+    );
+    const b = integrateSubmit(
+      { correct: true, matched_flag_index: 1, correct_flag_count: 1, total_flag_count: 2 },
+      led,
+      0,
+    );
+    expect(a.correctCount).toBe(1);
+    expect(b.correctCount).toBe(2); // 平台计数滞后，账本已 2
+    expect(b.totalCount).toBe(2);
+    expect(led.done()).toBe(true);
+  });
+
+  it("duplicate 响应补账：确认 index 且无 total 字段时用账本总数", () => {
+    const led = new FlagLedger();
+    led.setTotal(2);
+    led.add(0, 0);
+    const out = integrateSubmit(
+      { correct: false, error: "duplicate: duplicate: flag_index=1 already correctly submitted" },
+      led,
+      0,
+    );
+    expect(out.duplicateConfirmed).toBe(true);
+    expect(out.flagIndex).toBe(1);
+    expect(out.correctCount).toBe(2);
+    expect(out.totalCount).toBe(2);
+    expect(led.done()).toBe(true);
+    // 普通错误不算确认
+    const wrong = integrateSubmit({ correct: false, error: "wrong flag" }, led, 0);
+    expect(wrong.duplicateConfirmed).toBe(false);
+  });
+
   it("单 flag 收尾总结指示 + 压缩交接文档要求（治太简略/shell 无交接）", () => {
     expect(FLAG_SUMMARY_HINT_SINGLE).toContain("≤120");
     expect(FLAG_SUMMARY_HINT_SINGLE).toContain("不调用工具");
@@ -94,6 +135,177 @@ describe("submitFlag 平台响应集成", () => {
     expect(COMPACTION_PROMPT).toContain("已证伪死路");
     expect(COMPACT_NOTE).toContain("{summary}");
     expect(COMPACT_NOTE).toContain("不要重新收集");
+  });
+});
+
+describe("submit_flag 按题串行（平台计数非并发安全）", () => {
+  it("同题并发提交排队执行，第二个响应包含第一个的计数", async () => {
+    CFG.benchmark_token = "t";
+    CFG.benchmark_base_url = "http://bench.test";
+    let active = 0;
+    let maxActive = 0;
+    let done = 0;
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        const flag = String(JSON.parse(String(init?.body)).flag);
+        seen.push(`start:${flag}`);
+        await new Promise((r) => setTimeout(r, 20));
+        done++;
+        seen.push(`end:${flag}`);
+        active--;
+        return new Response(
+          JSON.stringify({
+            correct: true,
+            matched_flag_index: done - 1,
+            correct_flag_count: done,
+            total_flag_count: 2,
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    const [a, b] = await Promise.all([
+      submitFlag("t-serial", "flag{aaa}"),
+      submitFlag("t-serial", "flag{bbb}"),
+    ]);
+    expect(maxActive).toBe(1); // 请求不重叠
+    expect(seen).toEqual(["start:flag{aaa}", "end:flag{aaa}", "start:flag{bbb}", "end:flag{bbb}"]);
+    expect(a.correct_flag_count).toBe(1);
+    expect(b.correct_flag_count).toBe(2);
+  });
+
+  it("同轮两 flag 且响应计数滞后 → 账本判满，本段立即收束", async () => {
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "race_"));
+    setRecordsDir(recdir);
+    resetRecords();
+    initRecords("local", "deepseek-flash");
+    let active = 0;
+    let maxActive = 0;
+    let n = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        const flag = String(JSON.parse(String(init?.body)).flag);
+        await new Promise((r) => setTimeout(r, 10));
+        active--;
+        return new Response(
+          JSON.stringify({
+            correct: true,
+            matched_flag_index: flag === "flag{aaa}" ? 0 : 1,
+            correct_flag_count: 1, // 平台丢更新：两次都报 1/2
+            total_flag_count: 2,
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    CFG.benchmark_token = "t";
+    CFG.benchmark_base_url = "http://bench.test";
+    const scripted: LlmClient = {
+      async create() {
+        n++;
+        return {
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  tc("s1", "submit_flag", { flag: "flag{aaa}" }),
+                  tc("s2", "submit_flag", { flag: "flag{bbb}" }),
+                ],
+              },
+            },
+          ],
+        };
+      },
+    } as LlmClient;
+    const r = await solveTask(scripted, "t-race", "卡", 600, rec().conversation("t-race"), {
+      flagTotal: 2,
+    });
+    expect(maxActive).toBe(1);
+    expect(n).toBe(1); // 不因滞后计数多跑一轮
+    expect(r.status).toBe("done");
+    expect(r.flagsComplete).toBe(true);
+    expect(r.turnsUsed).toBe(1);
+  });
+});
+
+describe("通关平台复核（延迟 + 轮询 is_completed）", () => {
+  const snap = (completed: boolean, got: number, total: number) => async () => [
+    {
+      unique_code: "t-verify",
+      is_completed: completed,
+      correct_flag_count: got,
+      flag_count: total,
+    } as any,
+  ];
+
+  it("延迟后平台已通关 → 确认；未通关 → 不误判 pass", async () => {
+    const ok = await waitPlatformCompletion(snap(true, 2, 2), "t-verify", {
+      delaySec: 0,
+      timeoutSec: 0,
+    });
+    expect(ok.state?.is_completed).toBe(true);
+    const bad = await waitPlatformCompletion(snap(false, 1, 2), "t-verify", {
+      delaySec: 0,
+      timeoutSec: 0,
+    });
+    expect(bad.state?.is_completed).toBe(false);
+    expect(bad.state?.correct_flag_count).toBe(1);
+  });
+
+  it("平台计数异步落账：窗口内轮询到通关", async () => {
+    let n = 0;
+    const rolling = async () => {
+      n++;
+      const completed = n >= 3;
+      return [
+        {
+          unique_code: "t-verify",
+          is_completed: completed,
+          correct_flag_count: completed ? 2 : 1,
+          flag_count: 2,
+        } as any,
+      ];
+    };
+    const r = await waitPlatformCompletion(rolling, "t-verify", {
+      delaySec: 0,
+      timeoutSec: 2,
+      intervalSec: 0.001,
+    });
+    expect(r.state?.is_completed).toBe(true);
+    expect(n).toBe(3);
+  });
+
+  it("快照失败不算通关：窗口耗尽返回 null state", async () => {
+    const r = await waitPlatformCompletion(async () => null, "t-verify", {
+      delaySec: 0,
+      timeoutSec: 0,
+    });
+    expect(r.items).toBeNull();
+    expect(r.state).toBeNull();
+  });
+
+  it("计数未同步续跑通知：占位符填充 + 明确不重做", () => {
+    const s = fill(COMPLETION_DESYNC_NOTE, {
+      new_target: "10.0.0.1:80",
+      old_target: "10.0.0.2:80",
+      workdir: "/work/tasks/t",
+      platform: "3/4",
+      total_flags: 4,
+    });
+    expect(s).not.toContain("{");
+    expect(s).toContain("10.0.0.1:80");
+    expect(s).toContain("3/4");
+    expect(s).toContain("不要重新侦察");
+    expect(s).toContain("duplicate");
   });
 });
 
@@ -257,6 +469,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     const conv = rec().conversation("t-c1");
     const r = await solveTask(scripted, "t-c1", "卡", 600, conv, { flagTotal: 1 });
     expect(r.status).toBe("done");
+    expect(r.flagsComplete).toBe(true);
     expect(r.flagSummaryDone).toBe(true);
     expect(r.messages.some((m) => String(m.content ?? "").startsWith("【系统·上下文压缩】"))).toBe(
       false,

@@ -42,9 +42,19 @@ export function isSubmitCurl(command: string): boolean {
 export interface SubmitOutcome {
   result: string; // 给模型的工具结果文本
   newFlag: boolean; // 平台确认的新 flag（账本/时钟/卡的触发器）
+  duplicateConfirmed: boolean; // duplicate 响应确认该 index 早已正确提交（补账）
   correctCount: number;
   totalCount: number;
   flagIndex: number | null;
+}
+
+/** duplicate 响应里的 flag index（`duplicate: flag_index=2 already correctly submitted`）。
+ *  duplicate 不增加计数，但它证明该 index 已被平台记对——续跑重建的空账本靠它补账。 */
+export function parseDuplicateIndex(resp: any): number | null {
+  if (resp?.correct === true) return null;
+  const text = typeof resp?.error === "string" ? resp.error : "";
+  const m = /flag_index\s*=\s*(\d+)\s+already\s+correctly\s+submitted/i.exec(text);
+  return m ? Number(m[1]) : null;
 }
 
 /** 平台响应 → 工具结果 + 账本集成。caller 负责 bm.recordFlag/corelog（因为要 now/conv） */
@@ -52,16 +62,21 @@ export function integrateSubmit(resp: any, ledger: FlagLedger, branchId: number)
   const correct = resp?.correct === true;
   const idx =
     typeof resp?.matched_flag_index === "number" ? (resp.matched_flag_index as number) : null;
-  const correctCount = Number(resp?.correct_flag_count ?? ledger.count());
-  const totalCount = Number(resp?.total_flag_count ?? 0);
+  const duplicateIndex = parseDuplicateIndex(resp);
+  if (duplicateIndex !== null) ledger.add(duplicateIndex, branchId);
+  const totalCount = Number(resp?.total_flag_count ?? 0) || ledger.totalCount();
   if (totalCount) ledger.setTotal(totalCount);
   const newFlag = correct && idx !== null && ledger.add(idx, branchId);
+  // 进度取平台计数与账本的较大值：并发丢更新/重复响应会让平台计数滞后，
+  // 账本（每个 index 都经平台确认）是更可靠的下界。
+  const correctCount = Math.max(Number(resp?.correct_flag_count ?? 0), ledger.count());
   return {
     result: JSON.stringify(resp),
     newFlag,
+    duplicateConfirmed: duplicateIndex !== null,
     correctCount,
     totalCount,
-    flagIndex: idx,
+    flagIndex: idx ?? duplicateIndex,
   };
 }
 

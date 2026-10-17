@@ -153,6 +153,10 @@ export class FlagLedger {
   count(): number {
     return this.got.size;
   }
+  /** 平台申报的 flag 总数（未知识 0）。响应缺字段时用它兜底进度口径。 */
+  totalCount(): number {
+    return this.total;
+  }
   /** `2/5 (idx:1,3)` 进度表示（未知总数时给 `2/?`）。 */
   progress(): string {
     const idx = [...this.got].sort((a, b) => a - b).join(",");
