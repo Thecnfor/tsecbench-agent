@@ -137,3 +137,11 @@ def test_kb_tool_returns_snippets(common, monkeypatch):
     monkeypatch.setattr(common, "kb_snippets", lambda q, top_k=3: "PAYLOAD: ' OR 1=1--")
     out = common.run_kb({"query": "sql injection"})
     assert "PAYLOAD" in out["snippets"]
+
+
+def test_prompt_contains_attack_loop(common):
+    prompt = common.build_system_prompt()
+    assert "# ATTACK LOOP" in prompt
+    assert "reuse" in prompt.lower()
+    assert "flag" in prompt.lower()
+    assert len(prompt) < 2800
