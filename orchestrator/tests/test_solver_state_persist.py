@@ -52,3 +52,21 @@ def test_persist_writes_prior_and_findings(monkeypatch, tmp_path):
     assert any("curl -s http://10.0.0.1:8080" in item for item in prior["explored"])
     assert any("flag{pwd_test}" in item for item in prior["credentials"])
     assert "credentials:" in (tmp_path / "out" / "findings.txt").read_text(encoding="utf-8")
+
+
+def test_flag_nudge_only_when_new_flag_and_flags_remain(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"flag_count": 3, "correct_flag_count": 0}), encoding="utf-8")
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    sys.modules.pop("main", None)
+    main = importlib.import_module("main")
+    import common
+
+    common.TASK = {"flag_count": 3, "correct_flag_count": 0}
+    monkeypatch.setattr(common, "_reported", {"FLAG{a}"})
+    nudge = main._flag_nudge(common, 0)
+    assert "FLAG{a}" not in (nudge or "")
+    assert "2" in (nudge or "")
+    assert main._flag_nudge(common, 1) is None

@@ -102,6 +102,21 @@ def _persist_harness_state(messages: list[dict]) -> None:
         pass
 
 
+def _flag_nudge(common_mod, reported_before: int) -> str | None:
+    """多 flag 进度：只在发现新 flag 且仍有剩余时追加一次结构化提示。"""
+    task = getattr(common_mod, "TASK", {}) or {}
+    remaining = int(task.get("flag_count", 1)) - int(task.get("correct_flag_count", 0))
+    new_flags = len(common_mod._reported) - reported_before
+    if remaining <= 0 or new_flags <= 0:
+        return None
+    outstanding = max(0, remaining - new_flags)
+    return (
+        f"{new_flags} new flag(s) found; {outstanding} still outstanding after submitting "
+        "this one. Reuse confirmed credentials against every discovered service, and treat "
+        "this flag as a new pivot. Do not stop."
+    )
+
+
 # --------------------------------------------------------------------- main ---
 def main() -> int:
     if common.ORCH_MODE:
@@ -152,6 +167,7 @@ def main() -> int:
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
+        reported_before = len(common._reported)
         # 历史卫生：任何 user 插话/裁剪都可能切断 tool_calls 组 → DeepSeek 400 永久中毒
         messages[:] = sanitize_tool_messages(messages)
         try:
@@ -278,6 +294,9 @@ def main() -> int:
             )
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
+        nudge = _flag_nudge(common, reported_before)
+        if nudge:
+            messages.append({"role": "user", "content": nudge})
         remaining = common.remaining_seconds()
         if remaining is not None and remaining < 60 and not closing_nudged:
             closing_nudged = True
