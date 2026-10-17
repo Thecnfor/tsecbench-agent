@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import html as html_lib
+import itertools
 import json
 import os
 import re
@@ -57,9 +59,23 @@ CMD_TIMEOUT = int(cfg("SOLVER_CMD_TIMEOUT", "60"))
 # 单条命令的 harness 硬顶：模型可以请求更长，但执行层不允许一条命令吃掉大半片。
 CMD_HARD_MAX_S = int(cfg("SOLVER_CMD_MAX_S", "90"))
 OUTPUT_LIMIT = int(cfg("SOLVER_OUTPUT_LIMIT", "12000"))
-# 上下文裁剪：DeepSeek 128k 上下文下 45k 过早；长利用链需要更多历史。
+# 上下文预算（三层）：软阈值降级旧轮次、硬阈值整段压缩、条数是最后保险丝。
+# DeepSeek 128k 上下文下 90k 硬顶留 38k 余量；压缩目标 40k 形成迟滞，
+# 避免「压完仍超阈值 → 每轮重压」的 thrash。
 TRIM_TOKENS = int(cfg("SOLVER_TRIM_TOKENS", "90000"))
-TRIM_KEEP_MSGS = int(cfg("SOLVER_TRIM_KEEP_MSGS", "60"))
+TRIM_SOFT_TOKENS = int(cfg("SOLVER_TRIM_SOFT_TOKENS", "60000"))
+TRIM_TARGET_TOKENS = int(cfg("SOLVER_TRIM_TARGET_TOKENS", "40000"))
+TRIM_MAX_MSGS = int(cfg("SOLVER_TRIM_MAX_MSGS", "400"))
+KEEP_RECENT_TURNS = int(cfg("SOLVER_KEEP_RECENT_TURNS", "12"))
+EMERGENCY_TOKENS = int(cfg("SOLVER_EMERGENCY_TOKENS", "20000"))
+EMERGENCY_MSG_TOKENS = int(cfg("SOLVER_EMERGENCY_MSG_TOKENS", "2000"))
+MAX_CONTEXT_RECOVERIES = int(cfg("SOLVER_MAX_CONTEXT_RECOVERIES", "2"))
+MAX_CONSECUTIVE_LLM_ERRORS = int(cfg("SOLVER_MAX_CONSECUTIVE_LLM_ERRORS", "8"))
+# 单条工具输出超过阈值即落盘，上下文只回预览 + 文件路径；
+# 单轮所有工具输出共享一个字符预算，防止一轮多个调用把上下文打爆。
+SPILL_CHARS = int(cfg("SOLVER_SPILL_CHARS", "6000"))
+SPILL_PREVIEW_CHARS = int(cfg("SOLVER_SPILL_PREVIEW_CHARS", "2000"))
+TURN_OUTPUT_BUDGET = int(cfg("SOLVER_TURN_OUTPUT_CHARS", "20000"))
 # 连续「只说不做」的停机阈值：3 太早，实测会把已拿到 LFI/凭据的链子掐断。
 MAX_PLAIN_NUDGES = int(cfg("SOLVER_MAX_PLAIN_NUDGES", "6"))
 # 收敛守卫：连续多少轮没有新资产/凭据/端点就提示换面；多少轮无新事实直接收尾。
@@ -692,6 +708,321 @@ def sanitize_tool_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------ context budgeting ---
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
+
+
+def estimate_tokens(text: str) -> int:
+    """无依赖 token 估算：CJK 按 1 字/token，其余按 ~4 字符/token。
+
+    只用来自检上下文预算（真实计费仍以 API usage 为准）。对中英混排的
+    工具输出比纯字符截断准确得多。
+    """
+    text = str(text or "")
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def message_tokens(message: dict) -> int:
+    total = estimate_tokens(str(message.get("content") or ""))
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        total += estimate_tokens(str(function.get("name") or ""))
+        total += estimate_tokens(str(function.get("arguments") or ""))
+    return total + 4
+
+
+def conversation_tokens(messages: list[dict]) -> int:
+    return sum(message_tokens(message) for message in messages)
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """按 token 上限截断，保留头 2/3 + 尾 1/3（二分找字符边界）。"""
+    if max_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    reserve = max(1, max_tokens - 8)
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_tokens(text[:mid]) <= reserve:
+            lo = mid
+        else:
+            hi = mid - 1
+    head = lo * 2 // 3
+    tail = lo - head
+    marker = f"\n...[truncated to ~{max_tokens} tokens]...\n"
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def _cap_message(message: dict, max_tokens: int) -> dict:
+    out = dict(message)
+    if out.get("content"):
+        out["content"] = _truncate_to_tokens(str(out["content"]), max_tokens)
+    calls = out.get("tool_calls") or []
+    if calls:
+        per_call = max(200, max_tokens // max(1, len(calls)))
+        capped = []
+        for call in calls:
+            call = dict(call)
+            function = dict(call.get("function") or {})
+            if function.get("arguments"):
+                function["arguments"] = _truncate_to_tokens(str(function["arguments"]), per_call)
+            call["function"] = function
+            capped.append(call)
+        out["tool_calls"] = capped
+    return out
+
+
+def _safe_cut(body: list[dict], cut: int) -> int:
+    """把切点挪到合法消息边界：不能以 tool 结果开头（必须带它的 assistant）。"""
+    if not body:
+        return 0
+    cut = max(0, min(cut, len(body) - 1))
+    while cut < len(body) and body[cut].get("role") == "tool":
+        cut += 1
+    if cut >= len(body):
+        for index in range(len(body) - 1, -1, -1):
+            if body[index].get("role") == "assistant":
+                return index
+        return len(body) - 1
+    return cut
+
+
+def compact_history(
+    messages: list[dict], *, target_tokens: int | None = None, summary_limit: int = 24
+) -> tuple[list[dict], int, int, int]:
+    """按 token 下水位压缩历史，返回 (新历史, 丢弃条数, 压缩前 tokens, 压缩后 tokens)。
+
+    与旧实现的区别：摘要只覆盖**真正被丢弃的区间**（旧代码摘要窗口与保留尾部
+    重叠，早期命令被无声丢掉）；尾部按 token 预算而不是固定条数保留；单条超大
+    消息会被截断，保证压缩后一定落在目标附近。
+    """
+    target = int(TRIM_TARGET_TOKENS if target_tokens is None else target_tokens)
+    before = conversation_tokens(messages)
+    if len(messages) <= 2:
+        return list(messages), 0, before, before
+    head = list(messages[:2])
+    body = list(messages[2:])
+    budget = max(500, target - conversation_tokens(head) - 1500)
+    kept_tokens = 0
+    cut = len(body)
+    for index in range(len(body) - 1, -1, -1):
+        tokens = message_tokens(body[index])
+        if cut < len(body) and kept_tokens + tokens > budget:
+            break
+        kept_tokens += tokens
+        cut = index
+    cut = _safe_cut(body, cut)
+    if cut <= 0:
+        return list(messages), 0, before, before
+    dropped = body[:cut]
+    max_message_tokens = max(EMERGENCY_MSG_TOKENS, target // 2)
+    kept = [_cap_message(message, max_message_tokens) for message in body[cut:]]
+    digest = summarize_history(dropped, limit=summary_limit)
+    if digest:
+        # 摘要本身也要受目标预算约束：小目标下不能出现"摘要比正文还大"。
+        digest = _truncate_to_tokens(digest, max(200, target // 4))
+    carried = [
+        str(message.get("content"))
+        for message in dropped
+        if message.get("role") == "user"
+        and str(message.get("content") or "").startswith("[context trimmed")
+    ]
+    parts = [
+        "[context trimmed: older tool exchanges removed; full outputs remain in workspace files]"
+    ]
+    if carried:
+        parts.append("\n".join(carried[-2:]))
+    if digest:
+        parts.append(digest)
+    compacted = head + [{"role": "user", "content": "\n".join(parts)}] + kept
+    return compacted, len(dropped), before, conversation_tokens(compacted)
+
+
+def _elide_tool_content(content: str) -> str:
+    if "[elided" in content or len(content) <= 240:
+        return content
+    meta, _, body = content.partition("\n")
+    body = " ".join(body.split())
+    return f"{meta[:90]} | {body[:160]} … [elided {len(content)} chars]"
+
+
+def _elide_assistant_content(content: str) -> str:
+    if "[elided" in content or len(content) <= 240:
+        return content
+    return content[:220].rstrip() + " … [elided]"
+
+
+def elide_stale_messages(
+    messages: list[dict], *, keep_recent_turns: int | None = None
+) -> tuple[list[dict], int]:
+    """软阈值降级：保留最近 N 轮原文，更早的 assistant 文本/工具输出压成一行。
+
+    只改消息内容，不改 tool_call id 与消息顺序，因此不会破坏 DeepSeek 的
+    tool_calls 组形状；幂等，重复执行不会继续缩短。
+    """
+    keep = KEEP_RECENT_TURNS if keep_recent_turns is None else int(keep_recent_turns)
+    msgs = [dict(message) for message in messages]
+    assistant_indexes = [index for index, msg in enumerate(msgs) if msg.get("role") == "assistant"]
+    if keep <= 0 or len(assistant_indexes) <= keep:
+        return msgs, 0
+    boundary = assistant_indexes[-keep]
+    start = min(2, len(msgs))
+    elided = 0
+    for index in range(start, boundary):
+        message = msgs[index]
+        role = message.get("role")
+        content = str(message.get("content") or "")
+        if role == "tool":
+            replacement = _elide_tool_content(content)
+        elif role == "assistant":
+            replacement = _elide_assistant_content(content)
+        elif role == "user":
+            if content.startswith(("[context trimmed", "[HARNESS STATE")):
+                continue
+            replacement = content if len(content) <= 400 else content[:380].rstrip() + " …"
+        else:
+            continue
+        if replacement != content:
+            msgs[index] = {**message, "content": replacement}
+            elided += 1
+    return msgs, elided
+
+
+def emergency_compact(messages: list[dict]) -> list[dict]:
+    """上下文溢出 400 的最后手段：压到 20k token 并逐条封顶。"""
+    compacted, *_ = compact_history(messages, target_tokens=EMERGENCY_TOKENS, summary_limit=8)
+    if not compacted:
+        return []
+    return [compacted[0]] + [
+        _cap_message(message, EMERGENCY_MSG_TOKENS) for message in compacted[1:]
+    ]
+
+
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"(?i)(context[ _-]?length|maximum context|too many tokens|token limit|"
+    r"input is too long|reduce the length|request too large|prompt is too long)"
+)
+
+
+def is_context_overflow_error(exc: BaseException) -> bool:
+    return bool(_CONTEXT_OVERFLOW_RE.search(str(exc)))
+
+
+# ------------------------------------------------------- tool output budget ---
+_SPILL_SEQ = itertools.count(1)
+_HTML_HINT_RE = re.compile(r"(?is)<(?:!doctype|html|head|body|div|table|form|script|style)\b")
+_HTML_DROP_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
+_HTML_TAG_RE = re.compile(r"(?s)<[^>]+>")
+
+
+def condense_html(text: str) -> str:
+    """HTML 去标签/脚本/样式，仅用于上下文预览；原始输出始终落盘可 grep。"""
+    if not _HTML_HINT_RE.search(text[:50000]) and text.count("<") < 20:
+        return text
+    text = _HTML_DROP_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("\n", text)
+    text = html_lib.unescape(text)
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _spill_dir() -> Path:
+    if SOLVER_TASK_PATH:
+        base = Path(SOLVER_TASK_PATH).parent / "out" / "tool_outputs"
+    else:
+        base = Path(cfg("SOLVER_SPILL_DIR", "/tmp/tsec-tool-outputs"))
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _write_spill(text: str, label: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(label)).strip("-")[:60] or "tool"
+    name = f"{os.getpid()}-{int(time.time())}-{next(_SPILL_SEQ):03d}-{safe}.log"
+    path = _spill_dir() / name
+    path.write_text(text, encoding="utf-8", errors="replace")
+    return path
+
+
+def prepare_tool_output(
+    text: str, *, label: str = "tool", turn_budget_left: int | None = None
+) -> str:
+    """把工具输出压到上下文预算内：大输出落盘，仅回预览 + 文件路径。
+
+    `turn_budget_left` 是本轮剩余输出字符预算；预算耗尽时只回一行指针，
+    保证一轮多个 tool_call 也不会把上下文打爆。
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+    budget = TURN_OUTPUT_BUDGET if turn_budget_left is None else max(0, int(turn_budget_left))
+    if len(text) <= SPILL_CHARS and len(text) <= budget:
+        return text
+    try:
+        path = _write_spill(text, label)
+    except OSError:
+        return truncate(text, limit=min(OUTPUT_LIMIT, max(200, budget)))
+    preview_budget = min(SPILL_PREVIEW_CHARS, budget)
+    if preview_budget < 200:
+        return f"[output spilled: {len(text)} chars -> {path}; per-turn output budget exhausted]"
+    body = condense_html(text)
+    if len(body) <= preview_budget:
+        preview = body
+    else:
+        head_chars = max(120, preview_budget * 2 // 3)
+        tail_chars = max(0, preview_budget - head_chars)
+        preview = body[:head_chars]
+        if tail_chars:
+            preview += "\n...[spilled]...\n" + body[-tail_chars:]
+    return (
+        f"[output spilled: {len(text)} chars -> {path}]\n"
+        f"{preview}\n[full output in the file; grep/sed it for more]"
+    )
+
+
+# --------------------------------------------------------- context logging ---
+def _one_line(value: object) -> str:
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    return " ".join(str(value).split())
+
+
+def render_prior_items(title: str, items: list, *, limit: int = 15, item_chars: int = 160) -> str:
+    """把 prior 列表渲染成有界的单行条目；优先保留最近的条目。
+
+    旧实现 `json.dumps(items)[:4000]` 会按字节截断（可能切在条目中间），
+    且早期噪声与最新线索同等占位。
+    """
+    if not isinstance(items, list):
+        items = [items]
+    values = [_one_line(item)[:item_chars] for item in items]
+    values = [value for value in values if value]
+    shown = values[-limit:]
+    lines = [f"# {title}"]
+    lines.extend(f"- {value}" for value in shown)
+    omitted = len(values) - len(shown)
+    if omitted > 0:
+        lines.append(f"- ... {omitted} older entries omitted")
+    return "\n".join(lines)
+
+
+def log_context_event(record: dict) -> None:
+    """每轮上下文观测（out/context.jsonl）；无 workspace 时静默跳过。"""
+    if not SOLVER_TASK_PATH:
+        return
+    path = Path(SOLVER_TASK_PATH).parent / "out" / "context.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 # ----------------------------------------------------------- flag detection ---
 NAMED_FLAG_PATTERNS = [
     re.compile(r"(?<![a-zA-Z])FLAG\{[^}\n]{1,200}\}"),
@@ -928,6 +1259,14 @@ def setup_orch_mode() -> None:
     if task.get("attempt", 1) > 1:
         parts.append(f"# Attempt #{task['attempt']}: try a DIFFERENT strategy than before.")
     prior = task.get("prior") or {}
+    relay = _render_relay(prior)
+    limits = {
+        "assets": 20,
+        "explored": 15,
+        "open_leads": 15,
+        "credentials": 20,
+        "findings": 15,
+    }
     for key, title in (
         ("assets", "Confirmed assets"),
         ("explored", "Already explored (do NOT repeat)"),
@@ -937,11 +1276,13 @@ def setup_orch_mode() -> None:
     ):
         items = prior.get(key) or []
         if items:
-            parts.append(f"# {title}\n" + json.dumps(items, ensure_ascii=False)[:4000])
+            parts.append(render_prior_items(title, items, limit=limits[key]))
     history = str(prior.get("history") or "").strip()
     if history:
-        parts.append("# Previous attempt (harness state)\n" + history[:4000])
-    relay = _render_relay(prior)
+        # relay 已给出 worked/failed 摘要时，history 只留最近一小段，
+        # 避免两份近似内容重复占上下文。
+        history_budget = 2000 if relay else 4000
+        parts.append("# Previous attempt (harness state)\n" + history[-history_budget:])
     if relay:
         parts.append(relay)
     if parts:

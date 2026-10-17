@@ -23,7 +23,11 @@ Config (solver/.env or environment; environment wins):
                      以时间片为预算，不按轮数截断）
     SOLVER_MAX_MINUTES default 40
     SOLVER_CMD_TIMEOUT default 120   seconds per single command
-    SOLVER_OUTPUT_LIMIT default 12000 chars of command output fed back to the model
+    SOLVER_OUTPUT_LIMIT default 12000 chars of single tool output
+    SOLVER_SPILL_CHARS default 6000  larger tool outputs go to out/tool_outputs/*
+    SOLVER_TRIM_TOKENS default 90000 hard prompt-token threshold
+    SOLVER_TRIM_SOFT_TOKENS default 60000 stale-turn elision threshold
+    SOLVER_TRIM_TARGET_TOKENS default 40000 compaction low-water mark
 
 Exit code: 0 on normal completion (flag found, final answer, or budget exhausted).
 """
@@ -45,7 +49,6 @@ from common import (  # 函数引用安全：内部读 common 自身全局，转
     run_command,
     sanitize_tool_messages,
     setup_orch_mode,
-    truncate,
     write_result,
 )
 
@@ -134,11 +137,24 @@ def _flag_nudge(common_mod, reported_before: int) -> str | None:
     )
 
 
-def _structured_tool_message(turn: int, call, tool: str, args: dict, result: dict) -> dict:
+def _structured_tool_message(
+    turn: int,
+    call,
+    tool: str,
+    args: dict,
+    result: dict,
+    *,
+    turn_budget_left: int,
+) -> tuple[dict, int]:
     label = args.get("mode") or str(args.get("query") or "")[:40]
     print(f"[solver] turn {turn} {tool} {label}", flush=True)
-    text = truncate(json.dumps(result, ensure_ascii=False))
-    for flag in find_flags(text):
+    raw_text = json.dumps(result, ensure_ascii=False)
+    text = common.prepare_tool_output(
+        raw_text,
+        label=f"turn{turn}-{tool}",
+        turn_budget_left=turn_budget_left,
+    )
+    for flag in find_flags(raw_text):
         report_candidate(flag)
     remaining = common.remaining_seconds()
     note = f" | slice_time_left={int(remaining)}s" if remaining is not None else ""
@@ -146,7 +162,7 @@ def _structured_tool_message(turn: int, call, tool: str, args: dict, result: dic
         "role": "tool",
         "tool_call_id": call.id,
         "content": f"[{tool}{note}]\n{text}",
-    }
+    }, len(text)
 
 
 # --------------------------------------------------------------------- main ---
@@ -200,12 +216,15 @@ def main() -> int:
     last_fact_turn = 0
     fact_nudged = False
     no_fact_nudges = 0
+    consecutive_errors = 0
+    overflow_recoveries = 0
     turn = 0
     last_idea = ""
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
         reported_before = len(common._reported)
+        turn_output_chars = 0
         # 历史卫生：任何 user 插话/裁剪都可能切断 tool_calls 组 → DeepSeek 400 永久中毒
         messages[:] = sanitize_tool_messages(messages)
         try:
@@ -217,9 +236,42 @@ def main() -> int:
             )
         except Exception as exc:  # network / rate limit / bad request
             totals["llm_errors"] += 1
+            if (
+                common.is_context_overflow_error(exc)
+                and overflow_recoveries < common.MAX_CONTEXT_RECOVERIES
+            ):
+                overflow_recoveries += 1
+                before = common.conversation_tokens(messages)
+                messages[:] = common.emergency_compact(messages)
+                last_prompt_tokens = common.conversation_tokens(messages)
+                common.log_context_event(
+                    {
+                        "turn": turn,
+                        "compaction": "emergency",
+                        "tokens_before": before,
+                        "tokens_after": last_prompt_tokens,
+                        "error": type(exc).__name__,
+                    }
+                )
+                print(
+                    f"[solver] context overflow -> emergency compact "
+                    f"{before}->{last_prompt_tokens} tokens; retrying",
+                    flush=True,
+                )
+                continue
+            consecutive_errors += 1
             print(f"[solver] LLM call failed ({type(exc).__name__}): {exc}", flush=True)
+            if consecutive_errors >= common.MAX_CONSECUTIVE_LLM_ERRORS:
+                print(
+                    f"[solver] {consecutive_errors} consecutive LLM errors; stopping",
+                    flush=True,
+                )
+                break
             time.sleep(5)
             continue
+
+        consecutive_errors = 0
+        overflow_recoveries = 0
 
         usage = getattr(resp, "usage", None)
         if usage is not None:
@@ -306,7 +358,16 @@ def main() -> int:
                     result = common.run_rea(args)
                 else:
                     result = common.run_kb(args)
-                messages.append(_structured_tool_message(turn, call, tool, args, result))
+                message, used = _structured_tool_message(
+                    turn,
+                    call,
+                    tool,
+                    args,
+                    result,
+                    turn_budget_left=common.TURN_OUTPUT_BUDGET - turn_output_chars,
+                )
+                turn_output_chars += used
+                messages.append(message)
                 continue
 
             command = str(args.get("command", "")).strip()
@@ -326,14 +387,20 @@ def main() -> int:
             common.note_tool_use("run_command")
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
-            out = truncate(result["output"])
+            raw_output = result["output"]
+            out = common.prepare_tool_output(
+                raw_output,
+                label=f"turn{turn}-cmd",
+                turn_budget_left=common.TURN_OUTPUT_BUDGET - turn_output_chars,
+            )
+            turn_output_chars += len(out)
             meta = f"exit_code={result['exit_code']} seconds={result['seconds']}" + (
                 " TIMEOUT" if result["timed_out"] else ""
             )
             print(f"[solver]   -> {meta}", flush=True)
             if out.strip():
                 print(out, flush=True)
-            for flag in find_flags(result["output"]):
+            for flag in find_flags(raw_output):
                 report_candidate(flag)
 
             remaining = common.remaining_seconds()
@@ -408,19 +475,38 @@ def main() -> int:
                 }
             )
 
-        # Context guard: drop oldest tool exchanges when the prompt gets large.
-        if last_prompt_tokens > common.TRIM_TOKENS or len(messages) > 140:
-            head = messages[:2]
-            tail = messages[-common.TRIM_KEEP_MSGS :]
-            while tail and tail[0].get("role") == "tool":
-                tail.pop(0)
-            kept = "[context trimmed: older tool exchanges removed; continue solving, reuse files you created]"
-            digest = common.summarize_history(messages[2 : max(2, len(messages) - 30)])
-            if digest:
-                kept += "\n" + digest
-            messages[:] = head + [{"role": "user", "content": kept}] + tail
-            last_prompt_tokens = 0
-            print("[solver] context trimmed", flush=True)
+        # Context budget: soft elision -> hard compaction -> (400) emergency.
+        effective_tokens = last_prompt_tokens or common.conversation_tokens(messages)
+        compaction = None
+        if effective_tokens > common.TRIM_TOKENS or len(messages) > common.TRIM_MAX_MSGS:
+            messages[:], dropped, before, after = common.compact_history(
+                messages, target_tokens=common.TRIM_TARGET_TOKENS
+            )
+            last_prompt_tokens = after
+            compaction = "hard"
+            print(
+                f"[solver] context compacted: dropped={dropped} tokens~{before}->{after}",
+                flush=True,
+            )
+        elif effective_tokens > common.TRIM_SOFT_TOKENS:
+            messages[:], elided = common.elide_stale_messages(
+                messages, keep_recent_turns=common.KEEP_RECENT_TURNS
+            )
+            if elided:
+                last_prompt_tokens = common.conversation_tokens(messages)
+                compaction = "elide"
+                print(f"[solver] stale turns elided: messages={elided}", flush=True)
+
+        common.log_context_event(
+            {
+                "turn": turn,
+                "prompt_tokens": last_prompt_tokens,
+                "est_tokens": common.conversation_tokens(messages),
+                "messages": len(messages),
+                "tool_output_chars": turn_output_chars,
+                "compaction": compaction,
+            }
+        )
 
         # 每轮回写状态：即便下一拍被片超时杀掉，harness 也知道做过什么
         _persist_harness_state(messages)
