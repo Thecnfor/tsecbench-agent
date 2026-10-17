@@ -53,7 +53,9 @@ LIST_FAIL_LIMIT = 3  # list 连续失败达此数才全局停机（瞬时 409/40
 AVAILABLE_POLL_START_S = 0.3
 AVAILABLE_POLL_MAX_S = 2.0
 AVAILABLE_POLL_GROWTH = 1.6
-MAX_ATTEMPTS = 2  # 普通重试上限（失败一次后换策略再投一轮）
+# 失败重投上限：难题常需要多轮换策略（实测 60 轮/2 次投递会过早放弃）。
+# 可经 MAX_ATTEMPTS 覆盖；调度器的 attempts 惩罚会自然把重投题排到队尾。
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 
 
 @dataclass(slots=True)
@@ -157,9 +159,41 @@ async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: f
     return False
 
 
+def solver_env_for(
+    env: dict[str, str] | None,
+    rec: ChallengeRecord,
+    config: RuntimeConfig | None = None,
+) -> dict[str, str]:
+    """solver 子进程环境来源（§4.3 分级模型 / §6.2 网关改写）。
+
+    None = 以进程环境为基底 —— 镜像里没有 solver/.env，LLM_* 全部来自平台注入。
+    config 提供**改写后**的 LLM_BASE_URL（托管模式必须是 *.tsecbench.gw）与
+    key/model；若不注入，solver 会拿原始公网 URL 直连，平台网关上根本看不到请求
+    （run-34162 仿真抓到的第三个 bug）。
+    """
+    base = env if env is not None else os.environ
+    merged = dict(base)
+    if config is not None:
+        if config.llm_base_url:
+            merged["LLM_BASE_URL"] = config.llm_base_url
+        if config.llm_api_key:
+            merged["LLM_API_KEY"] = config.llm_api_key
+        if config.llm_model:
+            merged["LLM_MODEL"] = config.llm_model
+    if rec.difficulty == "hard" or rec.attempts > 1:
+        merged["LLM_MODEL"] = REASONER_MODEL
+    return merged
+
+
 def _merge_prior(old: dict | None, new: dict) -> dict:
     """双图跨轮合并：solver 只交原始观察，去重由编排器算（§2.5）。"""
-    merged = {"assets": [], "explored": [], "open_leads": []}
+    merged = {
+        "assets": [],
+        "explored": [],
+        "open_leads": [],
+        "credentials": [],
+        "findings": [],
+    }
     for key in merged:
         items = list((old or {}).get(key) or []) + list(new.get(key) or [])
         seen: list[str] = []
@@ -168,6 +202,9 @@ def _merge_prior(old: dict | None, new: dict) -> dict:
             if marker not in seen:
                 seen.append(marker)
                 merged[key].append(item)
+    # 跨 attempt 的 harness 状态：优先最新一轮（solver 每轮覆盖落盘）
+    history = str((new or {}).get("history") or (old or {}).get("history") or "")
+    merged["history"] = history[-4000:]
     return merged
 
 
@@ -269,9 +306,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     deadline_epoch = min(time.time() + slice_s, ctx.t0 + ctx.config.total_time_limit_s)
     # 分级模型调度（实测 reasoner 支持 tool calls 且延迟 ~3s）：hard 题与
     # 失败过的题用 reasoner 攻坚提首片解出率，其余用 chat 保吞吐。
-    solver_env = dict(ctx.env or {})
+    solver_env = solver_env_for(ctx.env, rec, ctx.config)
     if rec.difficulty == "hard" or rec.attempts > 1:
-        solver_env["LLM_MODEL"] = REASONER_MODEL
         ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
     outcome, early_new, early_completed = await streams.run_solver_with_stream(
@@ -502,16 +538,76 @@ async def run_agent(
         journal.close()
 
 
+_SCRIPT_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".sh")
+
+
+def _path_like(token: str) -> bool:
+    return token.startswith(("/", "./", "../")) or token.endswith(_SCRIPT_SUFFIXES)
+
+
+def _iter_script_tokens(cmd: list[str]):
+    for token in cmd:
+        if token.startswith("-"):
+            continue
+        if _path_like(token):
+            yield token
+
+
+def resolve_solver_cmd(
+    config: RuntimeConfig,
+    *,
+    environ: dict[str, str] | None = None,
+    module_file: str | Path | None = None,
+    python_exe: str | None = None,
+) -> list[str]:
+    """解析 solver 入口，镜像与仓库两种布局都成立（启动期硬校验）。
+
+    run-34162 根因：`Path(__file__).parents[3]` 在仓库里是仓库根，在镜像
+    （pip install 到 site-packages）里是 `venv/lib`，拼出的 solver/main.py
+    不存在。solver 每次 spawn 都 exit 2，编排器只看到失败 → 关靶场重投，
+    整轮零提交。解析顺序：SOLVER_CMD（操作者显式覆盖）→ TSECBENCH_SOLVER_DIR
+    → 仓库相对路径；全部不存在时启动即失败，绝不静默烧完一轮。
+    """
+    env = os.environ if environ is None else environ
+    python = python_exe or sys.executable
+    module = Path(module_file or __file__).resolve()
+
+    if config.solver_cmd:
+        cmd = list(config.solver_cmd)
+        for token in _iter_script_tokens(cmd):
+            if not Path(token).is_file():
+                raise FileNotFoundError(f"solver entry not found: {token}")
+        return cmd
+
+    tried: list[Path] = []
+    solver_dir = env.get("TSECBENCH_SOLVER_DIR", "").strip()
+    if solver_dir:
+        tried.append(Path(solver_dir) / "main.py")
+    if len(module.parents) > 3:
+        tried.append(module.parents[3] / "solver" / "main.py")
+    for path in tried:
+        if path.is_file():
+            return [python, str(path)]
+    raise FileNotFoundError(
+        "solver entry not found; set SOLVER_CMD or TSECBENCH_SOLVER_DIR. tried: "
+        + ", ".join(str(p) for p in tried)
+    )
+
+
 def main() -> int:
     config = resolve_config()
     # solver 在题目工作区目录下被启动（cwd ≠ 仓库根），`-m solver.main` 不可导入 ——
-    # 用仓库内绝对路径直接执行脚本（solver/main.py 自带 .env 定位，不依赖 cwd）。
-    solver_main = Path(__file__).resolve().parents[3] / "solver" / "main.py"
+    # 用绝对路径直接执行脚本（solver/main.py 自带 .env 定位，不依赖 cwd）。
+    try:
+        solver_cmd = resolve_solver_cmd(config)
+    except FileNotFoundError as exc:
+        print(f"[orchestrator] FATAL: {exc}", file=sys.stderr, flush=True)
+        return 2
     summary = asyncio.run(
         run_agent(
             base_url=config.base_url,
             token=config.token,
-            solver_cmd=config.solver_cmd or [sys.executable, str(solver_main)],
+            solver_cmd=solver_cmd,
             config=config,
         )
     )

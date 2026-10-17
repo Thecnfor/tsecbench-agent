@@ -591,6 +591,8 @@ def setup_orch_mode() -> None:
         ("assets", "Confirmed assets"),
         ("explored", "Already explored (do NOT repeat)"),
         ("open_leads", "Open leads"),
+        ("credentials", "Confirmed credentials"),
+        ("findings", "Findings (versions/endpoints)"),
     ):
         items = prior.get(key) or []
         if items:
