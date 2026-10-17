@@ -128,6 +128,17 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.wait(timeout=GRACE_S)
 
 
+def _kill_now(proc: subprocess.Popen) -> None:
+    """立即 SIGKILL 整个进程组并回收（取消路径不可优雅等待）。"""
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    else:
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=3)
+
+
 async def run_solver(
     *,
     solver_cmd: list[str],
@@ -176,11 +187,14 @@ async def run_solver(
         await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=slice_s)
     except TimeoutError:
         timed_out = True
-        await asyncio.to_thread(_kill_tree, proc)
-
+    finally:
+        # 超时 / 任务取消（pipeline 异常）都必须杀掉进程组：否则 solver 与它
+        # 拉起的 nmap/curl 会变成孤儿继续跑（run-35236 c-06 实测）。
+        if proc.poll() is None:
+            _kill_now(proc)
+        stdout_f.close()
+        stderr_f.close()
     duration = time.monotonic() - started
-    stdout_f.close()
-    stderr_f.close()
     exit_code = 124 if timed_out else proc.returncode
     return SolverOutcome(
         exit_code=exit_code,

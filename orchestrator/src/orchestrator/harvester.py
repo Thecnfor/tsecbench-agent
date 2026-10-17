@@ -24,13 +24,17 @@ from .registry import ChallengeRecord
 # 与 solver/main.py 保持同一组命名模式 + 通用兜底
 NAMED_FLAG_PATTERNS = (
     re.compile(r"(?<![a-zA-Z])FLAG\{[^}\n]{1,200}\}"),
+    re.compile(r"(?<![a-zA-Z])flag\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])HTB\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])picoCTF\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])THM\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])CTF\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])XBEN\{[^}\n]{1,200}\}"),
 )
-GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9_]{2,24}\{[^}\n]{4,120}\}")
+# 通用兜底必须拒绝 CSS/JS 规则形（body{...}、h1{border:...}、let{...}）：
+# 线上 run-35236 实测 stdout 里的 CSS 被当作 flag 连投 10 次全部失败。
+GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
+GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 
 FLAG_MIN_LEN, FLAG_MAX_LEN = 1, 4096
 _SCAN_SUFFIX_BLOCKLIST = (".log.bak",)  # 无实际用途，占位说明只按内容扫
@@ -41,12 +45,19 @@ def extract_flags(text: str) -> list[str]:
     """从一段文本提取候选：命名模式优先，generic 兜底；保持发现顺序，去重。"""
     found: list[str] = []
     seen: set[str] = set()
-    for pattern in (*NAMED_FLAG_PATTERNS, GENERIC_FLAG_PATTERN):
+    for pattern in NAMED_FLAG_PATTERNS:
         for m in pattern.finditer(text):
             value = m.group(0)
             if value not in seen:
                 seen.add(value)
                 found.append(value)
+    for m in GENERIC_FLAG_PATTERN.finditer(text):
+        if not GENERIC_BODY_RE.match(m.group(2)):
+            continue
+        value = m.group(0)
+        if value not in seen:
+            seen.add(value)
+            found.append(value)
     return found
 
 
@@ -106,9 +117,11 @@ async def submit_candidates(
             result = await client.submit(rec.unique_code, flag)
         except Duplicate:
             report.duplicates += 1
+            rec.submitted.add(flag)  # 已入袋，避免每个收割节拍重投
             continue
         except FlagRejected:
             report.rejected += 1
+            rec.submitted.add(flag)  # 失败也是终态；否则 45s 后会重复投递
             continue
         except TaskEnded:
             report.task_ended = True

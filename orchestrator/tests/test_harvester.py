@@ -8,7 +8,7 @@ import threading
 import pytest
 from mock_server.server import make_server
 from mock_server.state import ChallengeSpec
-from orchestrator.api import PlatformClient
+from orchestrator.api import FlagRejected, PlatformClient
 from orchestrator.harvester import SubmitReport, extract_flags, harvest, submit_candidates
 from orchestrator.registry import ChallengeRecord
 
@@ -33,8 +33,17 @@ def factory():
 
 # ---- 收割 ----
 def test_extract_named_and_generic_order():
-    text = "noise FLAG{aaa} HTB{bbb} weird{k:v!z} FLAG{aaa} end"
-    assert extract_flags(text) == ["FLAG{aaa}", "HTB{bbb}", "weird{k:v!z}"]
+    text = "noise FLAG{aaa} HTB{bbb} weird{abc-123} FLAG{aaa} end"
+    assert extract_flags(text) == ["FLAG{aaa}", "HTB{bbb}", "weird{abc-123}"]
+
+
+def test_extract_rejects_css_and_js_generic():
+    text = (
+        "body{color:#fff;background:#000} "
+        "h1{border-right:1px solid rgba(255,255,255,.3)} "
+        "let{children:t} try{r=a,n=b} FLAG{ok}"
+    )
+    assert extract_flags(text) == ["FLAG{ok}"]
 
 
 def test_harvest_scans_all_files_not_just_result(tmp_path):
@@ -73,6 +82,24 @@ def test_harvest_empty_workspace(tmp_path):
 # ---- 提交 ----
 def client(base: str) -> PlatformClient:
     return PlatformClient(base, TOKEN, qps=100.0, jitter=0.0)
+
+
+class RejectingClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def submit(self, unique_code: str, flag: str) -> dict:
+        self.calls += 1
+        raise FlagRejected("422 rejected")
+
+
+def test_rejected_candidate_is_not_resubmitted():
+    rec = ChallengeRecord(unique_code="r1")
+    rejecting = RejectingClient()
+    report = asyncio.run(submit_candidates(rejecting, rec, ["body{color:red}"]))
+    assert report.rejected == 1
+    assert "body{color:red}" in rec.submitted
+    assert [f for f in ["body{color:red}"] if f not in rec.submitted] == []
 
 
 def test_submit_multi_flag_progress_and_complete(factory):

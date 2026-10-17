@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from .harvester import harvest, submit_candidates
 from .supervisor import SolverOutcome, run_solver
@@ -49,17 +50,26 @@ async def run_solver_with_stream(
         )
     )
     early_new, early_completed = 0, False
-    while True:
-        done, _pending = await asyncio.wait({solver_task}, timeout=interval_s)
-        if done:
-            outcome = solver_task.result()
-            break
-        candidates = [f for f in harvest(ws) if f not in rec.submitted]
-        if not candidates:
-            continue
-        report = await submit_candidates(client, rec, candidates)
-        early_completed = early_completed or report.completed
-        if report.new_matches:
-            early_new += report.new_matches
-            journal.append("early_submit", unique_code=unique_code, new_matches=report.new_matches)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({solver_task}, timeout=interval_s)
+            if done:
+                outcome = solver_task.result()
+                break
+            candidates = [f for f in harvest(ws) if f not in rec.submitted]
+            if not candidates:
+                continue
+            report = await submit_candidates(client, rec, candidates)
+            early_completed = early_completed or report.completed
+            if report.new_matches:
+                early_new += report.new_matches
+                journal.append(
+                    "early_submit", unique_code=unique_code, new_matches=report.new_matches
+                )
+    except BaseException:
+        # 提交异常（WAF/网络）不能让 solver 成为孤儿：取消并等待其清理进程组。
+        solver_task.cancel()
+        with contextlib.suppress(BaseException):
+            await solver_task
+        raise
     return outcome, early_new, early_completed

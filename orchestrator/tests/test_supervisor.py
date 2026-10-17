@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -121,6 +122,43 @@ def test_run_solver_timeout_kills(tmp_path):
     assert outcome.timed_out and outcome.exit_code == 124
     assert time.monotonic() - t0 < 20  # 杀掉而非等 999s
     assert (ws / "out" / "flags" / "000.txt").read_text().strip() == "FLAG{before_kill}"
+
+
+def test_run_solver_cancellation_kills_process(tmp_path):
+    """pipeline 异常取消任务时，solver 进程组必须被杀（不留孤儿）。"""
+    script = tmp_path / "stubborn_cancel.py"
+    script.write_text(
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "ws = Path(os.environ['SOLVER_TASK']).parent\n"
+        "(ws / 'pid.txt').write_text(str(os.getpid()))\n"
+        "time.sleep(999)\n",
+        encoding="utf-8",
+    )
+    ws = prepare_workspace(tmp_path, rec(), attempt=1)
+
+    async def cancel_mid_run() -> None:
+        task = asyncio.create_task(
+            run_solver(
+                solver_cmd=[PY, str(script)],
+                ws=ws,
+                deadline_epoch=time.time() + 60,
+                slice_s=60,
+                environ={"PATH": str(Path(PY).parent)},
+            )
+        )
+        for _ in range(100):
+            if (ws / "pid.txt").is_file():
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_mid_run())
+    pid = int((ws / "pid.txt").read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_run_solver_crash_exit_code(tmp_path):

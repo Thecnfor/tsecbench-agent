@@ -205,3 +205,18 @@ def test_token_bucket_enforces_qps(factory):
     run(burst())
     elapsed = time.monotonic() - start
     assert elapsed >= 2.0  # 10 req / 3 qps ≈ 3s，留余量
+
+
+def test_501_waf_page_is_retried(monkeypatch):
+    c = PlatformClient("http://127.0.0.1:1", TOKEN, qps=100.0, **FAST)
+    calls = []
+
+    def fake_http(self, method, path, *, query="", body=None):
+        calls.append(path)
+        if len(calls) == 1:
+            return 501, b"<html>waf 501page</html>"
+        return 200, b'{"ok": 1}'
+
+    monkeypatch.setattr(PlatformClient, "_http", fake_http)
+    assert asyncio.run(c._request("GET", "/x")) == {"ok": 1}
+    assert len(calls) == 2

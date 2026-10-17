@@ -191,6 +191,13 @@ class PlatformClient:
                     await self._sleep(self.delay_500)
                     continue
                 raise RetryableError("500 internal_error, retries exhausted")
+            if status == 501:
+                # 腾讯 WAF 拦截页（HTML 跳转 501page.html），非业务错误；
+                # 按瞬时故障退避重试（run-35236 实测 submit 命中一次）。
+                if attempt < self.retries_network:
+                    await self._sleep(self.delay_network)
+                    continue
+                raise RetryableError("501 WAF/upstream page, retries exhausted")
             if status == 422:
                 raise FlagRejected(f"422 framework validation: {payload}")
 
