@@ -74,10 +74,10 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `agent.ts` | 控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close；并行调度、分段解题、VPN 守卫、平台终态收敛、`--smoke` |
 | `shell.ts` | 异步 shell：Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（PIL 压图；网关拒图降级为元数据文本） |
 | `shell_tool.ts` | shell 工具 schema、参数容错修复（`parseToolArguments`）、动作路由；出口拦截 `curl …challenges/submit`（提交只走 `submit_flag`） |
-| `submit_flag.ts` | `submit_flag` toolcall（唯一提交通道，unique_code 由 controller 填防跨题）：平台响应→账本/flag 时钟/corelog 卡；两版总结指示（多 flag 压缩继续 / 单 flag 即收尾） |
+| `submit_flag.ts` | `submit_flag` toolcall（唯一提交通道，unique_code 由 controller 填防跨题）：平台响应→账本/flag 时钟/corelog 卡；单 flag 收尾总结指示（多 flag 压缩是系统自动的，与 flag 无关） |
 | `llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换（匿名优先，标签只带尾 4 位掩码） |
 | `bench.ts` | 平台 API 客户端（fetch/start/close/选题策略/名额释放），错误码分类（含 `TaskFinishedError` 终态） |
-| `records.ts` | bench 级持久化：`meta.json`/`events.jsonl`/`tasks.jsonl`/`tasks/<code>/conversation.jsonl`；`rebuildMessages` 续跑重建（含多 flag 压缩锚：头 ∪ flag_summary ∪ flag_continue ∪ 最后 continue 之后）；`readFlagSummaries` 段启动恢复总结链 |
+| `records.ts` | bench 级持久化：`meta.json`/`events.jsonl`/`tasks.jsonl`/`tasks/<code>/conversation.jsonl`；`rebuildMessages` 续跑重建（压缩锚：头 ∪ 最后一条 `context_compact` 交接文档 ∪ 锚后过程） |
 | `config.ts` | 全部配置与默认值（环境变量 + 项目根 `.env`）、local/hosted 模式检测、转写规则 `toGatewayUrl` |
 | `prompt.ts` | 单题 system prompt、任务卡模板、续跑/拉回/复盘通知 |
 | `panel/` | `data.ts` 记录读取与统计（含历史归档基线预测）；`server.ts` Node 面板服务；`web/` React 面板 |
@@ -102,6 +102,7 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
 | `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸，轮数防极端空转） | 120 |
 | `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | 300 |
+| `AGENT_COMPACT_CHARS` | 上下文自动压缩阈值（字符估算；超限压缩为交接文档：凭据原值/产物与在途/死路/进度；0=关） | 120000 |
 | `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |

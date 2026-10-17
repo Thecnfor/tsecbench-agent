@@ -239,7 +239,7 @@ export const CFG: Config = {
   shell_max_jobs: num("AGENT_SHELL_MAX_JOBS", "8"),
 
   // --- 多模态（shell action=view 读图）---
-  // auto=先按图片发，网关 400 拒图时本会话降级为文本（只有元数据）
+  // auto=先按图片发，网关 400 拒图时本会话降级为文本（OCR/元数据）
   vision: env("AGENT_VISION", "auto").toLowerCase(),
   vision_max_kb: num("AGENT_VISION_MAX_KB", "4096"),
   vision_ok: null,
