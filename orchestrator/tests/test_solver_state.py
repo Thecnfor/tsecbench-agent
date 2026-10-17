@@ -18,13 +18,13 @@ def load_state():
 def test_extracts_credentials_and_endpoints():
     state = load_state()
     text = (
-        '{"DATABASE_PASSWORD":"flag{not_a_real_flag}","DATABASE_USER":"dbadmin"}\n'
+        '{"DATABASE_PASSWORD":"S3cretPwd!","DATABASE_USER":"dbadmin"}\n'
         "GET http://10.0.0.5:8080/api/functions/order/config\n"
         "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij\n"
         "Server: nginx/1.18.0\n"
     )
     out = state.extract_findings(text)
-    assert any("flag{not_a_real_flag}" in item for item in out["credentials"])
+    assert any("S3cretPwd!" in item for item in out["credentials"])
     assert any("10.0.0.5:8080" in item for item in out["endpoints"])
     assert any("nginx/1.18.0" in item for item in out["versions"])
 

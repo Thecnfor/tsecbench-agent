@@ -1229,6 +1229,8 @@ Hard rules:
 - No internet, no installs, no OOB callbacks; the only reachable endpoints are the target(s) and the LLM API.
 - Target connectivity is preconfigured. A first timeout usually means cold start: retry once after ~20s, then change vector. Do not debug VPN/DNS/routing.
 - Bound every network command (`curl -m 5`, `timeout 30`). One high-information command beats many small ones.
+- JS/CSS/font URLs, chunk filenames, and JS expressions are NOT assets or credentials.
+  Verify any credential with a real login/200 before building a chain.
 {shell_rule}
 - Flags: report exactly as found; multi-flag challenges continue until all flags are submitted.
 - No hints exist. Solve from local analysis; never probe the platform or LLM side.

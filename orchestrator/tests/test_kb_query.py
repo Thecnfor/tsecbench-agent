@@ -26,6 +26,11 @@ def test_expands_hugegraph_and_cloud():
     assert "environment variables" in build_query("AWS Lambda 配置泄露")
 
 
+def test_expands_langflow():
+    query = build_query("Langflow 1.2.0 AI workflow")
+    assert "langflow" in query and "cve" in query
+
+
 def test_generic_query_is_unchanged():
     query = build_query("普通 Web 登录页 SQL 注入")
     assert "lfi" not in query and "gremlin" not in query

@@ -11,6 +11,7 @@ import re
 # (触发词, 扩展词)。触发词命中任意一个即追加该组扩展。
 ALIASES: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
     (("dify",), ("next.js", "console api", "ssrf", "rsc", "server action")),
+    (("langflow",), ("langflow", "cve", "code injection", "api/v1", "gradio")),
     (("gitea", "forgejo"), ("gitea", "oauth", "pow", "registration", "cve")),
     (("flask", "werkzeug"), ("flask", "werkzeug", "ssti", "debug console", "lfi")),
     (("azurite", "minio"), ("azure", "sas", "blob", "storage", "azurite")),

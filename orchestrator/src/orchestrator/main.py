@@ -491,7 +491,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                 prior = _merge_prior(ctx.priors.get(code), collect_prior(ws))
                 ctx.priors[code] = prior
                 has_progress = _slice_has_progress(ws) or bool(prior.get("credentials"))
-                high_value = bool(prior.get("credentials")) or bool(harvest(ws))
+                high_value = bool(harvest(ws))
                 decision = _probe_decision(stage, has_progress, high_value, remaining_slice)
                 if decision == "stop":
                     ctx.journal.append(

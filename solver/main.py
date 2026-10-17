@@ -34,6 +34,7 @@ Exit code: 0 on normal completion (flag found, final answer, or budget exhausted
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import sys
@@ -115,7 +116,14 @@ def _fact_signature(text: str) -> set[str]:
     facts = {f"cred:{value}" for value in findings.get("credentials") or []}
     for endpoint in findings.get("endpoints") or []:
         match = re.match(r"https?://([^/]+)", endpoint) or re.match(r"([^/]+)", endpoint)
-        if match:
+        if not match:
+            continue
+        host = match.group(1).lower().split(":")[0]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if address.is_private and not address.is_loopback:
             facts.add(f"host:{match.group(1).lower()}")
     for flag in find_flags(text):
         facts.add(f"flag:{flag}")

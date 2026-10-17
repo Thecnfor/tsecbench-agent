@@ -113,6 +113,6 @@ def test_prior_synthesize_and_write(gov_modules):
 
 def test_prior_synthesize_includes_credentials(gov_modules):
     prior = gov_modules["prior"]
-    result = prior.synthesize([{"text": '{"DATABASE_PASSWORD":"flag{pwd_test}"}'}], candidates=[])
+    result = prior.synthesize([{"text": '{"DATABASE_PASSWORD":"S3cretPwd!"}'}], candidates=[])
     assert "credentials" in result
-    assert any("flag{pwd_test}" in item for item in result["credentials"])
+    assert any("S3cretPwd!" in item for item in result["credentials"])

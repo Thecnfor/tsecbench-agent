@@ -44,13 +44,13 @@ def test_persist_writes_prior_and_findings(monkeypatch, tmp_path):
         {
             "role": "tool",
             "tool_call_id": "a",
-            "content": '{"DATABASE_PASSWORD":"flag{pwd_test}","DATABASE_USER":"dbadmin"}',
+            "content": '{"DATABASE_PASSWORD":"S3cretPwd!","DATABASE_USER":"dbadmin"}',
         },
     ]
     main._persist_harness_state(messages)
     prior = json.loads((tmp_path / "out" / "prior.json").read_text(encoding="utf-8"))
     assert any("curl -s http://10.0.0.1:8080" in item for item in prior["explored"])
-    assert any("flag{pwd_test}" in item for item in prior["credentials"])
+    assert any("S3cretPwd!" in item for item in prior["credentials"])
     assert "credentials:" in (tmp_path / "out" / "findings.txt").read_text(encoding="utf-8")
 
 
@@ -80,7 +80,7 @@ def test_fact_signature_detects_credentials_and_endpoints(monkeypatch, tmp_path)
     sys.modules.pop("common", None)
     sys.modules.pop("main", None)
     main = importlib.import_module("main")
-    facts = main._fact_signature('{"DATABASE_PASSWORD":"flag{pwd}"} http://10.0.0.1:8080/api')
+    facts = main._fact_signature('{"DATABASE_PASSWORD":"S3cretPwd!"} http://10.0.0.1:8080/api')
     assert any(item.startswith("cred:") for item in facts)
     assert any(item.startswith("host:") for item in facts)
     assert main._fact_signature("just prose, no facts") == set()
@@ -98,3 +98,15 @@ def test_fact_signature_same_host_paths_are_not_new(monkeypatch, tmp_path):
     second = main._fact_signature("http://10.0.0.1:8080/b")
     assert first == second
     assert main._fact_signature("admin:pass@10.0.0.1") != first
+
+
+def test_fact_signature_ignores_public_and_static_hosts(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"unique_code": "x1"}), encoding="utf-8")
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    sys.modules.pop("main", None)
+    main = importlib.import_module("main")
+    facts = main._fact_signature("http://fonts.googleapis.com/css http://10.0.0.1:8080/a")
+    assert facts == {"host:10.0.0.1:8080"}

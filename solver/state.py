@@ -13,6 +13,52 @@ MAX_ITEMS = 50
 _ASSET_RE = re.compile(r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9.-]+\.[a-z]{2,})(?::\d{2,5})?\b")
 _URL_RE = re.compile(r"https?://[^\s\"'<>]{4,200}")
 _CMD_RE = re.compile(r"^\$\s+(.{1,200})")
+_BAD_CRED_RE = re.compile(r"[(){},;$+\"'\s]")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+
+def _host_port(value: str) -> tuple[str, str] | None:
+    text = value.strip().lower()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0]
+    if text.count(":") != 1:
+        return None
+    host, port = text.rsplit(":", 1)
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        return None
+    return host, port
+
+
+def _asset_ok(value: str) -> bool:
+    """只保留 host:port；JS chunk/字体/CSS 文件名和裸域名不算资产。"""
+    parsed = _host_port(value)
+    if parsed is None:
+        return False
+    host, _port = parsed
+    if host in _LOOPBACK_HOSTS:
+        return False
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host))
+
+
+def _lead_ok(value: str) -> bool:
+    parsed = _host_port(value)
+    if parsed is None:
+        return False
+    host, _port = parsed
+    return host not in _LOOPBACK_HOSTS and bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host))
+
+
+def _cred_ok(value: str) -> bool:
+    value = value.strip().rstrip(";,.}])")
+    if not 3 <= len(value) <= 120:
+        return False
+    if value.lower() in {"...", "<...>", "redacted", "password", "passwd", "token", "secret"}:
+        return False
+    # JS 表达式/字体族/shell 片段不是凭据
+    return not _BAD_CRED_RE.search(value)
+
+
 _CRED_RE = [
     re.compile(
         r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key)[\"']?\s*[:=]\s*"
@@ -46,11 +92,16 @@ def extract_findings(text: str) -> dict:
     for pattern in _CRED_RE:
         for match in pattern.finditer(text):
             if match.lastindex == 2 and match.group(0).endswith("@"):
-                credentials.append(f"{match.group(1)}:{match.group(2)}")
+                value = f"{match.group(1)}:{match.group(2)}"
             else:
-                credentials.append(match.group(1) if match.lastindex else match.group(0))
-    endpoints = [match.group(0) for match in _URL_RE.finditer(text)]
-    endpoints.extend(match.group(0) for match in _ASSET_RE.finditer(text.lower()))
+                value = match.group(1) if match.lastindex else match.group(0)
+            cleaned = value.strip().rstrip(";,.}])")
+            if _cred_ok(cleaned):
+                credentials.append(cleaned)
+    endpoints = [match.group(0) for match in _URL_RE.finditer(text) if _lead_ok(match.group(0))]
+    endpoints.extend(
+        match.group(0) for match in _ASSET_RE.finditer(text.lower()) if _asset_ok(match.group(0))
+    )
     versions = [match.group(1) for match in _VERSION_RE.finditer(text)]
     errors = [line.strip()[:160] for line in text.splitlines() if _ERROR_RE.search(line)]
     return {
@@ -71,8 +122,12 @@ def synthesize_prior(events: list[dict], candidates: list[str]) -> dict:
         text = str(event.get("text", ""))
         if not text:
             continue
-        assets.extend(match.group(0) for match in _ASSET_RE.finditer(text.lower()))
-        leads.extend(match.group(0) for match in _URL_RE.finditer(text))
+        assets.extend(
+            match.group(0)
+            for match in _ASSET_RE.finditer(text.lower())
+            if _asset_ok(match.group(0))
+        )
+        leads.extend(match.group(0) for match in _URL_RE.finditer(text) if _lead_ok(match.group(0)))
         for line in text.splitlines():
             match = _CMD_RE.match(line.strip())
             if match:
