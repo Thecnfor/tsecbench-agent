@@ -30,7 +30,8 @@ PRUNE_USES = 4  # 剪枝阈值：被用过这么多次仍几乎不中 → 出清
 _PRUNE_KEEP_WINS = 1
 
 _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?")
-_HOST_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){2,}\.[a-z]{2,}(?::\d{1,5})?")
+# 线性写法：标签锚定在点分隔上（旧式嵌套量词在长字母串上指数回溯，实测挂死）
+_HOST_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?::\d{1,5})?")
 _URL_RE = re.compile(r"\bhttps?://[^\s\"'<>]{4,200}")
 _BLOB_RE = re.compile(r"\b[A-Za-z0-9+/=_-]{60,}\b")  # 长 hex/base64 载荷
 _CMD_RE = re.compile(r"^\$\s+(.{1,200})")
