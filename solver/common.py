@@ -1312,6 +1312,21 @@ def setup_orch_mode() -> None:
         parts.append("# Previous attempt (harness state)\n" + history[-history_budget:])
     if relay:
         parts.append(relay)
+    previous = str(prior.get("previous_workspace") or "").strip()
+    if previous:
+        parts.append(
+            "# Previous attempt workspace (files still on disk — reuse, do not redo)\n" + previous
+        )
+        carried = [str(item) for item in (prior.get("carried_files") or [])][:20]
+        if carried:
+            parts.append(
+                "# Carried files (read or grep these first)\n"
+                + "\n".join(f"- {f}" for f in carried)
+            )
+        parts.append(
+            "The container may be a new instance: reuse scripts/notes/methodology, "
+            "but re-check host/port and credentials before replaying."
+        )
     if parts:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" if TASK_PROMPT else "") + "\n\n".join(parts)
     # 启动期知识注入：main.py 是线上入口，不像 dual_main 有 profile/skills 层；

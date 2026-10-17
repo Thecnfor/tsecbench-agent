@@ -219,3 +219,21 @@ def test_collect_prior_includes_credentials_and_findings(tmp_path):
     prior = collect_prior(ws)
     assert prior["credentials"] == ["admin:pass"]
     assert prior["findings"] == ["nginx/1.18.0"]
+
+
+def test_workspace_carries_previous_attempt_context(tmp_path):
+    prev = tmp_path / "workspaces" / "t1_attempt1"
+    (prev / "out").mkdir(parents=True)
+    (prev / "out" / "prior.json").write_text(
+        json.dumps({"credentials": ["admin:pw"], "assets": ["10.0.0.1:8080"]}), encoding="utf-8"
+    )
+    (prev / "out" / "harness_state.txt").write_text(
+        "$ curl http://x => exit_code=0 seconds=0.1 | HTTP/1.1 200 OK", encoding="utf-8"
+    )
+    (prev / "notes.md").write_text("notes", encoding="utf-8")
+    ws = prepare_workspace(tmp_path, rec(), attempt=2)
+    task = json.loads((ws / "task.json").read_text(encoding="utf-8"))
+    assert "admin:pw" in task["prior"]["credentials"]
+    assert task["prior"]["previous_workspace"].endswith("t1_attempt1")
+    assert any("notes.md" in item for item in task["prior"]["carried_files"])
+    assert "curl" in task["prior"]["history"]

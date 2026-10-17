@@ -115,3 +115,28 @@ def test_setup_orch_mode_renders_relay_protocol(monkeypatch, tmp_path):
     assert "do NOT repeat" in common.TASK_PROMPT
     assert "approve.php" in common.TASK_PROMPT
     assert "admin:pass" in common.TASK_PROMPT
+
+
+def test_setup_orch_mode_renders_previous_workspace(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(
+        json.dumps(
+            {
+                "description": "d",
+                "targets": ["10.0.0.1:80"],
+                "prior": {
+                    "previous_workspace": "/tmp/old-attempt",
+                    "carried_files": ["/tmp/old-attempt/notes.md"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.setenv("SOLVER_DEADLINE_EPOCH", "9999999999")
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    common = importlib.import_module("common")
+    common.setup_orch_mode()
+    assert "Previous attempt workspace" in common.TASK_PROMPT
+    assert "/tmp/old-attempt/notes.md" in common.TASK_PROMPT

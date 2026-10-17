@@ -53,8 +53,17 @@ def prepare_workspace(
     repair_note: str | None = None,
 ) -> Path:
     """创建该题第 attempt 轮的 workspace 并写 task.json（§2.1 形状 + harness-v2 §3/§4/§5 注入）。"""
-    ws = workspace_root(base) / f"{rec.unique_code}_attempt{attempt}"
+    root = workspace_root(base)
+    ws = root / f"{rec.unique_code}_attempt{attempt}"
     ws.mkdir(parents=True, exist_ok=True)
+    merged = dict(prior or {})
+    previous = _previous_attempt(root, rec.unique_code, ws)
+    if previous is not None:
+        # 上一投被关闭/超时后，文件仍在磁盘：把 prior/history 合并，并把
+        # 可复用文件路径写进提示，避免下一投重新侦察/重新写脚本。
+        merged = _merge_prior(merged, collect_prior(previous))
+        merged["previous_workspace"] = str(previous.resolve())
+        merged["carried_files"] = _carried_files(previous)
     task = {
         "unique_code": rec.unique_code,
         "description": rec.description,
@@ -66,7 +75,7 @@ def prepare_workspace(
         "targets": list(rec.container_addr),
         "flag_pattern": None,  # 平台不提供；从 description 推断或靠通用正则兜底
         "attempt": attempt,
-        "prior": prior
+        "prior": merged
         or {
             "assets": [],
             "explored": [],
@@ -81,6 +90,72 @@ def prepare_workspace(
     (ws / "task.json").write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     (ws / "out" / "flags").mkdir(parents=True, exist_ok=True)
     return ws
+
+
+def _dedupe(values: list) -> list:
+    out: list = []
+    seen: set[str] = set()
+    for value in values:
+        key = (
+            json.dumps(value, sort_keys=True, ensure_ascii=False)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        if not key.strip() or key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _merge_prior(base: dict, extra: dict) -> dict:
+    merged = dict(base or {})
+    for key in ("assets", "explored", "open_leads", "credentials", "findings"):
+        merged[key] = _dedupe(
+            list((base or {}).get(key) or []) + list((extra or {}).get(key) or [])
+        )
+    histories = [
+        str((base or {}).get("history") or "").strip(),
+        str((extra or {}).get("history") or "").strip(),
+    ]
+    history = "\n".join(part for part in histories if part)
+    if history:
+        merged["history"] = history[-4000:]
+    return merged
+
+
+def _previous_attempt(root: Path, code: str, current: Path) -> Path | None:
+    best: Path | None = None
+    best_mtime = -1.0
+    for path in root.glob(f"{code}_attempt*"):
+        if path == current:
+            continue
+        prior_file = path / "out" / "prior.json"
+        if not prior_file.is_file():
+            continue
+        with contextlib.suppress(OSError):
+            mtime = prior_file.stat().st_mtime
+            if mtime > best_mtime:
+                best, best_mtime = path, mtime
+    return best
+
+
+def _carried_files(previous: Path, limit: int = 20) -> list[str]:
+    """上一 attempt 里可复用的小文件；大输出只给目录，让模型自己 grep。"""
+    files: list[str] = []
+    for rel in ("notes.md", "out/prior.json", "out/findings.txt", "out/harness_state.txt"):
+        path = previous / rel
+        if path.is_file():
+            files.append(str(path.resolve()))
+    for pattern in ("*.py", "*.sh", "*.txt", "*.json"):
+        for path in sorted(previous.glob(pattern)):
+            with contextlib.suppress(OSError):
+                if path.is_file() and path.stat().st_size <= 1_000_000:
+                    files.append(str(path.resolve()))
+    outputs = previous / "out" / "tool_outputs"
+    if outputs.is_dir():
+        files.append(str(outputs.resolve()) + "/ (grep -r for full outputs)")
+    return list(dict.fromkeys(files))[:limit]
 
 
 def collect_prior(ws: Path) -> dict:
