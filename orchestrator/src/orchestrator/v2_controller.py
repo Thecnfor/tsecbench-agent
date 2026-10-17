@@ -13,8 +13,11 @@ submit_candidates 路径；经济学（rec.submitted 去重 / 计分）不动。
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 
 from . import streams
+from .supervisor import collect_prior
 from .v2_bridge import Delegate, Finish, PlannerBridge
 from .v2_state import IllegalTransition, SlotFullError
 
@@ -84,6 +87,23 @@ def make_stream_runner(
     async def runner(*, key: str, directive: str) -> tuple[str, int, bool]:
         node_dir = ws / f"node-{key}"
         node_dir.mkdir(parents=True, exist_ok=True)
+        (node_dir / "out" / "flags").mkdir(parents=True, exist_ok=True)
+        task: dict = {}
+        try:
+            task = json.loads((ws / "task.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            task = {}
+        task = dict(task)
+        if directive:
+            task["description"] = (
+                str(task.get("description") or "") + f"\n\n# NODE FOCUS\n{directive}"
+            ).strip()
+        accum = ws / "out" / "v2_prior.json"
+        with contextlib.suppress(OSError, ValueError):
+            task["prior"] = json.loads(accum.read_text(encoding="utf-8"))
+        (node_dir / "task.json").write_text(
+            json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         environ = dict(base_environ or {})
         if directive:
             environ["SOLVER_NODE_DIRECTIVE"] = directive
@@ -98,6 +118,24 @@ def make_stream_runner(
             unique_code=key,
             rec=rec,
         )
+        # 节点 flags 回传父 workspace，供片尾 harvest 统一收割/去重。
+        dest = ws / "out" / "flags"
+        dest.mkdir(parents=True, exist_ok=True)
+        for flag_file in (node_dir / "out" / "flags").glob("*.txt"):
+            (dest / f"{key}_{flag_file.name}").write_text(
+                flag_file.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        # prior 累积：下一节点 task.json 带上前面节点的资产/凭据/线索。
+        try:
+            old = json.loads(accum.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        new = collect_prior(node_dir)
+        merged: dict = {}
+        for field in ("assets", "explored", "open_leads", "credentials", "findings"):
+            values = list(old.get(field) or []) + list(new.get(field) or [])
+            merged[field] = list(dict.fromkeys(str(value) for value in values))
+        accum.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(outcome), outcome.exit_code, not outcome.timed_out and outcome.exit_code == 0
 
     return runner

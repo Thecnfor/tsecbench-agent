@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import config as config_module
 from . import sop as sop_mod
 from . import streams
 from .api import (
@@ -310,17 +311,47 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     if rec.difficulty == "hard" or rec.attempts > 1:
         ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
-    outcome, early_new, early_completed = await streams.run_solver_with_stream(
-        solver_cmd=ctx.solver_cmd,
-        ws=ws,
-        deadline_epoch=deadline_epoch,
-        slice_s=slice_s,
-        environ=solver_env,
-        client=ctx.client,
-        journal=ctx.journal,
-        unique_code=code,
-        rec=rec,
-    )
+    if config_module.HARNESS_V2:
+        from types import SimpleNamespace
+
+        from .v2_controller import StagePlanner, V2Controller
+
+        v2_started = time.monotonic()
+        planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
+        controller = V2Controller(
+            runner=None,
+            max_parallel=min(3, ctx.config.concurrency_limit),
+            node_timeout_s=max(60.0, slice_s),
+        )
+        await controller.run_task(
+            task=rec.description or "",
+            ws=ws,
+            client=ctx.client,
+            journal=ctx.journal,
+            rec=rec,
+            deadline_epoch=deadline_epoch,
+            total_budget_s=slice_s,
+            planner=planner,
+            solver_cmd=ctx.solver_cmd,
+            base_environ=solver_env,
+            slice_s=min(slice_s, streams.STREAM_INTERVAL_S * 20),
+        )
+        outcome = SimpleNamespace(
+            exit_code=0, timed_out=False, duration_s=time.monotonic() - v2_started
+        )
+        early_new, early_completed = 0, False
+    else:
+        outcome, early_new, early_completed = await streams.run_solver_with_stream(
+            solver_cmd=ctx.solver_cmd,
+            ws=ws,
+            deadline_epoch=deadline_epoch,
+            slice_s=slice_s,
+            environ=solver_env,
+            client=ctx.client,
+            journal=ctx.journal,
+            unique_code=code,
+            rec=rec,
+        )
     ctx.journal.append(
         "solver_done",
         unique_code=code,
