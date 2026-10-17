@@ -56,6 +56,11 @@ def install_extensions(agent_dir: Path) -> None:
     (ext_dir / "recon.ts").write_text(
         src.replace("__RECON_RECIPE__", str(HERE / "recon_recipe.py")), encoding="utf-8"
     )
+    # kb 工具：离线知识库按需检索（wiki/skill 语料，渐进披露）
+    kb_src = (HERE / "pi_ext" / "kb.ts").read_text(encoding="utf-8")
+    (ext_dir / "kb.ts").write_text(
+        kb_src.replace("__KB_QUERY__", str(HERE / "kb" / "index.py")), encoding="utf-8"
+    )
 
 
 def install_skills(agent_dir: Path) -> None:

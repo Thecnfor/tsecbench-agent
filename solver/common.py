@@ -310,6 +310,10 @@ def build_system_prompt() -> str:
   Guessing 5 filenames per turn for 10 turns is the classic budget killer — a single
   wordlist sweep covers hundreds of names in one command.
 - Prefer ONE high-information command over many small ones; batch related probes together.
+- If a `kb` tool is available, USE IT before improvising: it searches an offline security
+  wiki (hacktricks / payloadsallthethings / nuclei / awesome-poc / agent skills) for
+  N-day exploits, exact payload syntax and SOP checklists. Query it with the service/CVE
+  keywords you just fingerprinted; trust its payloads over guessed ones.
 # EXECUTION CONTRACT (added by the solver shell)
 {execution}
 - Commands must be non-interactive and automated. Use explicit timeouts for long tasks, e.g. `timeout 30 nmap -Pn --top-ports 200 <target>`.
