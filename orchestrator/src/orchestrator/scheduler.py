@@ -78,7 +78,8 @@ def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
     4. level 升序、difficulty easy → hard
     """
     value = rec.remaining_score / (estimated_cost(rec) * (1.0 + _ATTEMPT_PENALTY * rec.attempts))
-    return (-value, rec.level, DIFFICULTY_RANK.get(rec.difficulty, 1), rec.unique_code)
+    # 简单优先（实测指令：先拿分再说）：difficulty 升序是主键，性价比做次键。
+    return (DIFFICULTY_RANK.get(rec.difficulty, 1), -value, rec.level, rec.unique_code)
 
 
 def eligible(records: dict[str, ChallengeRecord]) -> list[ChallengeRecord]:

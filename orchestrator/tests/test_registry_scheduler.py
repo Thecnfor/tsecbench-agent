@@ -128,8 +128,9 @@ def test_priority_level_and_difficulty_tiebreak():
         "m1": rec("m1", difficulty="medium", level=1, total_score=200, flag_count=1),
         "h1": rec("h1", difficulty="hard", level=1, total_score=400, flag_count=1),
     }
-    # cost: medium 2, hard 4 → value 都是 100 → 平局 → unique_code 字典序
-    assert priority_key(records["m1"])[:2] == priority_key(records["h1"])[:2]
+    # 新契约：难度升序是主键 —— medium 永远排在 hard 之前（先拿分再说）
+    assert priority_key(records["m1"])[0] < priority_key(records["h1"])[0]
+    assert eligible(records)[0].unique_code == "m1"
     records["h1"].level = 2
     assert eligible(records)[0].unique_code == "m1"
 
