@@ -43,6 +43,7 @@ from pathlib import Path
 
 import common
 import reflect
+import skills
 import state
 from common import (  # 函数引用安全：内部读 common 自身全局，转发无陈旧问题
     build_system_prompt,
@@ -240,6 +241,7 @@ def main() -> int:
     turn = 0
     last_idea = ""
     known_terms: set[str] = set()
+    seen_skills: set[str] = set()
     pending_hints: list[str] = []
 
     while turn < common.turn_limit() and time.time() < deadline:
@@ -323,6 +325,10 @@ def main() -> int:
                         f"You explicitly identified {term}. Offline KB has a matching section — "
                         "apply its exact payload/syntax before inventing new paths:\n" + snippet
                     )
+            skill = skills.match(content)
+            if skill and skill["id"] not in seen_skills:
+                seen_skills.add(skill["id"])
+                pending_hints.append(skills.render(skill, common.TARGET_INFO.split(",")[0].strip()))
             for flag in find_flags(content):
                 report_candidate(flag)
 
@@ -387,6 +393,10 @@ def main() -> int:
                     result = common.run_recon(args)
                 elif tool == "rea":
                     result = common.run_rea(args)
+                elif tool == "gremlin":
+                    result = common.run_gremlin(args)
+                elif tool == "gradio":
+                    result = common.run_gradio(args)
                 else:
                     result = common.run_kb(args)
                 message, used = _structured_tool_message(
@@ -514,6 +524,21 @@ def main() -> int:
         for hint in pending_hints:
             messages.append({"role": "user", "content": hint})
         pending_hints.clear()
+        if turn % 15 == 0 and turn > 1:
+            prior = common.TASK.get("prior") or {}
+            assets = [str(item) for item in (prior.get("assets") or [])][:5]
+            creds = [str(item) for item in (prior.get("credentials") or [])][:3]
+            remaining = int(common.TASK.get("flag_count", 1)) - len(common._reported)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"[STATE turn {turn}] flags={sorted(common._reported) or '-'}; "
+                        f"remaining~{remaining}; products={sorted(known_terms) or '-'}; "
+                        f"assets={assets or '-'}; creds={creds or '-'}."
+                    ),
+                }
+            )
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
         nudge = _flag_nudge(common, reported_before)

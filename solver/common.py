@@ -23,6 +23,8 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -270,6 +272,10 @@ def reset_shell_session() -> None:
 atexit.register(reset_shell_session)
 
 
+_SCOPE_SCAN_RE = re.compile(
+    r"(?i)\b(?:nmap|masscan|rustscan|nc|curl|wget|gobuster|ffuf)\b[^\n]*"
+    r"(?:127\.|169\.254\.|172\.(?:1[7-9]|2\d|3[01])\.)"
+)
 _ROOT_SCAN_RE = re.compile(
     r"(?:^|[;&|]\s*)(?:find|grep|rg|du|tar)\s+(?:-[^\s]+\s+)*/(?:\s|$|mnt\b)"
 )
@@ -287,6 +293,14 @@ def run_command(command: str, timeout: int, *, isolated: bool = False) -> dict:
     目标挂死时只有宿主侧 `t+20` 的粗杀兜底 —— 一条命令白烧 120s+ 时间片。
     内层 timeout 让超时精确到 t；外层仍 kill 整个进程组防孤儿。
     """
+    if _SCOPE_SCAN_RE.search(command):
+        return {
+            "exit_code": 126,
+            "output": "blocked: host-local/Docker range (127/169.254/172.17-172.31); "
+            "only the target host/port is in scope",
+            "timed_out": False,
+            "seconds": 0.0,
+        }
     if _ROOT_SCAN_RE.search(command):
         return {
             "exit_code": 126,
@@ -366,6 +380,40 @@ def parse_tool_arguments(raw: str) -> tuple[dict | None, str | None]:
     if not isinstance(args, dict):
         return None, "tool arguments must be a JSON object"
     return args, None
+
+
+def _http_json(url: str, *, method: str = "GET", body: dict | None = None) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return {
+                "status": response.status,
+                "body": response.read().decode("utf-8", "replace")[:8000],
+            }
+    except urllib.error.HTTPError as exc:
+        return {"status": exc.code, "body": exc.read().decode("utf-8", "replace")[:8000]}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+def run_gremlin(args: dict) -> dict:
+    url = str(args.get("url") or "").strip()
+    query = str(args.get("query") or "").strip()
+    if not url or not query:
+        return {"error": "url and query required"}
+    return _http_json(url, method="POST", body={"gremlin": query})
+
+
+def run_gradio(args: dict) -> dict:
+    url = str(args.get("url") or "").strip()
+    path = str(args.get("path") or "/config").strip()
+    if not url:
+        return {"error": "url required"}
+    endpoint = url.rstrip("/") + "/" + path.lstrip("/")
+    data = args.get("data")
+    return _http_json(endpoint, method="POST" if data is not None else "GET", body=data)
 
 
 def build_tool_specs() -> list[dict]:
@@ -470,6 +518,40 @@ def build_tool_specs() -> list[dict]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "gremlin",
+                "description": "POST a Gremlin/Groovy query to a Gremlin endpoint and return status/body.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full /gremlin URL"},
+                        "query": {"type": "string", "description": "Gremlin/Groovy query"},
+                    },
+                    "required": ["url", "query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "gradio",
+                "description": "Call a Gradio/Langflow endpoint (config, version, validate/code, predict).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Base URL"},
+                        "path": {
+                            "type": "string",
+                            "description": "e.g. /config or /api/v1/version",
+                        },
+                        "data": {"type": "object", "description": "Optional JSON body (POST)"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
     ]
 
 
@@ -558,6 +640,11 @@ def _with_kb(result: dict) -> dict:
                         collected.append({"cmd": probe_cmd, "output": truncate(output, 1200)})
                 if collected:
                     result["fast_probe"] = collected
+        import skills
+
+        skill = skills.match(combined + " " + fingerprint[:2000])
+        if skill:
+            result["skill"] = skills.render(skill, target)
     except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
         pass
     return result
@@ -663,7 +750,7 @@ def run_kb(args: dict) -> dict:
     return {"query": query, "snippets": text[:8000]}
 
 
-STRUCTURED_TOOLS = ("recon", "rea", "kb")
+STRUCTURED_TOOLS = ("recon", "rea", "kb", "gremlin", "gradio")
 
 
 def run_structured_tool(name: str, args: dict) -> dict:
@@ -673,6 +760,10 @@ def run_structured_tool(name: str, args: dict) -> dict:
         return run_rea(args)
     if name == "kb":
         return run_kb(args)
+    if name == "gremlin":
+        return run_gremlin(args)
+    if name == "gradio":
+        return run_gradio(args)
     return {"error": f"unknown structured tool: {name}"}
 
 
@@ -1302,6 +1393,8 @@ Hard rules:
   Only the target host/port is reachable; use the frontend as a proxy if needed.
 - Never scan `/` or `/mnt`: root-wide find/grep/du is blocked. Search /challenge, /app,
   /root, /tmp, or the workspace only.
+- Never scan 127.0.0.0/8, 169.254.0.0/16, or 172.17.0.0/16–172.31.0.0/16 (host Docker
+  bridges); only the target host/port is in scope.
 {shell_rule}
 - Flags: report exactly as found; multi-flag challenges continue until all flags are submitted.
 - No hints exist. Solve from local analysis; never probe the platform or LLM side.
@@ -1428,6 +1521,23 @@ def setup_orch_mode() -> None:
             "The container may be a new instance: reuse scripts/notes/methodology, "
             "but re-check host/port and credentials before replaying."
         )
+    try:
+        import skills
+
+        target = str(targets[0]) if targets else ""
+        skill = skills.match(" ".join([str(task.get("description") or ""), *targets]))
+        if skill:
+            parts.append(skills.render(skill, target))
+        if int(task.get("flag_count", 1)) > int(task.get("correct_flag_count", 0)):
+            parts.append(
+                "# MULTI-FLAG TRACKER\n"
+                f"Remaining flags: {int(task.get('flag_count', 1)) - int(task.get('correct_flag_count', 0))}. "
+                "After each flag, do not stop: list remaining attack surfaces, pivot to a new "
+                "credential/port/service, and verify each flag via the exploit that produced it. "
+                "Never resubmit old workspace flag files."
+            )
+    except Exception:  # noqa: BLE001 - skill 是增强，不是必需
+        pass
     if parts:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" if TASK_PROMPT else "") + "\n\n".join(parts)
     # 启动期知识注入：main.py 是线上入口，不像 dual_main 有 profile/skills 层；

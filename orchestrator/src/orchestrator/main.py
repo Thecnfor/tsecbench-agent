@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -282,6 +283,8 @@ def _target_endpoints(ws: Path) -> tuple[set[tuple[str, int | None]], set[str]]:
 def _is_new_endpoint(value: str, endpoints: set, hosts: set) -> bool:
     host, port = _endpoint_of(value)
     if not host:
+        return False
+    if host.startswith(("127.", "169.254.")) or re.match(r"172\.(1[7-9]|2\d|3[01])\.", host):
         return False
     # 目标只给了 host 时，该 host 任何端口都算“目标回显”，不是新信息。
     if (host, None) in endpoints:

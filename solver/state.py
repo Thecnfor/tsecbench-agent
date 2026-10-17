@@ -38,6 +38,10 @@ def _asset_ok(value: str) -> bool:
     host, _port = parsed
     if host in _LOOPBACK_HOSTS:
         return False
+    if host.startswith(("127.", "169.254.")):
+        return False
+    if re.match(r"172\.(1[7-9]|2\d|3[01])\.", host):
+        return False
     return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host))
 
 

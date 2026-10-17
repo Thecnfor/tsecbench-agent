@@ -33,3 +33,9 @@ def test_synthesize_prior_filters_static_assets():
     assert not any("apps.html" in item for item in prior["assets"])
     assert not any("127.0.0.1" in item for item in prior["assets"])
     assert not any("www.w3.org" in item for item in prior["assets"])
+
+
+def test_host_docker_ranges_are_not_assets():
+    assert state._asset_ok("172.18.0.1:8080") is False
+    assert state._asset_ok("127.0.0.1:8080") is False
+    assert state._asset_ok("10.0.168.1:80") is True
