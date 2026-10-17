@@ -238,6 +238,10 @@ def main() -> int:
     last_idea = ""
     known_terms: set[str] = set()
     pending_hints: list[str] = []
+    pending_pivots: list[str] = []
+    failure_counts: dict[str, int] = {}
+    hypothesis_nudged: set[str] = set()
+    model = common.MODEL
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
@@ -247,7 +251,7 @@ def main() -> int:
         messages[:] = sanitize_tool_messages(messages)
         try:
             resp = client.chat.completions.create(
-                model=common.MODEL,
+                model=model,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -315,6 +319,12 @@ def main() -> int:
                     continue
                 known_terms.add(term)
                 snippet = common.known_issue_snippet(term)
+                if snippet and common.AUTO_REASONER and model != common.REASONER_MODEL:
+                    model = common.REASONER_MODEL
+                    print(
+                        f"[solver] identified {term} with KB payload; switching model to {model}",
+                        flush=True,
+                    )
                 if snippet:
                     pending_hints.append(
                         f"You explicitly identified {term}. Offline KB has a matching section — "
@@ -415,6 +425,19 @@ def main() -> int:
             common.note_tool_use("run_command")
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
+            key = common.hypothesis_key(command)
+            if common.command_failed(result, result["output"]):
+                failure_counts[key] = failure_counts.get(key, 0) + 1
+                if failure_counts[key] >= 2 and key not in hypothesis_nudged:
+                    hypothesis_nudged.add(key)
+                    pending_pivots.append(
+                        f"Hypothesis {key!r} has failed {failure_counts[key]} times. "
+                        "Do not repeat the same request shape: check payload/Content-Type/auth, "
+                        "apply the exact KB payload for the identified product/CVE, or pivot to an "
+                        "alternative surface (other port, known CVE, default creds, prior leads)."
+                    )
+            else:
+                failure_counts.pop(key, None)
             raw_output = result["output"]
             out = common.prepare_tool_output(
                 raw_output,
@@ -486,9 +509,32 @@ def main() -> int:
             )
             break
 
+        for hint in pending_pivots:
+            messages.append({"role": "user", "content": hint})
+        pending_pivots.clear()
         for hint in pending_hints:
             messages.append({"role": "user", "content": hint})
         pending_hints.clear()
+        if turn % 15 == 0 and turn > 1:
+            prior = common.TASK.get("prior") or {}
+            assets = [str(item) for item in (prior.get("assets") or [])][:5]
+            creds = [str(item) for item in (prior.get("credentials") or [])][:3]
+            failures = ", ".join(
+                f"{key}×{count}"
+                for key, count in sorted(failure_counts.items(), key=lambda item: -item[1])[:4]
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"[STATE turn {turn}] products: {', '.join(sorted(known_terms)) or '-'}; "
+                        f"flags: {', '.join(sorted(common._reported)) or '-'}; "
+                        f"prior assets: {', '.join(assets) or '-'}; "
+                        f"prior creds: {', '.join(creds) or '-'}; "
+                        f"failed: {failures or '-'}."
+                    ),
+                }
+            )
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
         nudge = _flag_nudge(common, reported_before)

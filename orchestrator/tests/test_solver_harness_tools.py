@@ -438,3 +438,10 @@ def test_detect_known_terms_and_known_issue_snippet(common, monkeypatch):
     assert "CVE-2025-3248" in (common.known_issue_snippet("CVE-2025-3248") or "")
     monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "unrelated")
     assert common.known_issue_snippet("dify") is None
+
+
+def test_command_failed_and_hypothesis_key(common):
+    assert common.hypothesis_key("curl -s http://10.0.0.1:8080/a") == "10.0.0.1:8080"
+    assert common.command_failed({"exit_code": 0, "timed_out": False}, "HTTP/1.1 404 Not Found")
+    assert not common.command_failed({"exit_code": 0, "timed_out": False}, "HTTP/1.1 200 OK")
+    assert common.command_failed({"exit_code": 1, "timed_out": False}, "")
