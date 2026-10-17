@@ -161,6 +161,10 @@ describe("多 flag 总结压缩（solveTask 集成）", () => {
     const r = await solveTask(client, "t-c2", "卡", 600, conv, { flagTotal: 2 });
 
     expect(r.status).toBe("done");
+    // 立即收束（衔接优化）：最后 flag 的 submit 响应即权威，回合末直接 done——
+    // 模型尾轮（脚本第 4 条）不被消耗，不再等 watcher 缓存
+    expect(r.turnsUsed).toBe(3);
+    expect(r.messages.some((m) => String(m.content ?? "").includes("两枚 flag"))).toBe(false);
     expect(r.messages[0].role).toBe("system");
     expect(r.messages.some((m) => String(m.content ?? "") === FLAG_CONTINUE_NOTE)).toBe(true);
     // 压缩边界：总结 assistant 在头之后、继续指令之前，其后才是轮3 的 submit（tool_calls）

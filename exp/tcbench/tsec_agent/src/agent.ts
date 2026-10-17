@@ -485,6 +485,7 @@ export async function solveTask(
   let turnsUsed = 0;
   let turn = 0;
   let flagSummaryDone = false; // 单 flag：flag_summary 总结轮已产出收尾（跳过 closingSummary）
+  let allFlagsSubmitted = false; // 多 flag 全齐（submit 响应权威）→ 回合末立即收束释放槽位
   let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
   const nowSec = () => Date.now() / 1000;
 
@@ -1093,6 +1094,12 @@ export async function solveTask(
             | undefined;
           const out = integrateSubmit(resp, ledger, br.id);
           let extra = "";
+          // 多 flag 全齐：submit 响应是权威（correct_flag_count == total）→ 回合末立即
+          // 收束——不等 watcher 缓存（20s 刷新）与模型尾轮（衔接优化，槽位早释放）；
+          // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
+          if (resp?.correct === true && out.totalCount > 1 && out.correctCount >= out.totalCount) {
+            allFlagsSubmitted = true;
+          }
           if (resp?.correct === true) {
             bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
             corelog?.write({
@@ -1200,6 +1207,14 @@ export async function solveTask(
       log(
         `[${code}] fork materialized: branch ${made.branch.id} from ${pf.parentId}: ${pf.direction.slice(0, 80)}`,
       );
+    }
+
+    // 全部 flag 已由 submit 响应权威确认：目标达成，本回合（工具配对完整后）立即收束——
+    // 跳过下一轮 LLM（模型可能继续摸已无意义的目标）与下轮开头的 watcher 缓存确认，
+    // 槽位即刻归还调度器（worker 出口仍以真实快照复核 completed）
+    if (allFlagsSubmitted) {
+      log(`[${code}] all flags confirmed by submit response; closing segment now`);
+      return finish("done");
     }
   }
 }
