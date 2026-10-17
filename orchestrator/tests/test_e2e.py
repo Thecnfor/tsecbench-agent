@@ -287,9 +287,11 @@ def test_zero_flag_timeout_triggers_repair(env_factory, tmp_path):
     events = [json.loads(ln) for ln in journal_path.read_text(encoding="utf-8").splitlines()]
     repairs = [e for e in events if e.get("event") == "repair"]
     assert repairs, "超时后必须走 EVOSTER 修复（此前恒为空）"
-    assert repairs[0]["action"] == "widen"  # 平票走固定优先序，widen 优先
+    # 零进展信号的超时片不再 widen（实测纯烧片），直接换面；有进展的 widen
+    # 路径由 test_repair.py::test_timeout_first_time_widens 覆盖
+    assert repairs[0]["action"] == "recompile"
     durs = [e["duration_s"] for e in events if e.get("event") == "solver_done"]
-    assert len(durs) == 2 and durs[1] > durs[0]  # 第二轮时间片被 widen 放大
+    assert len(durs) == 2 and durs[1] == durs[0]  # recompile 不放大时间片（widen 语义仅限有进展）
 
 
 # ---- 9. 绊线：整轮跑完绝不命中 hint 路由 ----

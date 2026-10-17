@@ -136,6 +136,9 @@ async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: f
     for a in rec.container_addr:
         host, _, port = a.partition(":")
         addrs.append((host, int(port) if port else 80))
+    # loopback 目标（mock/e2e）不做预检：它们没有真实服务冷启，空等只会吃掉测试预算
+    if timeout_s <= 0 or all(h in ("127.0.0.1", "localhost", "::1") for h, _ in addrs):
+        return True
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         for host, port in addrs:
