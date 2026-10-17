@@ -233,3 +233,11 @@ def test_recon_auto_probes_first_get_step(common, monkeypatch):
     out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
     assert "console/api/setup" in seen["cmd"]
     assert "fast_probe" in out
+
+
+def test_placeholder_flags_are_rejected(common):
+    assert common.find_flags("FLAG{...}") == []
+    assert common.find_flags("FLAG{<flag>}") == []
+    assert common.find_flags("FLAG{xxx}") == []
+    real = "flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
+    assert common.find_flags(real) == [real]

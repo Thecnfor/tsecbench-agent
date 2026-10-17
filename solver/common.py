@@ -63,7 +63,8 @@ MAX_PLAIN_NUDGES = int(cfg("SOLVER_MAX_PLAIN_NUDGES", "6"))
 NO_FACT_NUDGE_TURNS = int(cfg("SOLVER_NO_FACT_NUDGE_TURNS", "8"))
 STALE_HARD_TURNS = int(cfg("SOLVER_STALE_HARD_TURNS", "30"))
 MAX_NO_FACT_NUDGES = int(cfg("SOLVER_MAX_NO_FACT_NUDGES", "2"))
-MAX_TURNS_NO_FLAG = int(cfg("SOLVER_MAX_TURNS_NO_FLAG", "45"))
+# c-09 实测 82 轮才解出：绝对轮数上限不能太低，否则误杀可解题。
+MAX_TURNS_NO_FLAG = int(cfg("SOLVER_MAX_TURNS_NO_FLAG", "100"))
 
 
 def effective_command_timeout(
@@ -506,6 +507,22 @@ GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 # 通用兜底只认真实 flag 前缀；代码标识符（collect/it.name、
 # JSAPI_Event_*_{uuid}）一律拒绝。
 GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
+_PLACEHOLDER_BODIES = frozenset(
+    {"...", "<...>", "flag", "example", "your_flag_here", "your_flag", "xxx", "redacted"}
+)
+
+
+def is_plausible_flag(flag: str) -> bool:
+    """拒绝占位符/示例 flag（FLAG{...}、FLAG{<flag>}、FLAG{xxx}）。"""
+    if "{" not in flag or "}" not in flag:
+        return False
+    body = flag.split("{", 1)[1].rsplit("}", 1)[0].strip()
+    if not body or body.lower() in _PLACEHOLDER_BODIES:
+        return False
+    if "<" in body or ">" in body:
+        return False
+    return not set(body) <= set(".*-_ ")
+
 
 _reported: set[str] = set()
 
@@ -515,6 +532,8 @@ def find_flags(text: str, include_generic: bool = False) -> list[str]:
     for pattern in NAMED_FLAG_PATTERNS:
         for match in pattern.finditer(text):
             value = match.group(0)
+            if not is_plausible_flag(value):
+                continue
             if value not in found:
                 found.append(value)
     if include_generic:

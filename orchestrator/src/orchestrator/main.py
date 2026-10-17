@@ -49,6 +49,9 @@ AVAILABLE_TIMEOUT_S = 120.0
 # TCP 就绪预检上限（c-08 实测 7860 冷启 >45s；编排器等待免费，solver 等待烧片）
 TARGET_READY_TIMEOUT_S = 120.0
 REASONER_MODEL = os.environ.get("SOLVER_REASONER_MODEL", "deepseek-reasoner")
+# reasoner 每轮 ~12s（chat ~4-5s）：短片里只会拿到 20-25 轮，实测反而更慢。
+# 只在长片（Phase 2 深挖）启用；短片/首片保持 chat。
+REASONER_MIN_SLICE_S = float(os.environ.get("REASONER_MIN_SLICE_S", "600"))
 LIST_FAIL_LIMIT = 3  # list 连续失败达此数才全局停机（瞬时 409/404 不再一击致命）
 # 等 available 的轮询退避（§4.1 修订）。原先固定 0.2s：3 个 pipeline 同时轮询 =
 # 15 req/s 需求，而全局令牌桶只有 3 req/s —— 轮询把桶吃满，submit/close 排在
@@ -168,6 +171,8 @@ def solver_env_for(
     env: dict[str, str] | None,
     rec: ChallengeRecord,
     config: RuntimeConfig | None = None,
+    *,
+    slice_s: float | None = None,
 ) -> dict[str, str]:
     """solver 子进程环境来源（§4.3 分级模型 / §6.2 网关改写）。
 
@@ -185,7 +190,8 @@ def solver_env_for(
             merged["LLM_API_KEY"] = config.llm_api_key
         if config.llm_model:
             merged["LLM_MODEL"] = config.llm_model
-    if rec.difficulty == "hard" or rec.attempts > 1:
+    deep_slice = slice_s is None or slice_s >= REASONER_MIN_SLICE_S
+    if rec.difficulty == "hard" and deep_slice:
         merged["LLM_MODEL"] = REASONER_MODEL
     return merged
 
@@ -341,8 +347,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     deadline_epoch = min(time.time() + slice_s, ctx.t0 + ctx.config.total_time_limit_s)
     # 分级模型调度（实测 reasoner 支持 tool calls 且延迟 ~3s）：hard 题与
     # 失败过的题用 reasoner 攻坚提首片解出率，其余用 chat 保吞吐。
-    solver_env = solver_env_for(ctx.env, rec, ctx.config)
-    if rec.difficulty == "hard" or rec.attempts > 1:
+    solver_env = solver_env_for(ctx.env, rec, ctx.config, slice_s=slice_s)
+    if solver_env.get("LLM_MODEL") == REASONER_MODEL:
         ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
     solver_started = time.monotonic()

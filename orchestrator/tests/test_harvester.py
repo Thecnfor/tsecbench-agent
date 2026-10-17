@@ -144,3 +144,8 @@ def test_submit_report_type():
 def test_extract_rejects_code_identifier_prefixes():
     text = "JSAPI_Event_Abandon_{83e44378-6c8c-4be3-b3e5-29d6dfde1d55} collect{it.name}"
     assert extract_flags(text) == []
+
+
+def test_extract_rejects_placeholder_flags():
+    text = "FLAG{...} FLAG{<flag>} FLAG{xxx} flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
+    assert extract_flags(text) == ["flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"]

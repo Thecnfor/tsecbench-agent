@@ -36,6 +36,21 @@ NAMED_FLAG_PATTERNS = (
 GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
 GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
+_PLACEHOLDER_BODIES = frozenset(
+    {"...", "<...>", "flag", "example", "your_flag_here", "your_flag", "xxx", "redacted"}
+)
+
+
+def _is_plausible(flag: str) -> bool:
+    if "{" not in flag or "}" not in flag:
+        return False
+    body = flag.split("{", 1)[1].rsplit("}", 1)[0].strip()
+    if not body or body.lower() in _PLACEHOLDER_BODIES:
+        return False
+    if "<" in body or ">" in body:
+        return False
+    return not set(body) <= set(".*-_ ")
+
 
 FLAG_MIN_LEN, FLAG_MAX_LEN = 1, 4096
 _SCAN_SUFFIX_BLOCKLIST = (".log.bak",)  # 无实际用途，占位说明只按内容扫
@@ -49,6 +64,8 @@ def extract_flags(text: str) -> list[str]:
     for pattern in NAMED_FLAG_PATTERNS:
         for m in pattern.finditer(text):
             value = m.group(0)
+            if not _is_plausible(value):
+                continue
             if value not in seen:
                 seen.add(value)
                 found.append(value)
