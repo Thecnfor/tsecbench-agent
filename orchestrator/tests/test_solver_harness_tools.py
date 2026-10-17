@@ -145,3 +145,24 @@ def test_prompt_contains_attack_loop(common):
     assert "reuse" in prompt.lower()
     assert "flag" in prompt.lower()
     assert len(prompt) < 2800
+
+
+def test_generic_flag_rejects_css_and_js_shapes(common):
+    for text in (
+        "body{color:#fff;background:#000}",
+        "h1{border-right:1px solid rgba(255,255,255,.3)}",
+        "let{children:t}",
+        "try{r=globalThis.localStorage,n=globalThis.sessionStorage}",
+        "catch{r=new i,n=new i}",
+    ):
+        assert common.find_flags(text, include_generic=True) == [], text
+
+
+def test_lowercase_flag_is_a_named_pattern(common):
+    flag = "flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
+    assert common.find_flags(flag) == [flag]
+
+
+def test_generic_accepts_flag_like_body(common):
+    flag = "SOME{abc_def-123}"
+    assert common.find_flags(flag, include_generic=True) == [flag]

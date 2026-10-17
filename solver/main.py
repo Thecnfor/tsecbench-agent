@@ -201,11 +201,11 @@ def main() -> int:
 
         if content:
             print(f"[solver] assistant (turn {turn}): {content[:1500]}", flush=True)
-            for flag in find_flags(content, include_generic=True):
+            for flag in find_flags(content):
                 report_candidate(flag)
 
         if not calls:
-            if find_flags(content, include_generic=True):
+            if find_flags(content):
                 print(f"[solver] final answer with flag at turn {turn}", flush=True)
                 break
             nudges += 1

@@ -442,13 +442,18 @@ def sanitize_tool_messages(messages: list[dict]) -> list[dict]:
 # ----------------------------------------------------------- flag detection ---
 NAMED_FLAG_PATTERNS = [
     re.compile(r"(?<![a-zA-Z])FLAG\{[^}\n]{1,200}\}"),
+    re.compile(r"(?<![a-zA-Z])flag\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])HTB\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])picoCTF\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])THM\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])CTF\{[^}\n]{1,200}\}"),
     re.compile(r"(?<![a-zA-Z])XBEN\{[^}\n]{1,200}\}"),
 ]
-GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9_]{2,24}\{[^}\n]{4,120}\}")
+# 通用兜底：CSS/JS 规则（body{color:#fff}、h1{border:...}、let{children:t}）
+# 与 flag 同形，线上实测被误提交。正文限定为 flag 常见字符集，排除
+# `: ; ( ) # , 空白` 等代码/CSS 语法。
+GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
+GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 
 _reported: set[str] = set()
 
@@ -462,6 +467,8 @@ def find_flags(text: str, include_generic: bool = False) -> list[str]:
                 found.append(value)
     if include_generic:
         for match in GENERIC_FLAG_PATTERN.finditer(text):
+            if not GENERIC_BODY_RE.match(match.group(2)):
+                continue
             value = match.group(0)
             if value not in found:
                 found.append(value)
