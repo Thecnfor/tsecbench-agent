@@ -1,0 +1,27 @@
+# 人工样例集（风格样例，非无偏；无偏部分由 kb_eval.py 自动抽样）
+# 格式：查询<TAB>期望路径正则<TAB>kind（空=默认排除 template；tutorial/template/poc/code/doc）
+紧凑循环 移位 异或	crypto-in-malware	tutorial
+循环移位 rotate	arx-operations	tutorial
+魔改 TEA delta	identify-encode-encryption	tutorial
+z3 约束 求解器	constraint/z3	tutorial
+xxor 逆向	constraint/z3	tutorial
+RC4 S盒 256 次	identify-encode-encryption|crypto-in-malware
+虚拟机 opcode 跳转表	reverse/vm/vm	tutorial
+符号执行 angr	simulate-execution/angr	tutorial
+长度扩展攻击 sha256	length.exten|crypto/hash	tutorial
+git 泄露 git-dumper	pentesting-web/git	tutorial
+sqlmap 注入 测试	sql-injection|sqlmap	tutorial
+XXE 外带 实体	xxe
+ysoserial 反序列化	deserialization|ysoserial	tutorial
+JWT none 算法 签名	jwt	tutorial
+GTFOBins sudo	gtfo|sudo-command-abuse
+k8s 提权 serviceaccount	k8s
+容器逃逸 release_agent	escape|container|cgroup|0492	tutorial
+webshell php 参数执行	php-webshell	template
+log4shell CVE-2021-44228	log4j	template
+frp 内网 隧道	tunnel|frp|forward
+foremost binwalk 取证	forensic|foremost|binwalk	tutorial
+对抗样本 evasion 机器学习	atlas|ai-|machine|adversarial
+atlas api fastapi 路由	13-atlas-data	code
+python pickle 反序列化	pickle
+提权 sudo -l SUID	sudo|suid|privesc|privilege	tutorial

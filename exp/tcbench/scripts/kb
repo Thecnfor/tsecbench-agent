@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""kb —— 离线知识库检索 CLI（stdlib-only）。
+
+  kb find "循环移位 异或"        全文检索（FTS5 trigram BM25），输出 path/节/摘要
+  kb sig 0x9e3779b9             签名直查：十六进制常数 / ATT&CK 技术号 / 术语同义词
+  kb head vm                    标题倒排浏览（INDEX.tsv）
+  kb cat <path> [行号]           直接打印该文件（带行号，可定位到命中节）
+  kb tpl CVE-2021-44228         nuclei 模板通道（kind=template）
+  kb cve "<产品|CVE号>"      CVE·KEV 候选（2023+ high/critical 全量 + KEV 在野利用）
+  kb grep "<正则>" [--glob *.md] 自由全文搜索：不排序、不分层、不依赖索引
+  kb raw "<FTS 表达式>"          透传 FTS5 查询语法
+
+输出统一 TSV 风格，便于 grep/cut。索引缺省取 <KB>/.index，可用 --index 覆盖。
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+DEFAULT_KB = "/opt/security-knowledge-base"
+
+# 术语同义词 → 定位提示（召回辅助：中英术语归一，命中后仍走 find/sig）
+CJK_RUN_RE = re.compile(r"[一-鿿㐀-䶿]+|[^一-鿿㐀-䶿]+")
+CJK_RE = re.compile(r"[一-鿿㐀-䶿]+")
+SYNONYMS = {
+    "循环移位": "rotate rol ror 循环左移 循环右移",
+    "循环左移": "rotate rol 左移",
+    "循环右移": "ror 右移",
+    "rotate": "rol ror 循环移位",
+    "rol": "rotate 循环左移 arx",
+    "ror": "rotate 循环右移",
+    "异或": "xor",
+    "xor": "异或",
+    "约束求解": "z3 smt sat 求解器",
+    "z3": "约束求解 smt 求解器",
+    "符号执行": "angr claripy symbolic",
+    "已知明文": "known plaintext 攻击",
+    "虚拟机": "vm opcode 字节码 解释器",
+    "混淆": "obfuscation junk code 花指令",
+    "加壳": "upx unpack 脱壳 packing",
+    "熵": "entropy 信息熵 高熵",
+    "反序列化": "ysoserial unserialize deserialize pickle phar",
+    "命令注入": "command injection rce",
+    "文件包含": "lfi rfi inclusion",
+    "提权": "privesc privilege sudo suid",
+    "容器逃逸": "escape release_agent cgroup",
+    "内网": "lateral ad ldap kerberos",
+}
+
+
+def seg(text: str) -> str:
+    """与 build_kb_index.py 同构：中文二元切分 + 其余原样，再按 OR 组装 FTS 查询。"""
+    toks: list[str] = []
+    for run in CJK_RUN_RE.findall(text):
+        if not CJK_RE.fullmatch(run):
+            toks.extend(t for t in run.split() if t)
+        elif len(run) <= 2:
+            toks.append(run)
+        else:
+            toks.extend(run[i:i + 2] for i in range(len(run) - 1))
+    return toks
+
+
+def find_index(arg: str | None) -> Path:
+    base = Path(arg or os.environ.get("KB_INDEX", f"{DEFAULT_KB}/.index"))
+    if not (base / "kb.sqlite").exists():
+        sys.exit(f"索引不存在: {base}/kb.sqlite（先跑 scripts/build_kb_index.py）")
+    return base
+
+
+def snippet(text: str, n: int = 2) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return " ⏎ ".join(lines[:n])[:220]
+
+
+def cmd_find(idx: Path, args) -> int:
+    conn = sqlite3.connect(f"file:{idx / 'kb.sqlite'}?mode=ro", uri=True)
+    q = args.query.replace('"', " ")
+    if not args.raw:
+        # 多词默认 OR + bm25 排序（AND 会把"意图词+对象词"查询打成空结果），--and 时才 AND
+        toks = [t for t in seg(q) if len(t) >= 2]
+        joiner = " AND " if getattr(args, "and_", False) else " OR "
+        q = joiner.join(f'"{t}"' for t in toks) or '""'
+    sql = ("SELECT d.path, d.kind, d.heading, d.startline, f.body FROM fts f "
+           "JOIN docs d ON d.id = f.docid WHERE fts MATCH ? ")
+    params: list = [q]
+    if args.kind:
+        sql += "AND d.kind = ? "
+        params.append(args.kind)
+    elif not getattr(args, "all", False):
+        # 默认排除参考型数据：nuclei 模板（词频噪声大）、CVE/KEV 描述（常见词污染）。
+        # 它们走专用通道：tpl（模板）/ cve（CVE·KEV 候选）/ grep（自由文本）
+        sql += "AND d.kind NOT IN ('template','cve','kev') "
+    sql += "ORDER BY bm25(fts) LIMIT ?"
+    params.append(args.n)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"查询语法错误: {e}", file=sys.stderr)
+        return 1
+    if not rows:
+        rows = sig_fallback(idx, args.query, args.n)
+        if not rows:
+            nohit_receipt(args.query, idx)
+            return 3
+    for path, kind, heading, line, body in rows:
+        head = f"｜{heading}" if heading else ""
+        print(f"{path}:{line}\t[{kind}]{head}\t{snippet(body) if not args.brief else ''}")
+    # 弱命中检测：相关性应该体现在标题与开头，而不是"长文档深处恰好出现过这个词"。
+    # 判据=标题+正文前400字 对查询单元的覆盖；中文单元按其 bigram 覆盖率≥0.6 记为命中。
+    if rows:
+        units = re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{1,}", args.query)
+        units += re.findall(r"[\u4e00-\u9fff]{2,8}", args.query)
+        hay = (rows[0][0] + " " + (rows[0][2] or "") + " " + rows[0][4][:400]).lower()
+
+        def covered(u: str) -> bool:
+            if not CJK_RE.fullmatch(u):
+                return u.lower() in hay
+            grams = [u[i:i + 2] for i in range(len(u) - 1)] if len(u) > 2 else [u]
+            return sum(g in hay for g in grams) / len(grams) >= 0.6
+
+        if units:
+            cov = sum(covered(u) for u in units) / len(units)
+            cjk_units = [u for u in units if CJK_RE.fullmatch(u)]
+            all_cjk_missing = bool(cjk_units) and not any(covered(u) for u in cjk_units)
+            if all_cjk_missing or cov < 0.5:
+                print()
+                nohit_receipt(args.query, idx, weak=True)
+                print(f"WEAKCOV\ttop1 只覆盖了 {cov:.0%} 的查询词（按标题+开头判断）。"
+                      f"若与问题确实相关请忽略本提示；否则这很可能是 OR 语义捞出的无关项——"
+                      f"换技术词重查或唤起 kb-hunter，不要据此判定'KB 里没有'")
+    return 0
+
+
+def _advice(probes: list, got: bool, wordform: str = "") -> None:
+    head = f"词形={wordform}；" if wordform else ""
+    print(f"DIAG\t{head}"
+          f"{'索引与 grep 双无命中，优先怀疑查询用的是题面词而非技术词' if not got else '换技术词重查通常有效'}")
+    print("NEXT1\t换'现场最独特'的具体词重查：指令名/常数/循环次数/位宽/输出行为的精确说法"
+          "（如'紧凑循环 异或 32位运算'、'0x100 次循环'）——"
+          "抽象类别词（'自定义加密''识别''例程'）会被海量文档稀释，撞不出结果")
+    print("NEXT2\tkb grep '<常量|产品名|报错串|函数名>'   # 自由文本，不经索引、不排序")
+    print("NEXT3\t唤起 kb-hunter 子 agent 做改写检索："
+          "python3 /usr/local/bin/kb-hunter.py \"<问题原文>\"")
+    print("NOTE\t'KB 里没有'也是结论：拿到结果后在 core_log 落一行，避免后续段落重复检索")
+
+
+def nohit_receipt(query: str, idx: Path, weak: bool = False) -> None:
+    """无命中的回执：不只说"没有"，而是替调用方带着下一步走。
+    关键增值：顺手做一次 grep 全文预检——词若在文档里只是被分词/排序吃掉，
+    立刻把原文现场贴出来，省掉一轮'以为没有就换方向'的误判。"""
+    import subprocess
+    kb_root = kb_root_of(idx)
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", query))
+    print(f"{'WEAK' if weak else 'NOHIT'}\t{query}")
+    # grep 预检：挑信息量最高的 2 个 token
+    probes = re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{2,}", query)[:2]
+    if not probes:
+        probes = [t for t in re.findall(r"[\u4e00-\u9fff]{2,8}", query)][:2]
+    got = False
+    for tok in probes:
+        try:
+            p = subprocess.run(["rg", "--no-heading", "-n", "-i", "--max-count", "3",
+                                "--max-filesize", "3M", "-e", tok, str(kb_root)],
+                               capture_output=True, text=True, timeout=25)
+            out = (p.stdout or "").strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            out = ""
+        if out:
+            got = True
+            print(f"GREPHIT\t词 \"{tok}\" 在原文中出现（索引没吃到，可能是分词/排序问题）:")
+            for ln in out.splitlines()[:3]:
+                print(f"  {ln[:200]}")
+    if not got:
+        print(f"GREPHIT\t词 {probes} 连全文 grep 也无命中 → 大概率 KB 里确实没有此内容")
+    _advice(probes, got, wordform='中文' if has_cjk else '英文/数字')
+
+
+def sig_fallback(idx: Path, query: str, n: int) -> list:
+    """全文无命中时，拿每个词去签名层（常数表/术语同义词）兜底，标注 [sig]。"""
+    out, seen = [], set()
+    const = idx / "CONST.tsv"
+    words = [w.lower().lstrip("#") for w in query.split() if len(w) >= 2]
+    if const.exists():
+        table = open(const, encoding="utf-8").read()
+        for w in words:
+            for ln in table.splitlines():
+                val, cnt, where = ln.split("\t")
+                if w in val and val not in seen:
+                    seen.add(val)
+                    out.append((where.rsplit(":", 1)[0], "sig", f"const:{val}×{cnt}",
+                                int(where.rsplit(":", 1)[-1]), ""))
+    for w in words:
+        for name, s in SYNONYMS.items():
+            if w in name or w in s.lower():
+                key = f"syn:{name}"
+                if key not in seen:
+                    seen.add(key)
+                    out.append(("(同义词→请继续 kb find)", "sig", key, 0, s))
+    return out[:n]
+
+
+def kb_root_of(idx: Path) -> Path:
+    """索引目录未必在 KB 内（比如构建产物在 /tmp）：按环境变量→索引父目录→默认路径依次探。"""
+    cands = [Path(os.environ["KB_ROOT"])] if os.environ.get("KB_ROOT") else []
+    cands += [idx.parent, Path(DEFAULT_KB)]
+    for c in cands:
+        if (c / "B-漏洞与利用").is_dir():
+            return c
+    return cands[-1]
+
+
+def cmd_sig(idx: Path, args) -> int:
+    pat = args.pattern.lower().lstrip("#")
+    if pat.startswith("0x"):
+        pat = pat[2:]
+    hits = []
+    const = idx / "CONST.tsv"
+    if const.exists():
+        for ln in open(const, encoding="utf-8"):
+            val, cnt, where = ln.rstrip("\n").split("\t")
+            if pat in val:
+                hits.append(("const", val, cnt, where))
+    # 术语提示（内置小表，仅作 sig 的线索提示；词汇改写由 kb-hunter 子 agent 负责）
+    for name, words in SYNONYMS.items():
+        if pat in name or pat in words.lower():
+            hits.append(("syn", name, "-", words))
+    for kind, val, cnt, where in hits[:args.n]:
+        print(f"{kind}\t{val}\t{cnt}\t{where}")
+    if not hits:
+        print("（签名无命中，试 kb find）", file=sys.stderr)
+        return 3
+    return 0
+
+
+def cmd_head(idx: Path, args) -> int:
+    pat = args.pattern.lower()
+    n = 0
+    for ln in open(idx / "INDEX.tsv", encoding="utf-8"):
+        path, line, level, title = ln.rstrip("\n").split("\t")
+        if pat in title.lower() or pat in path.lower():
+            print(f"{path}:{line}\t{'#' * int(level)} {title}")
+            n += 1
+            if n >= args.n:
+                break
+    return 0 if n else 3
+
+
+def cmd_cat(args) -> int:
+    path = Path(args.path)
+    if not path.is_absolute():
+        idx = find_index(args.index if hasattr(args, "index") else None)
+        path = kb_root_of(idx) / path
+    if not path.exists():
+        print(f"文件不存在: {path}", file=sys.stderr)
+        return 2
+    want = args.line
+    for i, ln in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if want and not (want - 20 <= i <= want + 120):
+            continue
+        mark = "→" if i == want else " "
+        print(f"{mark}{i:5d} {ln}")
+    return 0
+
+
+def cmd_tpl(idx: Path, args) -> int:
+    # CVE/模板 id 是精确匹配场景：先扫文件名与 front-matter（12k 文件，秒级），
+    # 命中即返回；无命中再退 FTS 排序
+    kb_root = kb_root_of(idx)
+    tpl_root = kb_root / "B-漏洞与利用" / "02-nuclei-templates"
+    pat = args.cve.lower()
+    hits = []
+    if tpl_root.is_dir():
+        for p in tpl_root.rglob("*.yaml"):
+            if pat in p.name.lower():
+                hits.append((str(p.relative_to(kb_root)), "文件名"))
+                continue
+            try:
+                head = p.read_text(encoding="utf-8", errors="replace").lower()
+            except Exception:
+                continue
+            if pat in head:
+                hits.append((str(p.relative_to(kb_root)), "front-matter"))
+            if len(hits) >= args.n:
+                break
+    for path, how in hits[:args.n]:
+        print(f"{path}\t[tpl·{how}]")
+    if hits:
+        return 0
+    args.kind = "template"
+    args.query = args.cve
+    args.raw = False
+    args.brief = False
+    args.and_ = False
+    return cmd_find(idx, args)
+
+
+def cmd_grep(args) -> int:
+    """自由全文文本搜索：不过索引、不排序、不分 kind——最朴素的逐行匹配。
+    结构化命令（find/tpl/sig）给的是"排序后的候选"，这个给的是"原文现场"。
+    不依赖索引：即使索引没建也能用。"""
+    kb_root = Path(os.environ.get("KB_ROOT", DEFAULT_KB))
+    if not kb_root.is_dir():
+        print(f"KB 根目录不存在: {kb_root}", file=sys.stderr)
+        return 2
+    pat = args.pattern
+    try:
+        re.compile(pat)
+    except re.error as e:
+        print(f"正则错误: {e}", file=sys.stderr)
+        return 2
+    import subprocess
+    cmd = ["rg", "--no-heading", "-n", "-i", "--max-count", "20", "--max-filesize", "3M",
+           "-e", pat]
+    if args.glob:
+        cmd += ["--glob", args.glob]
+    cmd.append(str(kb_root))
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out = (p.stdout or "").strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        out, n = "", 0
+        rx = re.compile(pat, re.I)
+        for f in sorted(kb_root.rglob("*")):
+            if not f.is_file() or f.stat().st_size > 3_000_000:
+                continue
+            try:
+                for i, ln in enumerate(f.read_text(encoding="utf-8", errors="replace")
+                                       .splitlines(), 1):
+                    if rx.search(ln):
+                        print(f"{f.relative_to(kb_root)}:{i}:{ln.strip()[:160]}")
+                        n += 1
+                        if n >= args.n:
+                            return 0
+            except OSError:
+                continue
+        return 0 if n else 3
+    for i, ln in enumerate(out.splitlines(), 1):
+        if i > args.n:
+            break
+        print(ln[:220])
+    return 0 if out else 3
+
+
+def cmd_cve(idx: Path, args) -> int:
+    """产品/版本/编号 → CVE·KEV 候选；KEV（在野利用）排最前。"""
+    conn = sqlite3.connect(f"file:{idx / 'kb.sqlite'}?mode=ro", uri=True)
+    toks = [t for t in seg(args.query) if len(t) >= 2]
+    q = " OR ".join(f'"{t}"' for t in toks) or '""'
+    sql = ("SELECT d.path, d.kind, d.heading, d.startline, d.body FROM fts_cve f "
+           "JOIN docs d ON d.id=f.docid WHERE fts_cve MATCH ? AND d.kind IN ('cve','kev') "
+           "ORDER BY (d.kind='kev') DESC, bm25(fts_cve) LIMIT ?")
+    try:
+        rows = conn.execute(sql, (q, args.n)).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"查询语法错误: {e}", file=sys.stderr)
+        return 1
+    for path, kind, heading, line, body in rows:
+        mark = "★KEV在野" if kind == "kev" else "  "
+        print(f"{mark} {heading}  {snippet(body, 1)}")
+    return 0 if rows else 3
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="kb", description="离线知识库检索")
+    ap.add_argument("--index", help=f"索引目录（默认 {DEFAULT_KB}/.index 或 $KB_INDEX）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("find", help="全文检索")
+    p.add_argument("query")
+    p.add_argument("-n", type=int, default=8)
+    p.add_argument("--kind", choices=["tutorial", "template", "poc", "code", "doc"])
+    p.add_argument("--brief", action="store_true")
+    p.add_argument("--all", action="store_true", help="包含 nuclei 模板（默认排除）")
+    p.add_argument("--and", dest="and_", action="store_true", help="多词按 AND 匹配（默认 OR）")
+    p.add_argument("--raw", action="store_true", help="透传 FTS5 语法（如 NEAR/ OR）")
+
+    p = sub.add_parser("sig", help="签名直查（常数/技术号/术语）")
+    p.add_argument("pattern")
+    p.add_argument("-n", type=int, default=12)
+
+    p = sub.add_parser("head", help="标题浏览")
+    p.add_argument("pattern")
+    p.add_argument("-n", type=int, default=20)
+
+    p = sub.add_parser("cat", help="打印文件（带行号，可定位到命中行）")
+    p.add_argument("path")
+    p.add_argument("line", nargs="?", type=int)
+
+    p = sub.add_parser("cve", help="产品/编号 → CVE·KEV 候选（KEV 在野利用优先）")
+    p.add_argument("query")
+    p.add_argument("-n", type=int, default=10)
+
+    p = sub.add_parser("grep", help="自由全文文本搜索（不排序不分层，给原文现场）")
+    p.add_argument("pattern")
+    p.add_argument("-n", type=int, default=30)
+    p.add_argument("--glob", default=None)
+
+    p = sub.add_parser("tpl", help="nuclei 模板检索")
+    p.add_argument("cve")
+    p.add_argument("-n", type=int, default=8)
+
+    p = sub.add_parser("raw", help="透传 FTS5 表达式")
+    p.add_argument("query")
+    p.add_argument("-n", type=int, default=8)
+
+    args = ap.parse_args()
+    if args.cmd not in {"cat", "grep"}:
+        idx = find_index(args.index)
+    if args.cmd == "find":
+        return cmd_find(idx, args)
+    if args.cmd == "sig":
+        return cmd_sig(idx, args)
+    if args.cmd == "head":
+        return cmd_head(idx, args)
+    if args.cmd == "cat":
+        return cmd_cat(args)
+    if args.cmd == "tpl":
+        return cmd_tpl(idx, args)
+    if args.cmd == "grep":
+        return cmd_grep(args)
+    if args.cmd == "cve":
+        return cmd_cve(idx, args)
+    if args.cmd == "raw":
+        args.kind = None
+        args.brief = False
+        args.raw = True
+        return cmd_find(idx, args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
