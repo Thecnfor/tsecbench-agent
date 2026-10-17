@@ -5,56 +5,25 @@
   assets      —— 事件里出现过的 host:port / URL（客观资产）
   explored    —— 已执行的命令首词序列（防下轮重复侦察）
   open_leads  —— 未验证的线索（输出中出现但未产出 flag 的 URL/版本号）
-全程正则与集合运算，零 LLM。
+  credentials —— 输出中的凭据/令牌
+  findings    —— 输出中的版本/CVE 线索
+提取逻辑收敛在 solver/state.py，双内核共用（零 LLM）。
 """
 
 from __future__ import annotations
 
 import json
-import re
+import sys
 from pathlib import Path
-
-_ASSET_RE = re.compile(r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9.-]+\.[a-z]{2,})(?::\d{2,5})?\b")
-_URL_RE = re.compile(r"https?://[^\s\"'<>]{4,200}")
-_CMD_RE = re.compile(r"^\$\s+(.{1,200})")
-
-MAX_ITEMS = 50
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-        if len(out) >= MAX_ITEMS:
-            break
-    return out
 
 
 def synthesize(events: list[dict], candidates: list[str]) -> dict:
-    assets: list[str] = []
-    explored: list[str] = []
-    leads: list[str] = []
-    for ev in events:
-        text = str(ev.get("text", ""))
-        if not text:
-            continue
-        assets.extend(m.group(0) for m in _ASSET_RE.finditer(text.lower()))
-        leads.extend(m.group(0) for m in _URL_RE.finditer(text))
-        for line in text.splitlines():
-            m = _CMD_RE.match(line.strip())
-            if m:
-                explored.append(m.group(1)[:120])
-    known = set(candidates)
-    # 已在候选里出现过（即已解决线索）的 URL 不再算 open lead
-    leads = [u for u in leads if not any(u in c or c in u for c in known)]
-    return {
-        "assets": _dedupe(assets),
-        "explored": _dedupe(explored),
-        "open_leads": _dedupe(leads),
-    }
+    solver_dir = str(Path(__file__).resolve().parents[1])
+    if solver_dir not in sys.path:
+        sys.path.insert(0, solver_dir)
+    from state import synthesize_prior
+
+    return synthesize_prior(events, candidates)
 
 
 def write(out_dir: Path, events: list[dict], candidates: list[str]) -> Path | None:

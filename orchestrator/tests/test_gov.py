@@ -109,3 +109,10 @@ def test_prior_synthesize_and_write(gov_modules):
     assert any("curl" in c for c in data["explored"])
     # 已产出 flag 的线索不算 open lead；backup.zip 未出 flag → open lead
     assert any("backup.zip" in u for u in data["open_leads"])
+
+
+def test_prior_synthesize_includes_credentials(gov_modules):
+    prior = gov_modules["prior"]
+    result = prior.synthesize([{"text": '{"DATABASE_PASSWORD":"flag{pwd_test}"}'}], candidates=[])
+    assert "credentials" in result
+    assert any("flag{pwd_test}" in item for item in result["credentials"])
