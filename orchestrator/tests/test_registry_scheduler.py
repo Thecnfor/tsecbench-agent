@@ -130,7 +130,7 @@ def test_priority_level_and_difficulty_tiebreak():
     }
     # 新契约：首键是零进展沉底标记，难度升序是第二键 —— medium 永远排在
     # hard 之前（先拿分再说）。
-    assert priority_key(records["m1"])[2] < priority_key(records["h1"])[2]
+    assert priority_key(records["m1"])[1] < priority_key(records["h1"])[1]
     assert priority_key(records["m1"])[0] == priority_key(records["h1"])[0] == 0
     assert eligible(records)[0].unique_code == "m1"
     records["h1"].level = 2
@@ -267,18 +267,4 @@ def test_attempts_cap_at_two():
     """attempts 再大也只降两级，避免已失败题永久沉底。"""
     tried = rec("tried", difficulty="easy", total_score=100, attempts=9)
     hard_new = rec("hard_new", difficulty="hard", total_score=100)
-    assert priority_key(tried)[2] <= priority_key(hard_new)[2] + 1
-
-
-def test_history_priority_beats_platform_difficulty():
-    fast = rec("e3-03", difficulty="hard", total_score=100)
-    slow = rec("a-05", difficulty="easy", total_score=500)
-    assert priority_key(fast)[:3] < priority_key(slow)[:3]
-    assert eligible({"fast": fast, "slow": slow})[0].unique_code == "e3-03"
-
-
-def test_unknown_codes_use_category_prior():
-    from orchestrator.priority_history import expected_seconds
-
-    assert expected_seconds("e1-99") < expected_seconds("c-99")
-    assert expected_seconds("a-99") < expected_seconds("c-03")
+    assert priority_key(tried)[1] <= priority_key(hard_new)[1] + 1

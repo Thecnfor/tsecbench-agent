@@ -34,7 +34,7 @@ def test_probe_decision_tiers():
 
     assert _probe_decision(1, True, False, 240) == "second"
     assert _probe_decision(1, False, False, 240) == "stop"
-    assert _probe_decision(2, True, False, 240) == "stop"
+    assert _probe_decision(2, True, False, 240) == "full"
     assert _probe_decision(2, True, True, 240) == "full"
     assert _probe_decision(3, True, False, 240) == "full"
     assert _probe_decision(1, True, True, 0) == "stop"

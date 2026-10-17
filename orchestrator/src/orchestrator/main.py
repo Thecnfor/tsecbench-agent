@@ -38,11 +38,9 @@ from .config import RuntimeConfig, resolve_config
 from .harvester import harvest, submit_candidates
 from .journal import Journal, score_summary
 from .memory import AttackMemory
-from .priority_history import expected_seconds
 from .registry import ChallengeRecord, Registry
 from .repair import BASE_WEIGHTS, choose_repair, update_weights
 from .scheduler import (
-    FAST_RETRY_S,
     can_start,
     eligible,
     plan_phase,
@@ -293,17 +291,17 @@ def _is_new_endpoint(value: str, endpoints: set, hosts: set) -> bool:
     return host not in hosts
 
 
-def _pass_progress(report, early_new: int, ws: Path) -> bool:
+def _pass_progress(report, early_new: int, ws: Path, since: float | None = None) -> bool:
     """pass 级进展只认 flag 候选/命中；未验证的 credentials 不算。
 
     c-03 的 prior 里长期留着 JS 串里的 Passw0rd!123，zero-progress 调度
     因此永远认为它“有进展”，把 fresh 的 e1/e2 题挤掉；pass 级必须用
     可验证的 flag 信号，候选凭据只影响 probe 续片，不影响槽位经济学。
     """
-    return bool(report.new_matches or early_new) or bool(harvest(ws))
+    return bool(report.new_matches or early_new) or bool(harvest(ws, since=since))
 
 
-def _slice_has_progress(ws: Path) -> bool:
+def _slice_has_progress(ws: Path, since: float | None = None) -> bool:
     """widen/续片门控的进展信号：只认**新信息**。
 
     explored 命令、session 行数、以及回显目标本身的资产都不算进展——
@@ -324,7 +322,10 @@ def _slice_has_progress(ws: Path) -> bool:
             if _is_new_endpoint(str(item), endpoints, hosts):
                 return True
     try:
-        return any((ws / "out" / "flags").glob("*.txt"))
+        for path in (ws / "out" / "flags").glob("*.txt"):
+            if since is None or path.stat().st_mtime >= since:
+                return True
+        return False
     except OSError:
         return False
 
@@ -363,7 +364,7 @@ def _probe_decision(stage: int, has_progress: bool, high_value: bool, remaining_
     if stage == 1:
         return "second" if has_progress else "stop"
     if stage == 2:
-        return "full" if high_value else "stop"
+        return "full" if (high_value or has_progress) else "stop"
     return "full"
 
 
@@ -430,6 +431,8 @@ def _save_submitted(ws: Path, rec: ChallengeRecord) -> None:
 async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     rec = ctx.registry.records[code]
     rec.attempts += 1
+    rec.reject_budget = 3
+    attempt_start = time.time()
     rejected_before = rec.rejected_candidates
     rec.state = "STARTING"
     try:
@@ -533,9 +536,6 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         else:
             remaining_slice = slice_s
             probe_slice = min(PROBE_SLICE_S, remaining_slice)
-            if rec.zero_progress_passes > 0 and expected_seconds(code) <= FAST_RETRY_S:
-                # 快题重试不再只给 60s 试探：给完整片，配合 prior/relay 再试一次。
-                probe_slice = remaining_slice
             early_new, early_completed = 0, False
             outcome = None
             stage = 1
@@ -559,6 +559,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                     journal=ctx.journal,
                     unique_code=code,
                     rec=rec,
+                    since=attempt_start,
                 )
                 early_new += sub_new
                 early_completed = early_completed or sub_completed
@@ -567,8 +568,10 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                     break
                 prior = _merge_prior(ctx.priors.get(code), collect_prior(ws))
                 ctx.priors[code] = prior
-                has_progress = _slice_has_progress(ws) or bool(prior.get("credentials"))
-                high_value = bool(harvest(ws))
+                has_progress = _slice_has_progress(ws, since=attempt_start) or bool(
+                    prior.get("credentials")
+                )
+                high_value = bool(harvest(ws, since=attempt_start))
                 decision = _probe_decision(stage, has_progress, high_value, remaining_slice)
                 if decision == "stop":
                     ctx.journal.append(
@@ -617,7 +620,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     ctx.priors[code] = _merge_prior(ctx.priors.get(code), collect_prior(ws))
     if ctx.memory is not None:
         ctx.memory.record(code, ctx.priors[code])  # 攻击图记忆：单写者=编排器
-    candidates = [f for f in harvest(ws) if f not in rec.submitted]
+    candidates = [f for f in harvest(ws, since=attempt_start) if f not in rec.submitted]
 
     rec.state = "SUBMITTING"
     report = await submit_candidates(ctx.client, rec, candidates)
@@ -639,7 +642,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
 
     # 槽位经济学：pass 级进展信号。无新 flag 且无新事实 → 零进展次数 +1，
     # 调度器会把该题沉底并停止补位；一旦出现事实/flag 则清零。
-    pass_progress = _pass_progress(report, early_new, ws)
+    pass_progress = _pass_progress(report, early_new, ws, since=attempt_start)
     if pass_progress:
         rec.zero_progress_passes = 0
     elif not (rec.is_completed or report.completed or early_completed):

@@ -79,6 +79,7 @@ async def run_solver_with_stream(
     rec,
     interval_s: float = STREAM_INTERVAL_S,
     stall_s: float | None = None,
+    since: float | None = None,
 ) -> tuple[SolverOutcome, int, bool]:
     """跑一整片 solver，片内按节拍早收割。
 
@@ -135,7 +136,7 @@ async def run_solver_with_stream(
                     early_new,
                     early_completed,
                 )
-            candidates = [f for f in harvest(ws) if f not in rec.submitted]
+            candidates = [f for f in harvest(ws, since=since) if f not in rec.submitted]
             if not candidates:
                 continue
             report = await submit_candidates(client, rec, candidates)

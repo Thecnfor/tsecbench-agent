@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,7 +105,7 @@ def _read_head(path: Path) -> str:
         return ""
 
 
-def harvest(ws: Path) -> list[str]:
+def harvest(ws: Path, since: float | None = None) -> list[str]:
     """双通道收割：workspace 全部文本文件（含 out/flags、notes、stdout/stderr、
     out/traffic/*.jsonl）。result.json 不排除 —— 它只是不可信，扫了也无妨。
 
@@ -117,6 +118,10 @@ def harvest(ws: Path) -> list[str]:
     if ws.is_dir():
         files = [p for p in ws.rglob("*") if p.is_file() and p.suffix not in _SCAN_SUFFIX_BLOCKLIST]
     for path in sorted(files):
+        if since is not None:
+            with contextlib.suppress(OSError):
+                if path.stat().st_mtime < since:
+                    continue
         text = _read_head(path)
         for flag in extract_flags(text):
             if flag not in seen:
@@ -147,6 +152,8 @@ async def submit_candidates(
     """逐个提交候选。duplicate 不算失败；任务级终止立即停（§5.1）。"""
     report = SubmitReport()
     for flag in candidates:
+        if getattr(rec, "reject_budget", 3) <= 0:
+            break
         try:
             result = await client.submit(rec.unique_code, flag)
         except Duplicate:
@@ -156,6 +163,7 @@ async def submit_candidates(
         except FlagRejected:
             report.rejected += 1
             rec.rejected_candidates += 1
+            rec.reject_budget = max(0, rec.reject_budget - 1)
             rec.submitted.add(flag)  # 失败也是终态；否则 45s 后会重复投递
             continue
         except TaskEnded:

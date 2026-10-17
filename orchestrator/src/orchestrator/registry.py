@@ -63,6 +63,7 @@ class ChallengeRecord:
     # 槽位经济学：本 pass 无新 flag 且无新事实的次数。>0 的题排到队尾，
     # 且不再与非零进展题抢补位槽（对齐 CyberPenda 的零进展 pass 规则）。
     zero_progress_passes: int = 0
+    reject_budget: int = 3  # 本 attempt 最多接受的平台拒绝次数
 
     @property
     def remaining_flags(self) -> int:
