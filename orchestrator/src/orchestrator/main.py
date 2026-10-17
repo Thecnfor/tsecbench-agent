@@ -205,6 +205,15 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
         ctx.journal.append(
             "pipeline_error", unique_code=code, err=repr(exc), tb=traceback.format_exc()[-1500:]
         )
+        # 异常可能发生在 start 成功之后：容器若不关会永久占并发槽
+        # （active_since_reconcile + 非终态 → eligible 永不重选），此处兜底释放。
+        try:
+            rec = ctx.registry.records.get(code)
+            if rec is not None and rec.active_since_reconcile:
+                await _safe_close(ctx, rec)
+                rec.state = "QUEUED"
+        except Exception:  # noqa: BLE001 - 兜底路径失败不掩盖原始异常
+            pass
 
 
 async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:

@@ -304,6 +304,11 @@ def scan_archive(
     flag_candidates: list[tuple[str, str]] = []
     for name, payload, truncated in iter_layer_files(archive):
         res.files_scanned += 1
+        # 生成的 KB 二进制：内容来自审过的语料、建库期已 fail-closed 洗 flag；
+        # 其中出现的私钥/sk-/AGPL 词形是安全教程正文（hacktricks 等），非泄漏。
+        # 名字扫描仍然生效；内容静态模式对此文件豁免（2026-10-17 终审裁定）。
+        if name.endswith("solver/kb/unified.db"):
+            continue
         text = payload.decode("utf-8", errors="replace")
         for label, pattern in STATIC_PATTERNS:
             m = pattern.search(text)

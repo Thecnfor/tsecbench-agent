@@ -9,8 +9,8 @@ task.json 不带 targets → recon 步零外部命令，纯离线。
 from __future__ import annotations
 
 import json
-import shutil
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path

@@ -114,7 +114,9 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # 3) Python 依赖：编排器（本项目）+ OpenHands 控制平面（独立 venv，版本取
 #    toolchain.env）。OpenHands 全系 requires_python <3.14 —— 这是本镜像钉 3.13
 #    的唯一原因（architecture.md §1.1）。
-COPY orchestrator/ /tmp/build/orchestrator/
+# 只带 pyproject + src：tests/ 里的样例 flag 不应进任何镜像层
+COPY orchestrator/pyproject.toml /tmp/build/orchestrator/pyproject.toml
+COPY orchestrator/src/ /tmp/build/orchestrator/src/
 COPY mock/ /tmp/build/mock/
 COPY pyproject.toml uv.lock /tmp/build/
 RUN python3 -m venv /opt/tsecbench/venv \
