@@ -30,6 +30,12 @@ check:
 clean-tmp:
 	scripts/clean_solver_tmp.sh
 
+## new-run: 全新平台 run：归档 workspaces + 清 /tmp，再后台启动
+new-run: clean-tmp
+	@if [ -d workspaces ] && [ -n "$$(ls -A workspaces 2>/dev/null)" ]; then mv workspaces workspaces.old-$$(date +%Y%m%d-%H%M%S); fi
+	@mkdir -p workspaces
+	@$(MAKE) rerun
+
 ## run: 本地评测起编排器（先 make check；LLM key 取自 solver/.env，GATEWAY_MODE=off）
 ## 时间片可调：SLICE_MIN_S/SLICE_MAX_S 覆盖默认 120/1200（v1.1 起默认拉长到 300/1800）
 SLICE_MIN_S ?= 300
