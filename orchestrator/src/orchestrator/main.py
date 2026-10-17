@@ -37,7 +37,7 @@ from .journal import Journal, score_summary
 from .memory import AttackMemory
 from .registry import ChallengeRecord, Registry
 from .repair import BASE_WEIGHTS, choose_repair, update_weights
-from .scheduler import can_start, eligible, plan_phase, slice_for
+from .scheduler import can_start, eligible, plan_phase, should_start, slice_for
 from .supervisor import collect_prior, prepare_workspace
 
 POLL_INTERVAL_S = 2.0
@@ -509,6 +509,14 @@ async def run_agent(
                     slice_min_s=config.slice_min_s,
                     slice_max_s=plan.slice_cap_s,
                 )
+                prior = ctx.priors.get(rec.unique_code) or {}
+                has_progress = any(
+                    prior.get(key)
+                    for key in ("assets", "explored", "open_leads", "credentials", "findings")
+                )
+                if not should_start(rec, attempt_slice, has_progress=has_progress):
+                    rec.next_slice_s = attempt_slice  # 保留加权片，下次再试
+                    continue
                 rec.next_slice_s = None
                 task = asyncio.create_task(_pipeline(ctx, rec.unique_code, attempt_slice))
                 tasks.add(task)

@@ -211,3 +211,28 @@ def test_plan_phase2_after_phase1_window():
     plan = plan_phase(elapsed_s=1700, total_s=3600, reserve_s=600, n_eligible=3)
     assert (plan.phase, plan.finalize) == (2, False)
     assert plan.slice_s >= 120
+
+
+def test_slice_for_sweep_mode_floors_by_difficulty():
+    """极速扫题（Phase1 cap=45）：easy 保底 90s、hard/多 flag 保底 120s、其余 30-45s。"""
+    easy = rec("e", difficulty="easy", total_score=100, flag_count=1)
+    medium = rec("m", difficulty="medium", total_score=300, flag_count=1)
+    hard = rec("h", difficulty="hard", total_score=500, flag_count=1)
+    assert slice_for(easy, 45, slice_min_s=30, slice_max_s=45) == 90
+    assert slice_for(hard, 45, slice_min_s=30, slice_max_s=45) == 120
+    assert slice_for(medium, 45, slice_min_s=30, slice_max_s=45) <= 45
+
+
+def test_short_slice_gate_skips_fresh_hard_task():
+    from orchestrator.scheduler import should_start
+
+    assert should_start(rec("t", difficulty="hard"), 80, has_progress=False, gate=True) is False
+    assert should_start(rec("t", difficulty="hard"), 200, has_progress=False, gate=True) is True
+
+
+def test_short_slice_gate_exempts_easy_and_progress():
+    from orchestrator.scheduler import should_start
+
+    assert should_start(rec("t", difficulty="easy"), 80, has_progress=False, gate=True) is True
+    assert should_start(rec("t", difficulty="hard"), 80, has_progress=True, gate=True) is True
+    assert should_start(rec("t", difficulty="hard"), 80, has_progress=False, gate=False) is True

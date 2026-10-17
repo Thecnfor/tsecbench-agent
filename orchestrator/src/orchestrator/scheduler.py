@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from .registry import ChallengeRecord
@@ -20,11 +21,12 @@ _DIFF_COST = {"easy": 0.6, "medium": 2.0, "hard": 4.0}
 PHASE1_BUDGET_RATIO = 0.45  # Phase 1 广撒网占总时限比例（§4.3）
 SLICE_MIN_S = 120
 SLICE_MAX_S = 1200
-# Phase 1 单题时间片上限（§4.3 修订）：上限只决定「**失败题占用槽位多久**」——
+# Phase1 单题时间片上限（§4.3 修订）：上限只决定「**失败题占用槽位多久**」——
 # 成功题几十秒就结束，上限对它们无影响。实测 1785s 的片让 3 个槽位被
 # b-01/b-02/b-03 连续独占 30 分钟，其余 60 题全部排队。压到 420s 后，一个槽位
 # 30 分钟能周转 ~4 题。Phase 2 深挖不受此限（用 SLICE_MAX_S）。
-PHASE1_SLICE_MAX_S = 420
+# 可经 PHASE1_SLICE_MAX_S 覆盖：短窗口/追分阶段压到 180s，先扫完简单题。
+PHASE1_SLICE_MAX_S = int(os.environ.get("PHASE1_SLICE_MAX_S", "420"))
 
 # 时间片按剩余分数加权（§4.3 修订）：多阶段高分题（b-01 1200 / b-02 1800）
 # 与 200 分单题拿同样的片，实测 300s 下必死 —— 用 sqrt 缩放，避免 1800 分题
@@ -41,6 +43,32 @@ _MULTI_FLAG_COST = 1.5
 
 
 _ATTEMPT_PENALTY = 0.75  # 每次失败尝试的成本放大系数
+
+MIN_USEFUL_SLICE_S = float(os.environ.get("MIN_USEFUL_SLICE_S", "150"))
+SHORT_SLICE_GATE = os.environ.get("SHORT_SLICE_GATE", "on").strip().lower() in (
+    "1",
+    "on",
+    "true",
+    "yes",
+)
+
+
+def should_start(
+    rec: ChallengeRecord,
+    slice_s: float,
+    *,
+    has_progress: bool = False,
+    min_useful_s: float | None = None,
+    gate: bool | None = None,
+) -> bool:
+    """尾段短片闸门：无进展的新题/盲重投不值得启动（只能被 recon 吃光）。"""
+    min_useful = MIN_USEFUL_SLICE_S if min_useful_s is None else min_useful_s
+    enabled = SHORT_SLICE_GATE if gate is None else gate
+    if not enabled or slice_s >= min_useful:
+        return True
+    if rec.difficulty == "easy":
+        return True
+    return has_progress
 
 
 def estimated_cost(rec: ChallengeRecord) -> float:
@@ -63,8 +91,19 @@ def slice_for(
     slice_min_s: float = SLICE_MIN_S,
     slice_max_s: float = SLICE_MAX_S,
 ) -> float:
-    """把 phase 基础片按该题分数加权，夹回 [min, max]。"""
-    return max(slice_min_s, min(slice_max_s, base_slice * slice_weight(rec)))
+    """按分数加权并夹回 [floor, cap]。
+
+    极速扫题模式会把 Phase1 cap 压到 ~45s 让失败题快速让槽；easy 题接近必解、
+    hard/多 flag 题值得深挖，因此按难度给 floor（easy 90s / hard 120s）。
+    """
+    floor = slice_min_s
+    # 只有真实预算下（base 片 >=20s）才启用难度保底；e2e/单测用秒级片时保持原语义
+    if base_slice >= 20:
+        if rec.difficulty == "easy":
+            floor = max(floor, 90)
+        elif rec.difficulty == "hard" or rec.flag_count > 1:
+            floor = max(floor, 120)
+    return max(floor, min(slice_max_s, base_slice * slice_weight(rec)))
 
 
 def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
