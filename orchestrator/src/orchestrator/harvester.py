@@ -36,6 +36,16 @@ NAMED_FLAG_PATTERNS = (
 GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
 GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
+_DECOY_MARKERS = (
+    "test_flag",
+    "dummy",
+    "placeholder",
+    "not_a_real_flag",
+    "for_development",
+    "changeme",
+    "sample_flag",
+    "fake_flag",
+)
 _PLACEHOLDER_BODIES = frozenset(
     {"...", "<...>", "flag", "example", "your_flag_here", "your_flag", "xxx", "redacted"}
 )
@@ -50,6 +60,8 @@ def _is_plausible(flag: str) -> bool:
     if "<" in body or ">" in body:
         return False
     if any(ch in body for ch in "[]^()|\\*+?"):
+        return False
+    if any(marker in body.lower() for marker in _DECOY_MARKERS):
         return False
     return not set(body) <= set(".*-_ ")
 

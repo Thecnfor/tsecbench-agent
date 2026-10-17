@@ -1108,6 +1108,16 @@ GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
 # 通用兜底只认真实 flag 前缀；代码标识符（collect/it.name、
 # JSAPI_Event_*_{uuid}）一律拒绝。
 GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
+_DECOY_MARKERS = (
+    "test_flag",
+    "dummy",
+    "placeholder",
+    "not_a_real_flag",
+    "for_development",
+    "changeme",
+    "sample_flag",
+    "fake_flag",
+)
 _PLACEHOLDER_BODIES = frozenset(
     {"...", "<...>", "flag", "example", "your_flag_here", "your_flag", "xxx", "redacted"}
 )
@@ -1124,6 +1134,8 @@ def is_plausible_flag(flag: str) -> bool:
         return False
     # 正则/代码片段（如 flag{[^}）不是 flag
     if any(ch in body for ch in "[]^()|\\*+?"):
+        return False
+    if any(marker in body.lower() for marker in _DECOY_MARKERS):
         return False
     return not set(body) <= set(".*-_ ")
 

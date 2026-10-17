@@ -246,6 +246,7 @@ def test_placeholder_flags_are_rejected(common):
     assert common.find_flags("FLAG{<flag>}") == []
     assert common.find_flags("FLAG{xxx}") == []
     assert common.find_flags("FLAG{[^}") == []
+    assert common.find_flags("FLAG{test_flag_for_development}") == []
     real = "flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
     assert common.find_flags(real) == [real]
 
