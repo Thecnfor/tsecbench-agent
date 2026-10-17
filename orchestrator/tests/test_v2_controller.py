@@ -99,3 +99,29 @@ class TestReDelegate:
         assert ctl.skipped_delegates == 1
         states = {k: v["state"] for k, v in ctl.controller.snapshot().items()}
         assert states == {"recon": EXPLORED, "probe": EXPLORED}
+
+
+def test_stage_planner_orders_stages_and_skips_exploring():
+    from orchestrator.v2_bridge import Delegate, Finish
+    from orchestrator.v2_controller import StagePlanner
+    from orchestrator.v2_state import NodeState
+
+    planner = StagePlanner()
+    first = planner.next_action({})
+    assert isinstance(first, Delegate) and first.key == "recon" and first.parent is None
+    snapshot = {
+        "recon": {"state": NodeState.EXPLORED, "parent": None},
+        "probe": {"state": NodeState.EXPLORING, "parent": "recon"},
+    }
+    action = planner.next_action(snapshot)
+    assert isinstance(action, Delegate) and action.key == "exploit"
+    assert action.parent == "probe"
+    done = {key: {"state": NodeState.EXPLORED, "parent": None} for key in planner.stages}
+    assert isinstance(planner.next_action(done), Finish)
+
+
+def test_stage_planner_adds_pivot_for_multi_flag():
+    from orchestrator.v2_controller import StagePlanner
+
+    planner = StagePlanner(multi_flag=True)
+    assert planner.stages[-1] == "pivot"

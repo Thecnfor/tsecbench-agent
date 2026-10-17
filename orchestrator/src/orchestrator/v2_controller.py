@@ -29,6 +29,40 @@ class StubPlanner:
         return Finish("all visited")
 
 
+STAGE_DIRECTIVES = {
+    "recon": "Map every reachable service, endpoint and technology; record assets.",
+    "probe": "Test each surface against likely weakness classes; pick the strongest lead.",
+    "exploit": "Weaponize the strongest lead into a working exploit and collect the flag.",
+    "verify": "Confirm the flag exactly as found; do not invent or transform it.",
+    "pivot": "Reuse confirmed credentials/assets to reach the next stage; find remaining flags.",
+}
+
+
+class StagePlanner:
+    """确定性阶段 planner：按 recon→probe→exploit→verify(→pivot) 顺序委派。"""
+
+    def __init__(
+        self,
+        *,
+        stages: tuple[str, ...] = ("recon", "probe", "exploit", "verify"),
+        directives: dict[str, str] | None = None,
+        multi_flag: bool = False,
+    ) -> None:
+        self.stages = list(stages) + (["pivot"] if multi_flag else [])
+        self.directives = {**STAGE_DIRECTIVES, **(directives or {})}
+
+    def next_action(self, snapshot: dict) -> Delegate | Finish:
+        previous: str | None = None
+        for key in self.stages:
+            info = snapshot.get(key)
+            if info is None:
+                return Delegate(key=key, directive=self.directives.get(key, ""), parent=previous)
+            if info["state"].value == "UNEXPLORED":
+                return Delegate(key=key, directive=self.directives.get(key, ""), parent=previous)
+            previous = key
+        return Finish("all stages explored")
+
+
 def make_stream_runner(
     *,
     solver_cmd: list[str],
