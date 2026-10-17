@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 import common
+import reflect
 import state
 from common import (  # 函数引用安全：内部读 common 自身全局，转发无陈旧问题
     build_system_prompt,
@@ -199,6 +200,7 @@ def main() -> int:
     client = OpenAI(api_key=API_KEY, base_url=common.BASE_URL, timeout=180.0, max_retries=2)
 
     tools = common.build_tool_specs()
+    out_dir = Path(common.SOLVER_TASK_PATH).parent / "out" if common.SOLVER_TASK_PATH else None
 
     messages: list[dict] = [
         {"role": "system", "content": build_system_prompt()},
@@ -232,16 +234,13 @@ def main() -> int:
     last_fact_turn = 0
     fact_nudged = False
     no_fact_nudges = 0
+    reflects = 0
     consecutive_errors = 0
     overflow_recoveries = 0
     turn = 0
     last_idea = ""
     known_terms: set[str] = set()
     pending_hints: list[str] = []
-    pending_pivots: list[str] = []
-    failure_counts: dict[str, int] = {}
-    hypothesis_nudged: set[str] = set()
-    model = common.MODEL
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
@@ -251,7 +250,7 @@ def main() -> int:
         messages[:] = sanitize_tool_messages(messages)
         try:
             resp = client.chat.completions.create(
-                model=model,
+                model=common.MODEL,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -319,12 +318,6 @@ def main() -> int:
                     continue
                 known_terms.add(term)
                 snippet = common.known_issue_snippet(term)
-                if snippet and common.AUTO_REASONER and model != common.REASONER_MODEL:
-                    model = common.REASONER_MODEL
-                    print(
-                        f"[solver] identified {term} with KB payload; switching model to {model}",
-                        flush=True,
-                    )
                 if snippet:
                     pending_hints.append(
                         f"You explicitly identified {term}. Offline KB has a matching section — "
@@ -425,19 +418,6 @@ def main() -> int:
             common.note_tool_use("run_command")
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
-            key = common.hypothesis_key(command)
-            if common.command_failed(result, result["output"]):
-                failure_counts[key] = failure_counts.get(key, 0) + 1
-                if failure_counts[key] >= 2 and key not in hypothesis_nudged:
-                    hypothesis_nudged.add(key)
-                    pending_pivots.append(
-                        f"Hypothesis {key!r} has failed {failure_counts[key]} times. "
-                        "Do not repeat the same request shape: check payload/Content-Type/auth, "
-                        "apply the exact KB payload for the identified product/CVE, or pivot to an "
-                        "alternative surface (other port, known CVE, default creds, prior leads)."
-                    )
-            else:
-                failure_counts.pop(key, None)
             raw_output = result["output"]
             out = common.prepare_tool_output(
                 raw_output,
@@ -484,21 +464,43 @@ def main() -> int:
                     flush=True,
                 )
                 break
-            print(
-                f"[solver] no new facts for {factless_turns} turns; switching surface",
-                flush=True,
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"No new asset/credential/endpoint in the last {factless_turns} turns. "
-                        "This surface looks exhausted: switch to the next candidate from the "
-                        "FAST PATH/KB, or stop and report your best hypothesis. Do not repeat "
-                        "the same request shape."
-                    ),
-                }
-            )
+            remaining = common.remaining_seconds()
+            obs = None
+            if reflect.should_reflect(reflects=reflects, remaining_s=remaining):
+                obs = reflect.observe(
+                    client,
+                    common.MODEL,
+                    getattr(common, "TASK", {}) or {},
+                    messages,
+                    sorted(common._reported),
+                    remaining,
+                )
+            if obs:
+                reflects += 1
+                if out_dir is not None:
+                    reflect.save(out_dir, obs)
+                display = obs.get("lock") or (obs.get("angles") or [""])[0]
+                print(
+                    f"[solver] observer reflection #{reflects}: {display[:100]}",
+                    flush=True,
+                )
+                messages.append({"role": "user", "content": reflect.render(obs)})
+            else:
+                print(
+                    f"[solver] no new facts for {factless_turns} turns; switching surface",
+                    flush=True,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"No new asset/credential/endpoint in the last {factless_turns} turns. "
+                            "This surface looks exhausted: switch to the next candidate from the "
+                            "FAST PATH/KB, or stop and report your best hypothesis. Do not repeat "
+                            "the same request shape."
+                        ),
+                    }
+                )
         if turn >= common.MAX_TURNS_NO_FLAG and not common._reported:
             print(f"[solver] turn cap without flag ({turn}); stopping", flush=True)
             break
@@ -509,32 +511,9 @@ def main() -> int:
             )
             break
 
-        for hint in pending_pivots:
-            messages.append({"role": "user", "content": hint})
-        pending_pivots.clear()
         for hint in pending_hints:
             messages.append({"role": "user", "content": hint})
         pending_hints.clear()
-        if turn % 15 == 0 and turn > 1:
-            prior = common.TASK.get("prior") or {}
-            assets = [str(item) for item in (prior.get("assets") or [])][:5]
-            creds = [str(item) for item in (prior.get("credentials") or [])][:3]
-            failures = ", ".join(
-                f"{key}×{count}"
-                for key, count in sorted(failure_counts.items(), key=lambda item: -item[1])[:4]
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"[STATE turn {turn}] products: {', '.join(sorted(known_terms)) or '-'}; "
-                        f"flags: {', '.join(sorted(common._reported)) or '-'}; "
-                        f"prior assets: {', '.join(assets) or '-'}; "
-                        f"prior creds: {', '.join(creds) or '-'}; "
-                        f"failed: {failures or '-'}."
-                    ),
-                }
-            )
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
         nudge = _flag_nudge(common, reported_before)

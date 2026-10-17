@@ -68,6 +68,14 @@ def choose_repair(
       - 其它非零退出        → retry_same（瞬态崩溃，计划本身没错）
       - 正常结束但零候选    → recompile（原 plan 的面已经探秃）
     """
+    if outcome.stalled:
+        # 停滞看门狗杀掉的片：不是时间不够，而是当前动作把 solver 挂住了。
+        # widen 只会给同一面更多时间，必然再次挂死；直接换面。
+        return RepairPlan(
+            action="recompile",
+            note="solver stalled with no output or new artifacts; change the "
+            "request shape and attack surface instead of repeating the same action",
+        )
     if outcome.exit_code == 124 and outcome.timed_out:
         # widen 只投给有进展信号的片（实测：零线索题 widen 后照样烧满整片，
         # 纯时间浪费；有 assets/线索的题才值得更多 runway）

@@ -84,8 +84,6 @@ STALE_HARD_TURNS = int(cfg("SOLVER_STALE_HARD_TURNS", "30"))
 MAX_NO_FACT_NUDGES = int(cfg("SOLVER_MAX_NO_FACT_NUDGES", "2"))
 # c-09 实测 82 轮才解出：绝对轮数上限不能太低，否则误杀可解题。
 MAX_TURNS_NO_FLAG = int(cfg("SOLVER_MAX_TURNS_NO_FLAG", "100"))
-REASONER_MODEL = cfg("SOLVER_REASONER_MODEL", "deepseek-reasoner")
-AUTO_REASONER = (cfg("SOLVER_AUTO_REASONER", "on") or "").lower() in ("1", "on", "true", "yes")
 
 
 def effective_command_timeout(
@@ -493,27 +491,6 @@ def known_issue_snippet(term: str) -> str | None:
     if not text or term.lower() not in text.lower():
         return None
     return text[:1500]
-
-
-_CMD_ERROR_RE = re.compile(
-    r"(?i)\b(?:404|403|401|500|502|503|error|failed|refused|denied|not found|"
-    r"exception|timed out|timeout)\b"
-)
-
-
-def command_failed(result: dict, output: str) -> bool:
-    """命令是否失败：非零退出、超时，或输出里有 4xx/5xx/错误关键词。"""
-    if result.get("timed_out") or result.get("exit_code"):
-        return True
-    return bool(_CMD_ERROR_RE.search(str(output or "")))
-
-
-def hypothesis_key(command: str) -> str:
-    """把命令归并成“假设键”：优先 host:port，否则命令前 80 字。"""
-    match = re.search(r"https?://([^/\s'\"]+)", command)
-    if match:
-        return match.group(1)[:80]
-    return " ".join(command.split())[:80]
 
 
 def _with_kb(result: dict) -> dict:
@@ -1371,6 +1348,23 @@ def setup_orch_mode() -> None:
         items = prior.get(key) or []
         if items:
             parts.append(render_prior_items(title, items, limit=limits[key]))
+    observer = prior.get("observer")
+    if isinstance(observer, dict) and observer:
+        lines = ["# OBSERVER (advisory; new evidence beats this)"]
+        if observer.get("hypothesis"):
+            lines.append(f"HYPOTHESIS: {observer['hypothesis']}")
+        if observer.get("confirmed"):
+            lines.append("CONFIRMED:")
+            lines.extend(f"- {item}" for item in observer["confirmed"][:6])
+        if observer.get("lock"):
+            lines.append(f"LOCK: {observer['lock']}")
+        if observer.get("angles"):
+            lines.append("ANGLES:")
+            lines.extend(f"- {item}" for item in observer["angles"][:5])
+        if observer.get("tension"):
+            lines.append("TENSION:")
+            lines.extend(f"- {item}" for item in observer["tension"][:2])
+        parts.append("\n".join(lines))
     history = str(prior.get("history") or "").strip()
     if history:
         # relay 已给出 worked/failed 摘要时，history 只留最近一小段，

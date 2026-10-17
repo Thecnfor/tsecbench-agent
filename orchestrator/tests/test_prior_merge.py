@@ -21,6 +21,23 @@ def test_merge_prior_merges_credentials_and_findings():
     assert merged["findings"] == ["nginx/1.18.0", "tomcat/9.0.1"]
 
 
+def test_merge_prior_keeps_latest_observer():
+    from orchestrator.supervisor import _merge_prior as merge_supervisor
+
+    old = {"observer": {"revision": 1, "lock": "old"}}
+    new = {"observer": {"revision": 2, "lock": "new"}}
+    assert _merge_prior(old, new)["observer"]["lock"] == "new"
+    assert merge_supervisor(old, new)["observer"]["lock"] == "new"
+    # 旧 revision 不得覆盖新记录
+    assert (
+        _merge_prior(
+            {"observer": {"revision": 3, "lock": "keep"}},
+            {"observer": {"revision": 2, "lock": "stale"}},
+        )["observer"]["lock"]
+        == "keep"
+    )
+
+
 def test_setup_orch_mode_injects_new_sections(monkeypatch, tmp_path):
     task = tmp_path / "task.json"
     task.write_text(

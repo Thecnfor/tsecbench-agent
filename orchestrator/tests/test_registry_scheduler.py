@@ -128,8 +128,10 @@ def test_priority_level_and_difficulty_tiebreak():
         "m1": rec("m1", difficulty="medium", level=1, total_score=200, flag_count=1),
         "h1": rec("h1", difficulty="hard", level=1, total_score=400, flag_count=1),
     }
-    # 新契约：难度升序是主键 —— medium 永远排在 hard 之前（先拿分再说）
-    assert priority_key(records["m1"])[0] < priority_key(records["h1"])[0]
+    # 新契约：首键是零进展沉底标记，难度升序是第二键 —— medium 永远排在
+    # hard 之前（先拿分再说）。
+    assert priority_key(records["m1"])[1] < priority_key(records["h1"])[1]
+    assert priority_key(records["m1"])[0] == priority_key(records["h1"])[0] == 0
     assert eligible(records)[0].unique_code == "m1"
     records["h1"].level = 2
     assert eligible(records)[0].unique_code == "m1"

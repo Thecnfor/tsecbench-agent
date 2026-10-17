@@ -60,6 +60,9 @@ class ChallengeRecord:
     # 本地修复记账（EVOSTER，harness-v2.md §5；平台读不回来，不在对账路径）
     repair_widened: bool = False  # widen 动作最多一次
     next_slice_s: float | None = None  # 下轮时间片覆盖（widen 后生效一次即清零）
+    # 槽位经济学：本 pass 无新 flag 且无新事实的次数。>0 的题排到队尾，
+    # 且不再与非零进展题抢补位槽（对齐 CyberPenda 的零进展 pass 规则）。
+    zero_progress_passes: int = 0
 
     @property
     def remaining_flags(self) -> int:
