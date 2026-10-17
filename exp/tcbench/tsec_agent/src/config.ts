@@ -139,8 +139,8 @@ export interface Config {
   // 通关后 AI 复盘的时间上限（秒）：容器此时已关闭、槽位已释放，总结脱槽跑不占并发名额；
   // 超时丢弃总结照常记 pass——总结失败绝不能拖累通关，也不能让 agent 无限烧 token。
   summary_timeout_sec: number;
-  /** 上下文压缩阈值（字符估算 ≈ messages 总长；超过即压缩交接。0=关） */
-  compact_chars: number;
+  /** 上下文压缩兜底阈值（token，取上一次 LLM 调用 usage.prompt_tokens 实测；0=只留 flag 触发） */
+  compact_tokens: number;
   // 暂停题续跑 aging（秒）：排队超过此时长的暂停题提权，防止 fresh 无限插队
   //（实测曾有题暂停后等 118 分钟才续跑）。
   resume_aging_sec: number;
@@ -211,7 +211,7 @@ export const CFG: Config = {
   segment_short_sec: num("AGENT_TASK_SEGMENT_SHORT_SEC", "600"),
   segment_long_sec: num("AGENT_TASK_SEGMENT_LONG_SEC", "1800"),
   summary_timeout_sec: num("AGENT_SUMMARY_TIMEOUT_SEC", "300"),
-  compact_chars: num("AGENT_COMPACT_CHARS", "120000"), // ≈30k tok（128k 窗口留足余量）
+  compact_tokens: num("AGENT_COMPACT_TOKENS", "500000"), // 500k tok 才兜底压缩（主触发器=找到 flag）
   resume_aging_sec: num("AGENT_RESUME_AGING_SEC", "600"),
   platform_capacity: num("AGENT_PLATFORM_CAPACITY", "3"),
   pause_max: num("AGENT_PAUSE_MAX", "0"), // 每题最多暂停续跑次数，0=不限

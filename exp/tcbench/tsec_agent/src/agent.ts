@@ -528,8 +528,11 @@ export async function solveTask(
   if (flagTotal) ledger.setTotal(flagTotal);
   // 单 flag 收尾总结轮（branchId→flag_index+设置轮次）
   const flagSummariesPending = new Map<number, { idx: number; turn: number }>();
-  // 找到 flag（多 flag 未全齐）→ 回合末强制压缩交接（主触发器；阈值兜底）
+  // 找到 flag（多 flag 未全齐）→ 回合末强制压缩交接（主触发器；token 兜底）
   const compactAfterFlag = new Set<number>();
+  // 各分支最近一次 LLM 调用的实测输入 token（usage.prompt_tokens——真实口径零成本；
+  // 段重启后首轮调用即反映重建上下文的大小）
+  const lastPromptTokens = new Map<number, number>();
   const taskClass = opts.taskClass ?? "short";
   const stallSec = taskClass === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
   // 思考档位分档：短题 low 省 thinking（实测占成本 37-69%），长题不发=模型默认档；
@@ -751,9 +754,11 @@ export async function solveTask(
   const compactFailedAt = new Map<number, number>();
   const maybeCompact = async (br: BranchState, force = false): Promise<boolean> => {
     const before = estMsgChars(br.messages);
+    const beforeTokens = lastPromptTokens.get(br.id) ?? 0;
     if (!force) {
-      // 阈值兜底路径（长探索不靠 flag 也能压）；flag 触发走 force（信息密度最高时刻）
-      if (CFG.compact_chars <= 0 || before < CFG.compact_chars) return false;
+      // token 兜底路径（500k 实测才压，不经常压）；flag 触发走 force（信息密度最高时刻）
+      const used = lastPromptTokens.get(br.id) ?? 0;
+      if (CFG.compact_tokens <= 0 || used < CFG.compact_tokens) return false;
     }
     if (turn - (compactFailedAt.get(br.id) ?? -99) < 3) return false;
     try {
@@ -786,11 +791,14 @@ export async function solveTask(
       rec().event("context_compacted", {
         code,
         branch: br.id,
+        beforeTokens,
         beforeChars: before,
         afterChars: estMsgChars(br.messages),
       });
+      lastPromptTokens.delete(br.id); // 陈旧高值会反复触发，下一次真实 usage 重建口径
       log(
-        `[${code}] branch ${br.id} compacted: ${before} -> ${estMsgChars(br.messages)} chars (turn ${turn})`,
+        `[${code}] branch ${br.id} compacted @${Math.round(beforeTokens / 1000)}k tok: ` +
+          `${before} -> ${estMsgChars(br.messages)} chars (turn ${turn})`,
       );
       return true;
     } catch (e) {
@@ -940,6 +948,10 @@ export async function solveTask(
       ended_at: tLlmEnd,
     });
     if (msg.content) lastContent = msg.content;
+    {
+      const pt = Number(resp?.usage?.prompt_tokens ?? 0); // 实测输入 token（口径：上一次 LLM 调用）
+      if (pt > 0) lastPromptTokens.set(br.id, pt);
+    }
     // 自动黑板：模型的进展叙述（content，不含 thinking/tool）直接落 corelog——
     // 治"提示词暗示不可靠"（b-02 实测 123 次 shell 仅 1 张实质卡）；短应答(<8字)跳过防噪。
     // 记卡即核心事件：停滞时钟随之刷新（黑板确实在长，不算隐形空转）

@@ -163,7 +163,6 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     );
     CFG.benchmark_token = "t";
     CFG.benchmark_base_url = "http://bench.test";
-    CFG.compact_chars = 999_999; // 阈值不参与——压缩只由「找到 flag」触发
     const { client, taskCalls } = makeClient(
       [
         // 任务轮 1：submit flag#0（1/2）→ 找到 flag → 回合末强制压缩交接
@@ -291,17 +290,29 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     );
     CFG.benchmark_token = "t";
     CFG.benchmark_base_url = "http://bench.test";
-    CFG.compact_chars = systemPromptWithExtras(false, false).length + 600; // shell 700B 越线
-    const script: Array<Record<string, unknown>> = [
-      // 轮 1：长 shell 输出推高上下文
+    // token 兜底：轮 1 响应回报实测 600k（≥默认 500k）→ 轮 2 开头触发压缩；
+    // 之后 usage 回落 20k → 不再压（压缩成功后计数清零，真实 usage 重建口径）
+    const script = [
       {
-        content: null,
-        tool_calls: [tc("s1", "shell", { command: `echo "${"x".repeat(700)}"`, wait_ms: 3000 })],
+        usage: { prompt_tokens: 600_000 },
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [tc("s1", "shell", { command: "echo recon-done", wait_ms: 3000 })],
+        },
       },
-      // 轮 2：submit（1/1）→ 单 flag 收尾总结指示
-      { content: null, tool_calls: [tc("s2", "submit_flag", { flag: "flag{single}" })] },
-      // 轮 3：收尾总结（≥8 字叙述 → 自动落黑板卡）
-      { content: "注入拿到，本题收束：后台弱口令已验证。" },
+      {
+        usage: { prompt_tokens: 20_000 },
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [tc("s2", "submit_flag", { flag: "flag{single}" })],
+        },
+      },
+      {
+        usage: { prompt_tokens: 20_000 },
+        message: { role: "assistant", content: "注入拿到，本题收束：后台弱口令已验证。" },
+      },
     ];
     let i = 0;
     const client = {
@@ -310,9 +321,9 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
         if (last.includes("即将被压缩为一份")) {
           return { choices: [{ message: { role: "assistant", content: COMPACT_DOC } }] };
         }
-        const r = script[Math.min(i, script.length - 1)];
+        const e = script[Math.min(i, script.length - 1)];
         i++;
-        return { choices: [{ message: { role: "assistant", ...r } }] };
+        return { choices: [{ message: e.message }], usage: e.usage };
       },
     } as LlmClient;
     const conv = rec().conversation("t-c3");
