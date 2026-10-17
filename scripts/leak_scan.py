@@ -157,7 +157,8 @@ def _is_tar(fileobj: io.BufferedIOBase) -> bool:
         magic = fileobj.read(5)
         fileobj.seek(pos)
         return magic == b"ustar"
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
+        # gzip 流的 _Stream 没有 seekable()（嵌套层解压时实测崩溃）
         return False
 
 
@@ -171,6 +172,15 @@ def iter_layer_files(archive: Path, *, _depth: int = 0):
         yield from _walk_tar(outer, "", _depth)
 
 
+def _seek(fobj, pos: int) -> bool:
+    """尽力回绕；非 seekable 流（嵌套 r| 解压出的 _Stream）返回 False。"""
+    try:
+        fobj.seek(pos)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _walk_tar(tf: tarfile.TarFile, prefix: str, depth: int):
     for member in tf:
         if not member.isfile():
@@ -179,15 +189,15 @@ def _walk_tar(tf: tarfile.TarFile, prefix: str, depth: int):
         fobj = tf.extractfile(member)
         if fobj is None:
             continue
-        if depth < MAX_NEST and _is_tar(fobj):  # type: ignore[arg-type]
-            fobj.seek(0)
+        if depth < MAX_NEST and _is_tar(fobj) and _seek(fobj, 0):  # type: ignore[arg-type]
             try:
                 with tarfile.open(fileobj=fobj, mode="r|") as inner:  # type: ignore[arg-type]
                     yield from _walk_tar(inner, f"{name}::", depth + 1)
                 continue
             except (tarfile.TarError, OSError, EOFError):
                 pass
-        fobj.seek(0)
+        if not _seek(fobj, 0):
+            continue
         direct = _open_maybe_compressed(fobj)  # type: ignore[arg-type]
         if direct is not fobj and depth < MAX_NEST and _is_tar(direct):  # type: ignore[arg-type]
             try:
@@ -196,7 +206,8 @@ def _walk_tar(tf: tarfile.TarFile, prefix: str, depth: int):
                 continue
             except (tarfile.TarError, OSError, EOFError):
                 pass
-        direct.seek(0)
+        if not _seek(direct, 0):
+            continue
         payload = direct.read(MAX_SCAN_BYTES + 1)
         truncated = len(payload) > MAX_SCAN_BYTES
         yield name, payload[:MAX_SCAN_BYTES], truncated
