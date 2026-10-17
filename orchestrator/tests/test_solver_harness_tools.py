@@ -425,3 +425,16 @@ def test_host_recon_auto_fingerprints_http_and_lists_known_issues(common, monkey
     out = common.run_recon({"mode": "host", "target": "x"})
     assert out["web"]["title"] == "Dify"
     assert any("Dify" in item for item in out["known_issues"])
+
+
+def test_detect_known_terms_and_known_issue_snippet(common, monkeypatch):
+    terms = common.detect_known_terms("Dify 1.2.0 is vulnerable to CVE-2025-3248")
+    assert "dify" in terms and "CVE-2025-3248" in terms
+    monkeypatch.setattr(
+        common,
+        "kb_snippets",
+        lambda query, top_k=3: "## KB: CVE-2025-3248 payload\ncurl -s /api/v1/validate/code",
+    )
+    assert "CVE-2025-3248" in (common.known_issue_snippet("CVE-2025-3248") or "")
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "unrelated")
+    assert common.known_issue_snippet("dify") is None

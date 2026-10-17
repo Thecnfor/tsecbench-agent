@@ -464,6 +464,35 @@ _AUTO_PROBED: set[str] = set()
 _AUTO_PROBED_LOCK = threading.Lock()
 
 
+_KNOWN_TERM_RE = re.compile(
+    r"\b(dify|langflow|gitea|forgejo|hugegraph|gradio|jenkins|minio|azurite|next\.js|"
+    r"flask|werkzeug)\b|\bCVE-\d{4}-\d{4,7}\b",
+    re.I,
+)
+
+
+def detect_known_terms(text: str) -> list[str]:
+    """从模型自己的话里识别产品/CVE；用于强制检索离线 wiki 的精确 payload。"""
+    terms = []
+    for match in _KNOWN_TERM_RE.finditer(text):
+        term = match.group(0)
+        term = term.upper() if term.upper().startswith("CVE-") else term.lower()
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def known_issue_snippet(term: str) -> str | None:
+    """返回包含该产品/CVE 的 KB 片段；没有命中就静默跳过。"""
+    try:
+        text = kb_snippets(f"{term} payload exploit CVE", top_k=3)
+    except Exception:  # noqa: BLE001 - KB 缺失不影响主循环
+        return None
+    if not text or term.lower() not in text.lower():
+        return None
+    return text[:1500]
+
+
 def _with_kb(result: dict) -> dict:
     """recon 结果附带离线 KB 命中与 FAST PATH：把「发现指纹 → 第一批动作」压到同一回合。"""
     fingerprint = json.dumps(result, ensure_ascii=False)[:1500]
@@ -1231,6 +1260,8 @@ Hard rules:
 - Bound every network command (`curl -m 5`, `timeout 30`). One high-information command beats many small ones.
 - JS/CSS/font URLs, chunk filenames, and JS expressions are NOT assets or credentials.
   Verify any credential with a real login/200 before building a chain.
+- 127.0.0.1/localhost URLs in HTML/JS are server-side references; you cannot reach them.
+  Only the target host/port is reachable; use the frontend as a proxy if needed.
 {shell_rule}
 - Flags: report exactly as found; multi-flag challenges continue until all flags are submitted.
 - No hints exist. Solve from local analysis; never probe the platform or LLM side.

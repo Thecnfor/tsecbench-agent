@@ -236,6 +236,8 @@ def main() -> int:
     overflow_recoveries = 0
     turn = 0
     last_idea = ""
+    known_terms: set[str] = set()
+    pending_hints: list[str] = []
 
     while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
@@ -308,6 +310,16 @@ def main() -> int:
         if content:
             print(f"[solver] assistant (turn {turn}): {content[:1500]}", flush=True)
             last_idea = content[:300]
+            for term in common.detect_known_terms(content):
+                if term in known_terms:
+                    continue
+                known_terms.add(term)
+                snippet = common.known_issue_snippet(term)
+                if snippet:
+                    pending_hints.append(
+                        f"You explicitly identified {term}. Offline KB has a matching section — "
+                        "apply its exact payload/syntax before inventing new paths:\n" + snippet
+                    )
             for flag in find_flags(content):
                 report_candidate(flag)
 
@@ -473,6 +485,10 @@ def main() -> int:
                 flush=True,
             )
             break
+
+        for hint in pending_hints:
+            messages.append({"role": "user", "content": hint})
+        pending_hints.clear()
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
         nudge = _flag_nudge(common, reported_before)
