@@ -545,7 +545,9 @@ async def run_agent(
                     prior.get(key)
                     for key in ("assets", "explored", "open_leads", "credentials", "findings")
                 )
-                if not should_start(rec, attempt_slice, has_progress=has_progress):
+                if plan.phase >= 2 and not should_start(
+                    rec, attempt_slice, has_progress=has_progress
+                ):
                     rec.next_slice_s = attempt_slice  # 保留加权片，下次再试
                     continue
                 rec.next_slice_s = None
