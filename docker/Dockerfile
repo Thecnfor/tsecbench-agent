@@ -48,6 +48,10 @@ ARG PI_VERSION
 WORKDIR /opt/tsecbench/pi
 RUN npm install --omit=dev "${PI_PACKAGE}@${PI_VERSION}" \
     && ./node_modules/.bin/pi --version   # 装上即可执行，失败即断构建
+# 悬空 tool_calls 消毒补丁（deepseek 400 死循环；见 solver/THIRD_PARTY.md）
+COPY docker/pi_patch.js /tmp/pi_patch.js
+RUN node /tmp/pi_patch.js /opt/tsecbench/pi/node_modules/@earendil-works/pi-coding-agent \
+    && rm /tmp/pi_patch.js
 
 # ---- L1.5：TS 手动工作流 solver（Mastra）------------------------------------
 FROM node:${NODE_VERSION}-trixie-slim AS ts-workflow-builder
@@ -74,7 +78,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 1) 系统工具面（image-spec.md §3）。python3.13 是 trixie 自带，无需 standalone 包。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # 基础 / 网络
-      ca-certificates curl wget git unzip xz-utils file xxd less procps \
+      ca-certificates ripgrep curl wget git unzip xz-utils file xxd less procps \
       socat netcat-openbsd tcpdump iproute2 dnsutils \
       # 侦察与扫描
       nmap masscan \
@@ -84,9 +88,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       hydra john hashcat \
       # 二进制 / Pwn
       gdb binutils patchelf gcc g++ make gcc-multilib \
-      # 逆向（trixie 无 rizin，用 radare2；nikto 也不在 trixie，
+      # 逆向（trixie 无 rizin/radare2，用 gdb+binutils+binwalk；nikto 也不在 trixie，
       #   image-spec.md §3 记为 apt/git，需要时单独 clone）
-      radare2 binwalk \
+      binwalk \
       # L4 Lua 注入面（仅本地写/自检 .nse）+ Redis
       lua5.4 redis-tools \
       # Python 3.13 运行时（trixie 自带）
@@ -115,6 +119,8 @@ COPY mock/ /tmp/build/mock/
 COPY pyproject.toml uv.lock /tmp/build/
 RUN python3 -m venv /opt/tsecbench/venv \
     && /opt/tsecbench/venv/bin/pip install --upgrade pip \
+    # triviumdb 发的是 abi3 轮子、3.13 可用，但元数据保守写了 <3.13
+    && /opt/tsecbench/venv/bin/pip install --ignore-requires-python "triviumdb>=0.8.8,<0.9" \
     && /opt/tsecbench/venv/bin/pip install /tmp/build/orchestrator /tmp/build/mock \
     && /opt/tsecbench/venv/bin/pip install "openhands-ai==${OPENHANDS_VERSION}" \
     && /opt/tsecbench/venv/bin/python -c "import orchestrator, mock_server, openhands; print('py deps ok')" \

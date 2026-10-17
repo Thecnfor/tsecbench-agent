@@ -29,3 +29,8 @@ state/
 .pytest_cache/
 .ruff_cache/
 bench_results.jsonl
+
+# pi 执行内核本地 vendor（含 auth.json 与 node_modules，一律构建期重装）
+solver/.pi-vendor/
+.superpowers/
+workspaces/

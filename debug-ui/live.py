@@ -86,12 +86,8 @@ def scoreboard(evs: list[dict]) -> dict:
 
 def vpn_status() -> dict:
     try:
-        out = subprocess.run(
-            ["ip", "-br", "a"], capture_output=True, text=True, timeout=3
-        ).stdout
-        route = subprocess.run(
-            ["ip", "route"], capture_output=True, text=True, timeout=3
-        ).stdout
+        out = subprocess.run(["ip", "-br", "a"], capture_output=True, text=True, timeout=3).stdout
+        route = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.TimeoutExpired):
         return {"up": False, "iface": "", "ip": "", "subnet_route": False}
     iface, ip, subnet = "", "", False
@@ -241,8 +237,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         url = urlparse(self.path)
         if url.path == "/api/live":
-            self._send(200, json.dumps(snapshot(), ensure_ascii=False).encode(),
-                       "application/json; charset=utf-8")
+            self._send(
+                200,
+                json.dumps(snapshot(), ensure_ascii=False).encode(),
+                "application/json; charset=utf-8",
+            )
             return
         if url.path == "/api/task/log":
             name = parse_qs(url.query).get("name", [""])[0]
@@ -260,12 +259,20 @@ class Handler(BaseHTTPRequestHandler):
             if d is None:
                 self._send(404, b"no such task", "text/plain")
                 return
-            self._send(200, (d / "stdout.log").read_bytes(), "text/plain",
-                       {"Content-Disposition": f'attachment; filename="{name}-stdout.log"'})
+            self._send(
+                200,
+                (d / "stdout.log").read_bytes(),
+                "text/plain",
+                {"Content-Disposition": f'attachment; filename="{name}-stdout.log"'},
+            )
             return
         if url.path == "/api/download/journal":
-            self._send(200, JOURNAL.read_bytes(), "application/jsonl",
-                       {"Content-Disposition": 'attachment; filename="journal.jsonl"'})
+            self._send(
+                200,
+                JOURNAL.read_bytes(),
+                "application/jsonl",
+                {"Content-Disposition": 'attachment; filename="journal.jsonl"'},
+            )
             return
         if url.path in ("/", "/index.html"):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
@@ -288,8 +295,9 @@ class Handler(BaseHTTPRequestHandler):
             str(payload.get("ovpn", "")),
             str(payload.get("sudo_password", "")),
         )
-        self._send(200, json.dumps(result, ensure_ascii=False).encode(),
-                   "application/json; charset=utf-8")
+        self._send(
+            200, json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8"
+        )
 
     def log_message(self, *args) -> None:
         pass

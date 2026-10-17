@@ -52,3 +52,4 @@ data/
 
 # ── AI 工具本地产物（计划文档等），不入库 ──────────────────
 .trae/
+runtime-import.env

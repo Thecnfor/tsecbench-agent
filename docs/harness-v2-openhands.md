@@ -85,5 +85,11 @@ orchestrator (Python, 顶层守护)
 ## 7. 未决
 
 - B15：TriviumDB Node 绑定实证（决赛前窗口）。
-- OpenHands 1.11.0 离线镜像行为实证（config 目录、隐式探活、内存占用）
+- B17：OpenHands 1.11.0 离线镜像行为实证（config 目录、隐式探活、内存占用）
   —— v2 冒烟的先决项，不绿不切真跑。
+
+## 8. 状态（2026-10-17）
+
+stub e2e 全绿（test_v2_*）；v2 模块默认旁路（HARNESS_V2=off），交付镜像
+按已验证主路径构建。OpenHandsPlanner 真跑冒烟 = B17，未绿前
+HARNESS_V2 不在正式镜像开 on。
