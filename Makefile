@@ -50,6 +50,7 @@ run: clean-tmp
 rerun:
 	-@pkill -f '/solver/main\.py$$' 2>/dev/null
 	-@pkill -f 'python -m orchestrator$$' 2>/dev/null
+	@for i in $$(seq 1 20); do pgrep -f '/solver/main\.py$$' >/dev/null || break; sleep 0.5; done
 	@sleep 1
 	@set -a; . ./solver/.env; set +a; \
 	 SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) nohup $(UV) run python -m orchestrator >> /tmp/tsec-run.log 2>&1 & \
