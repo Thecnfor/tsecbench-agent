@@ -11,6 +11,13 @@ import re
 # (触发词, 扩展词)。触发词命中任意一个即追加该组扩展。
 ALIASES: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
     (("dify",), ("next.js", "console api", "ssrf", "rsc", "server action")),
+    (("1panel",), ("1panel", "cve", "auth", "api")),
+    (("weaver", "泛微"), ("weaver", "oa", "rce", "unauth")),
+    (("geoserver",), ("geoserver", "wms", "cve", "xxe")),
+    (("ollama", "comfyui"), ("ollama", "comfyui", "api", "model")),
+    (("pydash",), ("pydash", "prototype pollution", "merge")),
+    (("azure", "sas"), ("azure", "sas", "blob", "storage")),
+    (("serverless", "云函数"), ("serverless", "lambda", "runtime", "env")),
     (("langflow",), ("langflow", "cve", "code injection", "api/v1", "gradio")),
     (("gitea", "forgejo"), ("gitea", "oauth", "pow", "registration", "cve")),
     (("flask", "werkzeug"), ("flask", "werkzeug", "ssti", "debug console", "lfi")),

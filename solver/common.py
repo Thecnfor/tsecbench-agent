@@ -571,7 +571,8 @@ _AUTO_PROBED_LOCK = threading.Lock()
 
 _KNOWN_TERM_RE = re.compile(
     r"\b(dify|langflow|gitea|forgejo|hugegraph|gradio|jenkins|minio|azurite|next\.js|"
-    r"flask|werkzeug)\b|\bCVE-\d{4}-\d{4,7}\b",
+    r"flask|werkzeug|1panel|weaver|geoserver|ollama|comfyui|pydash|serverless)\b|"
+    r"\bCVE-\d{4}-\d{4,7}\b",
     re.I,
 )
 
