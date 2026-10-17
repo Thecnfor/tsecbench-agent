@@ -69,6 +69,7 @@ class RunContext:
     solver_cmd: list[str]
     priors: dict[str, dict] = field(default_factory=dict)  # code → 双图状态（跨轮合并）
     running: set[str] = field(default_factory=set)
+    slot_freed: asyncio.Event = field(default_factory=asyncio.Event)
     stopped: bool = False
     t0: float = 0.0
     env: dict[str, str] | None = None  # 传给 solver 的基础环境（测试注入用）
@@ -252,6 +253,15 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
                 rec.state = "QUEUED"
         except Exception:  # noqa: BLE001 - 兜底路径失败不掩盖原始异常
             pass
+
+
+def _active_slots(ctx: RunContext) -> int:
+    """并发槽真值 = 在飞 pipeline 数。
+
+    registry.active_count 是平台对账视图，与 ctx.running 是同一批题；
+    两者相加会把同一题算两遍（run-35236 实测：只剩 2 槽时被算成 4，
+    第 3 槽空转 474s）。"""
+    return len(ctx.running)
 
 
 async def _salvage_candidates(ctx: RunContext, rec: ChallengeRecord, ws: Path, code: str) -> int:
@@ -547,7 +557,7 @@ async def run_agent(
                 break
             for rec in eligible(ctx.registry.records):
                 if not can_start(
-                    active_count=ctx.registry.active_count() + len(ctx.running),
+                    active_count=_active_slots(ctx),
                     concurrency_limit=config.concurrency_limit,
                 ):
                     break
@@ -576,8 +586,15 @@ async def run_agent(
                 task = asyncio.create_task(_pipeline(ctx, rec.unique_code, attempt_slice))
                 tasks.add(task)
                 ctx.running.add(rec.unique_code)
-                task.add_done_callback(lambda t, c=rec.unique_code: ctx.running.discard(c))
-            await asyncio.sleep(poll_interval_s)
+                task.add_done_callback(
+                    lambda t, c=rec.unique_code: (
+                        ctx.running.discard(c),
+                        ctx.slot_freed.set(),
+                    )
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(ctx.slot_freed.wait(), timeout=poll_interval_s)
+            ctx.slot_freed.clear()
         # 收尾保护（§4.3）：等在跑的 pipeline 结束，再强制 close 一切活跃容器
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
