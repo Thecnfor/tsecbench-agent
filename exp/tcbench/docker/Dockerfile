@@ -196,7 +196,7 @@ RUN set -eux; \
     export GOPROXY=https://goproxy.cn,direct GOFLAGS=-mod=mod; \
     git clone --depth 1 https://github.com/devploit/nomore403 /tmp/n403 \
     && (cd /tmp/n403 && go build -o /usr/local/bin/nomore403 .) \
-    && rm -rf /tmp/n403 "$(go env GOPATH)"/pkg/mod \
+    && rm -rf /tmp/n403 "$(go env GOPATH)"/pkg/mod "$(go env GOCACHE)" \
     ; \
     apt-get purge -y --auto-remove libcurl4-openssl-dev libpcre3-dev libssh-dev \
     && rm -rf /var/lib/apt/lists/* \

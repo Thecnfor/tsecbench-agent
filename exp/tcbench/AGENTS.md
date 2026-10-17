@@ -296,6 +296,9 @@ POST {BASE}/openapi/v1/challenges/close?unique_code=X  释放名额（通关/放
   **不装 neo4j 服务端**）、`aircrack-ng`、`volatility3==2.28.2`（pip，命令 `vol`）、`ghidra`
   （headless 入口 `analyzeHeadless` 已链到 PATH）、`security-knowledge-base`、
   JRE/python2/ssh/php/gcc/make/node/go/telnet；
+  **2026-10-17 补齐**：`tesseract-ocr`+`eng`（验证码取字）、`feroxbuster`、`busybox-static`、
+  seclists 保留 `Discovery/DNS`（子域字典）、`kadimus`+`nomore403`（源码构建，LFI/403 绕过）、
+  `/opt/portable/{mysql,redis-cli,socat}`（自包含可搬运客户端：二进制+libs+loader，靶机缺客户端时 scp 上去 `run.sh` 即跑）；
   **版本口径**：基底按 digest 钉死、pip 精确钉版本、apt 跟 rolling 最新，全量快照在镜像内 `/opt/toolchain.lock`
   （硬钉某包照它写 `pkg=ver`）；**新增安装层自己清理 doc/man/locale**（清理层在前，之后的层会自带一批），
   且**删除只在 builder 阶段有意义**（最终阶段删 = 白花一层 whiteout，基底字节仍在 save 里）；
