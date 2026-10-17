@@ -41,7 +41,14 @@ def test_workspace_writes_task_json(tmp_path):
 
 def test_collect_prior_tolerates_missing_and_garbage(tmp_path):
     ws = prepare_workspace(tmp_path, rec(), attempt=1)
-    assert collect_prior(ws) == {"assets": [], "explored": [], "open_leads": []}
+    assert collect_prior(ws) == {
+        "assets": [],
+        "explored": [],
+        "open_leads": [],
+        "credentials": [],
+        "findings": [],
+        "history": "",
+    }
     (ws / "out" / "prior.json").write_text("not json", encoding="utf-8")
     assert collect_prior(ws)["assets"] == []
     (ws / "out" / "prior.json").write_text('{"assets": [1,2], "bogus": 3}', encoding="utf-8")
@@ -153,3 +160,24 @@ def test_windows_note(platform_guard):
 
     if platform_guard == "win32":
         assert not hasattr(os, "killpg") or os.name != "posix"
+
+
+def test_collect_prior_includes_harness_state(tmp_path):
+    """跨 attempt 记忆：solver 落盘的 harness_state.txt 必须被回收。"""
+    ws = prepare_workspace(tmp_path, rec(), attempt=1)
+    (ws / "out" / "harness_state.txt").write_text(
+        "$ curl -i http://t/ => exit_code=0 | HTTP/1.1 200", encoding="utf-8"
+    )
+    prior = collect_prior(ws)
+    assert "HTTP/1.1 200" in prior["history"]
+
+
+def test_collect_prior_includes_credentials_and_findings(tmp_path):
+    ws = prepare_workspace(tmp_path, rec(), attempt=1)
+    (ws / "out" / "prior.json").write_text(
+        '{"assets": [], "credentials": ["admin:pass"], "findings": ["nginx/1.18.0"]}',
+        encoding="utf-8",
+    )
+    prior = collect_prior(ws)
+    assert prior["credentials"] == ["admin:pass"]
+    assert prior["findings"] == ["nginx/1.18.0"]

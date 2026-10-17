@@ -14,6 +14,7 @@ stdout/stderr 全量落盘、exit code 收集。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -65,7 +66,14 @@ def prepare_workspace(
         "targets": list(rec.container_addr),
         "flag_pattern": None,  # 平台不提供；从 description 推断或靠通用正则兜底
         "attempt": attempt,
-        "prior": prior or {"assets": [], "explored": [], "open_leads": []},
+        "prior": prior
+        or {
+            "assets": [],
+            "explored": [],
+            "open_leads": [],
+            "credentials": [],
+            "findings": [],
+        },
         # harness-v2 注入位（solver 侧缺失时不使用，向后兼容）：
         "sops": list(sops or []),  # EvoSOP：库里检索出的已蒸馏 SOP 正文
         "repair": {"note": repair_note} if repair_note else {},  # EVOSTER 修复指令
@@ -77,19 +85,28 @@ def prepare_workspace(
 
 def collect_prior(ws: Path) -> dict:
     """读 out/prior.json；缺失或畸形**不是致命错误**（§2.2 末段），降级为空。"""
+    prior: dict = {
+        "assets": [],
+        "explored": [],
+        "open_leads": [],
+        "credentials": [],
+        "findings": [],
+        "history": "",
+    }
     path = ws / "out" / "prior.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
-        return {"assets": [], "explored": [], "open_leads": []}
-    if not isinstance(data, dict):
-        return {"assets": [], "explored": [], "open_leads": []}
-    out = {"assets": [], "explored": [], "open_leads": []}
-    for key in out:
-        value = data.get(key)
-        if isinstance(value, list):
-            out[key] = value
-    return out
+        data = None
+    if isinstance(data, dict):
+        for key in ("assets", "explored", "open_leads", "credentials", "findings"):
+            value = data.get(key)
+            if isinstance(value, list):
+                prior[key] = value
+    # 跨 attempt 记忆：solver 每轮落盘的命令/结果摘要，下一投不再从零开始
+    with contextlib.suppress(OSError):
+        prior["history"] = (ws / "out" / "harness_state.txt").read_text(encoding="utf-8")[:4000]
+    return prior
 
 
 # ---------------------------------------------------------------- spawn ----
