@@ -60,7 +60,6 @@ def make_handler(kind: str):
                     self._r(404, "not found")
             elif kind == "pwn":
                 if u.path == "/run":
-                    cmd = (q.get("cmd") or [""])[0]
                     self._r(
                         200,
                         f"uid=1000(agent) gid=1000\n{FLAGS['pwn_a']}\n{FLAGS['pwn_b']}\n",

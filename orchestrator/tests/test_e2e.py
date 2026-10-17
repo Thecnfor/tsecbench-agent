@@ -17,7 +17,7 @@ import pytest
 from mock_server.server import make_server
 from mock_server.state import ChallengeSpec
 from orchestrator.config import RuntimeConfig
-from orchestrator.main import run_agent
+from orchestrator.main import MAX_ATTEMPTS, run_agent
 
 TOKEN = "mock-token"
 PY = sys.executable
@@ -291,7 +291,8 @@ def test_zero_flag_timeout_triggers_repair(env_factory, tmp_path):
     # 路径由 test_repair.py::test_timeout_first_time_widens 覆盖
     assert repairs[0]["action"] == "recompile"
     durs = [e["duration_s"] for e in events if e.get("event") == "solver_done"]
-    assert len(durs) == 2 and durs[1] == durs[0]  # recompile 不放大时间片（widen 语义仅限有进展）
+    # 每次失败都重新投递，直到 MAX_ATTEMPTS；recompile 不放大时间片
+    assert len(durs) == MAX_ATTEMPTS and durs[1] == durs[0]
 
 
 # ---- 9. 绊线：整轮跑完绝不命中 hint 路由 ----

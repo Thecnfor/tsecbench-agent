@@ -37,12 +37,14 @@ class TestHarnessV2Flag:
     def test_default_off(self, monkeypatch):
         monkeypatch.delenv("HARNESS_V2", raising=False)
         from orchestrator.config import HARNESS_V2
+
         assert HARNESS_V2 is False
 
     def test_on(self, monkeypatch):
         monkeypatch.setenv("HARNESS_V2", "on")
         import importlib
         from orchestrator import config
+
         importlib.reload(config)
         assert config.HARNESS_V2 is True
 ```
@@ -108,8 +110,14 @@ git commit -m "feat(v2): HARNESS_V2 特性开关（默认 off，旁路零回归�
 import pytest
 
 from orchestrator.v2_state import (
-    DEAD_END, EXPLORED, EXPLORING, UNEXPLORED, NodeState,
-    GraphController, IllegalTransition, SlotFullError,
+    DEAD_END,
+    EXPLORED,
+    EXPLORING,
+    UNEXPLORED,
+    NodeState,
+    GraphController,
+    IllegalTransition,
+    SlotFullError,
 )
 
 
@@ -124,7 +132,9 @@ class TestTransitions:
 
     def test_dead_end_is_terminal(self):
         gc = GraphController()
-        gc.add_node("a"); gc.begin("a"); gc.timeout_node("a")
+        gc.add_node("a")
+        gc.begin("a")
+        gc.timeout_node("a")
         with pytest.raises(IllegalTransition):
             gc.begin("a")
 
@@ -135,7 +145,8 @@ class TestTransitions:
 
     def test_double_begin_rejected(self):
         gc = GraphController()
-        gc.add_node("a"); gc.begin("a")
+        gc.add_node("a")
+        gc.begin("a")
         with pytest.raises(IllegalTransition):
             gc.begin("a")
 
@@ -144,7 +155,8 @@ class TestConcurrency:
     def test_slots_exhausted(self):
         gc = GraphController(max_parallel=3)
         for k in ("a", "b", "c"):
-            gc.add_node(k); gc.begin(k)
+            gc.add_node(k)
+            gc.begin(k)
         assert gc.free_slots == 0
         gc.add_node("d")
         with pytest.raises(SlotFullError):
@@ -152,11 +164,12 @@ class TestConcurrency:
 
     def test_finish_releases_slot(self):
         gc = GraphController(max_parallel=1)
-        gc.add_node("a"); gc.begin("a")
+        gc.add_node("a")
+        gc.begin("a")
         gc.add_node("b")
         with pytest.raises(SlotFullError):
             gc.begin("b")
-        gc.finish("a", explored=False)   # 非超时失败也释放槽
+        gc.finish("a", explored=False)  # 非超时失败也释放槽
         gc.begin("b")
         assert gc.free_slots == 0
 
@@ -164,8 +177,10 @@ class TestConcurrency:
 class TestTimeoutFuse:
     def test_expired_and_force_dead_end(self):
         gc = GraphController(max_parallel=2, node_timeout_s=10)
-        gc.add_node("a"); gc.begin("a")
-        gc.add_node("b"); gc.begin("b")
+        gc.add_node("a")
+        gc.begin("a")
+        gc.add_node("b")
+        gc.begin("b")
         stale = gc.expired(now=_clock() + 11)
         assert sorted(stale) == ["a", "b"]
         for k in stale:
@@ -176,6 +191,7 @@ class TestTimeoutFuse:
 
 def _clock() -> float:
     import time
+
     return time.monotonic()
 ```
 
@@ -273,11 +289,7 @@ class GraphController:
     # -- 查询 ------------------------------------------------------------
     def expired(self, *, now: float | None = None) -> list[str]:
         now = time.monotonic() if now is None else now
-        return [
-            k
-            for k, t in self._started.items()
-            if now - t >= self.node_timeout_s
-        ]
+        return [k for k, t in self._started.items() if now - t >= self.node_timeout_s]
 
     def unexplored(self) -> list[str]:
         return [k for k, s in self._states.items() if s is UNEXPLORED]
@@ -330,6 +342,7 @@ git commit -m "feat(v2): 攻击图确定性状态机（UNEXPLORED→EXPLORING→
 class TestReadOnly:
     def test_readonly_rejects_write(self, tmp_path):
         from orchestrator.memory import AttackMemory
+
         writer = AttackMemory(tmp_path / "a.tdb")
         if not writer.available():
             pytest.skip("triviumdb not installed")
@@ -337,11 +350,13 @@ class TestReadOnly:
         ro = AttackMemory.open_readonly(tmp_path / "a.tdb")
         with pytest.raises(Exception):
             ro.record_node("child", parent="root", state="UNEXPLORED")
-        assert ro.reachable_nodes() >= 1   # 只读侧能读回
-        writer.close(); ro.close()
+        assert ro.reachable_nodes() >= 1  # 只读侧能读回
+        writer.close()
+        ro.close()
 
     def test_record_node_graph_edges(self, tmp_path):
         from orchestrator.memory import AttackMemory
+
         m = AttackMemory(tmp_path / "b.tdb")
         if not m.available():
             pytest.skip("triviumdb not installed")
@@ -361,33 +376,37 @@ Expected: AttributeError: open_readonly
 - [ ] **Step 3: 实现（memory.py 追加）**
 
 ```python
-    # ---- v2：单写多读（harness-v2-openhands.md §3）----
-    @classmethod
-    def open_readonly(cls, path: Path) -> "AttackMemory":
-        m = cls(path)
-        if m._db is not None:
-            m._db.set_readonly(True)   # 若 0.8.8 无此方法，退化为包一层写拒绝（见 record）
-        return m
+# ---- v2：单写多读（harness-v2-openhands.md §3）----
+@classmethod
+def open_readonly(cls, path: Path) -> "AttackMemory":
+    m = cls(path)
+    if m._db is not None:
+        m._db.set_readonly(True)  # 若 0.8.8 无此方法，退化为包一层写拒绝（见 record）
+    return m
 
-    def record_node(self, key: str, *, parent: str | None, state: str,
-                    directive: str = "") -> None:
-        """v2 状态机经桥接层落图的唯一入口：节点 + 父边 + 状态文本一次写。"""
-        if self._db is None:
-            return
-        if self._readonly:
-            from triviumdb import ReadOnlyError  # noqa: F401  POC 已验证该异常存在
-            raise ReadOnlyError("AttackMemory.open_readonly handle is read-only")
-        text = f"{state} {directive}".strip() or state
-        self._db.insert_with_id(_node_id(key), text,
-                                metadata={"key": key, "state": state})
-        if parent is not None:
-            self._db.link(_node_id(parent), _node_id(key))
 
-    def reachable_nodes(self) -> int:
-        if self._db is None:
-            return 0
-        return self._db.reachable(_node_id(_ROOT_SENTINEL), max_depth=99).__len__() \
-            if False else int(self._stats_nodes())
+def record_node(self, key: str, *, parent: str | None, state: str, directive: str = "") -> None:
+    """v2 状态机经桥接层落图的唯一入口：节点 + 父边 + 状态文本一次写。"""
+    if self._db is None:
+        return
+    if self._readonly:
+        from triviumdb import ReadOnlyError  # noqa: F401  POC 已验证该异常存在
+
+        raise ReadOnlyError("AttackMemory.open_readonly handle is read-only")
+    text = f"{state} {directive}".strip() or state
+    self._db.insert_with_id(_node_id(key), text, metadata={"key": key, "state": state})
+    if parent is not None:
+        self._db.link(_node_id(parent), _node_id(key))
+
+
+def reachable_nodes(self) -> int:
+    if self._db is None:
+        return 0
+    return (
+        self._db.reachable(_node_id(_ROOT_SENTINEL), max_depth=99).__len__()
+        if False
+        else int(self._stats_nodes())
+    )
 ```
 
 实现注意（写代码时以实测为准，三选一取最简可行）：
@@ -433,7 +452,11 @@ git commit -m "feat(v2): TriviumDB 单写多读 —— open_readonly + record_no
 import pytest
 
 from orchestrator.v2_bridge import (
-    Delegate, Finish, PlannerBridge, PlannerFusedOut, RejectedAction,
+    Delegate,
+    Finish,
+    PlannerBridge,
+    PlannerFusedOut,
+    RejectedAction,
 )
 from orchestrator.v2_state import GraphController
 
@@ -526,8 +549,9 @@ class PlannerFusedOut(Exception):
 
 
 class PlannerBridge:
-    def __init__(self, *, memory: AttackMemory | None,
-                 controller: GraphController, max_rejects: int = 3) -> None:
+    def __init__(
+        self, *, memory: AttackMemory | None, controller: GraphController, max_rejects: int = 3
+    ) -> None:
         self.memory = memory
         self.controller = controller
         self.max_rejects = max_rejects
@@ -536,17 +560,15 @@ class PlannerBridge:
     def handle_delegate(self, d: Delegate) -> None:
         self.controller.add_node(d.key, parent=d.parent)
         if self.memory is not None:
-            self.memory.record_node(d.key, parent=d.parent,
-                                    state=NodeState.UNEXPLORED.value,
-                                    directive=d.directive)
+            self.memory.record_node(
+                d.key, parent=d.parent, state=NodeState.UNEXPLORED.value, directive=d.directive
+            )
 
     def handle_command(self, tool_name: str, args: dict) -> None:
         del args  # 命令内容不落任何存储 —— planner 侧命令零通道
         self._rejects += 1
         if self._rejects > self.max_rejects:
-            raise PlannerFusedOut(
-                f"planner 试图执行命令 {self._rejects} 次，熔断"
-            )
+            raise PlannerFusedOut(f"planner 试图执行命令 {self._rejects} 次，熔断")
         raise RejectedAction(
             f"REJECTED: planner 不执行命令（{tool_name}），请委派 AgentDelegateAction"
         )
@@ -554,9 +576,11 @@ class PlannerBridge:
     def confirm_state(self, key: str, *, explored: bool) -> None:
         self.controller.finish(key, explored=explored)
         if self.memory is not None:
-            self.memory.record_node(key, parent=None,
-                                    state=(NodeState.EXPLORED if explored
-                                           else NodeState.DEAD_END).value)
+            self.memory.record_node(
+                key,
+                parent=None,
+                state=(NodeState.EXPLORED if explored else NodeState.DEAD_END).value,
+            )
 ```
 
 （`handle_command` 里 `raise` 后的 `PlannerFusedOut` 分支：注意顺序 —— 先计数判熔断再 raise Rejected，如上已正确。）
@@ -663,8 +687,7 @@ class VerifyReport:
 
 def _shell_alive() -> bool:
     try:
-        p = subprocess.run(["sh", "-c", "echo $RANDOM"],
-                           capture_output=True, text=True, timeout=10)
+        p = subprocess.run(["sh", "-c", "echo $RANDOM"], capture_output=True, text=True, timeout=10)
         return p.returncode == 0 and p.stdout.strip() != ""
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -725,6 +748,7 @@ git commit -m "feat(v2): 独立验证闸门 —— flag 形态复核 + shell 往
 class TestProgressiveDisclosure:
     def test_catalog_and_load(self, tmp_path):
         from orchestrator import sop
+
         base = tmp_path / "sops"
         base.mkdir()
         # 直接构造正文文件（绕过 distill，聚焦读侧）
@@ -732,8 +756,10 @@ class TestProgressiveDisclosure:
         body.write_text("第一步：探测注入点\n第二步：sqlmap 批处理\n", encoding="utf-8")
         idx = base / "index.json"
         import json
-        idx.write_text(json.dumps({"entries": [{"slug": "web-sqli", "wins": 1, "uses": 0}]}),
-                       encoding="utf-8")
+
+        idx.write_text(
+            json.dumps({"entries": [{"slug": "web-sqli", "wins": 1, "uses": 0}]}), encoding="utf-8"
+        )
         cat = sop.catalog(base)
         assert cat and cat[0][0] == "web-sqli"
         full = sop.load(base, "web-sqli")
@@ -741,14 +767,18 @@ class TestProgressiveDisclosure:
 
     def test_load_rejects_flag_body(self, tmp_path):
         from orchestrator import sop
-        base = tmp_path / "sops"; base.mkdir()
+
+        base = tmp_path / "sops"
+        base.mkdir()
         (base / "dirty.md").write_text("flag{leak}\n", encoding="utf-8")
         (base / "index.json").write_text(
-            '{"entries": [{"slug": "dirty", "wins": 1, "uses": 0}]}', encoding="utf-8")
+            '{"entries": [{"slug": "dirty", "wins": 1, "uses": 0}]}', encoding="utf-8"
+        )
         assert sop.load(base, "dirty") is None
 
     def test_load_missing_slug_none(self, tmp_path):
         from orchestrator import sop
+
         assert sop.load(tmp_path, "ghost") is None
 ```
 
@@ -852,11 +882,13 @@ class FakeRunner:
 class TestControllerLoop:
     def test_linear_chain(self):
         runner = FakeRunner()
-        planner = ScriptedPlanner([
-            Delegate(key="recon", directive="d1"),
-            Delegate(key="probe", directive="d2", parent="recon"),
-            Finish("done"),
-        ])
+        planner = ScriptedPlanner(
+            [
+                Delegate(key="recon", directive="d1"),
+                Delegate(key="probe", directive="d2", parent="recon"),
+                Finish("done"),
+            ]
+        )
         ctl = V2Controller(runner=runner, max_parallel=3, node_timeout_s=900)
         asyncio.run(ctl.run_for_test(planner=planner))
         assert runner.ran == ["recon", "probe"]
@@ -867,10 +899,12 @@ class TestControllerLoop:
                 await asyncio.sleep(0.05)
                 return ("timeout", 1, False)
 
-        planner = ScriptedPlanner([
-            Delegate(key="a", directive="x"),
-            Delegate(key="b", directive="y"),
-        ])
+        planner = ScriptedPlanner(
+            [
+                Delegate(key="a", directive="x"),
+                Delegate(key="b", directive="y"),
+            ]
+        )
         ctl = V2Controller(runner=TimeoutRunner(), max_parallel=1, node_timeout_s=0.01)
         asyncio.run(ctl.run_for_test(planner=planner))
         states = {k: v["state"] for k, v in ctl.controller.snapshot().items()}
@@ -914,11 +948,12 @@ class StubPlanner:
 
 
 class V2Controller:
-    def __init__(self, *, runner, max_parallel: int = 3,
-                 node_timeout_s: float = 900.0, memory=None) -> None:
+    def __init__(
+        self, *, runner, max_parallel: int = 3, node_timeout_s: float = 900.0, memory=None
+    ) -> None:
         from .v2_state import GraphController
-        self.controller = GraphController(max_parallel=max_parallel,
-                                          node_timeout_s=node_timeout_s)
+
+        self.controller = GraphController(max_parallel=max_parallel, node_timeout_s=node_timeout_s)
         self.bridge = PlannerBridge(memory=memory, controller=self.controller)
         self.runner = runner
 
@@ -934,7 +969,8 @@ class V2Controller:
                 # 空槽 + planner 决策
                 while self.controller.free_slots > 0:
                     action = await loop.run_in_executor(
-                        None, planner.next_action, self.controller.snapshot())
+                        None, planner.next_action, self.controller.snapshot()
+                    )
                     if isinstance(action, Finish):
                         return
                     self.bridge.handle_delegate(action)
@@ -944,8 +980,8 @@ class V2Controller:
                     await asyncio.sleep(poll_interval)
                     continue
                 done, _ = await asyncio.wait(
-                    running.values(), timeout=poll_interval,
-                    return_when=asyncio.FIRST_COMPLETED)
+                    running.values(), timeout=poll_interval, return_when=asyncio.FIRST_COMPLETED
+                )
                 for t in done:
                     key = next(k for k, task in running.items() if task is t)
                     explored = bool(t.result() and t.result()[2])
@@ -1026,6 +1062,7 @@ class TestV2EndToEnd:
         class Scripted:
             def __init__(self):
                 self.n = 0
+
             def next_action(self, snapshot):
                 self.n += 1
                 if self.n == 1:
