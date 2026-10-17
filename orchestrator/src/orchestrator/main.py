@@ -68,7 +68,7 @@ AVAILABLE_POLL_MAX_S = 2.0
 AVAILABLE_POLL_GROWTH = 1.6
 # 失败重投上限：难题常需要多轮换策略（实测 60 轮/2 次投递会过早放弃）。
 # 可经 MAX_ATTEMPTS 覆盖；调度器的 attempts 惩罚会自然把重投题排到队尾。
-MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS") or "3")
 
 
 @dataclass(slots=True)

@@ -154,6 +154,14 @@ def _structured_tool_message(
         label=f"turn{turn}-{tool}",
         turn_budget_left=turn_budget_left,
     )
+    known = result.get("known_issues") or []
+    prefix = ""
+    if known:
+        prefix = (
+            "KNOWN ISSUES (offline KB — apply first): "
+            + " | ".join(str(item)[:120] for item in known[:4])
+            + "\n"
+        )
     for flag in find_flags(raw_text):
         report_candidate(flag)
     remaining = common.remaining_seconds()
@@ -161,8 +169,8 @@ def _structured_tool_message(
     return {
         "role": "tool",
         "tool_call_id": call.id,
-        "content": f"[{tool}{note}]\n{text}",
-    }, len(text)
+        "content": f"[{tool}{note}]\n{prefix}{text}",
+    }, len(text) + len(prefix)
 
 
 # --------------------------------------------------------------------- main ---

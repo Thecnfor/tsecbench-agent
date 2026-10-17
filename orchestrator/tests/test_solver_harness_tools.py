@@ -402,3 +402,26 @@ def test_structured_tool_descriptions_teach_when_to_use(common):
     }
     assert "first" in specs["recon"].lower()
     assert "stuck" in specs["kb"].lower() or "before" in specs["kb"].lower()
+
+
+def test_host_recon_auto_fingerprints_http_and_lists_known_issues(common, monkeypatch):
+    fake = types.SimpleNamespace(
+        recon_host=lambda target: {"target": target, "open_ports": ["3000"]},
+        recon_web=lambda url: {"url": url, "title": "Dify", "tech": ["next.js"]},
+        derive_web_url=lambda target, ports: "http://x:3000/",
+    )
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    monkeypatch.setattr(
+        common,
+        "kb_snippets",
+        lambda query, top_k=3: "## KB: Dify console api\npayload\n## KB: next.js RSC\npayload",
+    )
+    monkeypatch.setattr(common, "_AUTO_PROBED", set())
+    monkeypatch.setattr(
+        common,
+        "run_command",
+        lambda cmd, timeout: {"output": "", "exit_code": 0, "seconds": 0.0, "timed_out": False},
+    )
+    out = common.run_recon({"mode": "host", "target": "x"})
+    assert out["web"]["title"] == "Dify"
+    assert any("Dify" in item for item in out["known_issues"])

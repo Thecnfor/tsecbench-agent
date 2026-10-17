@@ -471,6 +471,9 @@ def _with_kb(result: dict) -> dict:
     hits = kb_snippets(query, top_k=2)
     if hits:
         result["kb"] = hits[:4000]
+        known = [line.strip() for line in hits.splitlines() if line.startswith("## KB:")][:5]
+        if known:
+            result["known_issues"] = known
     try:
         import playbooks
 
@@ -521,7 +524,15 @@ def run_recon(args: dict) -> dict:
         if mode == "host":
             if not target:
                 return {"error": "target required for mode=host"}
-            return _with_kb({"host": recon_recipe.recon_host(target)})
+            host = recon_recipe.recon_host(target)
+            result: dict = {"host": host}
+            # host-only 会漏掉 title/tech，KB 就只能按泛化描述检索。HTTP 端口
+            # 开放时自动补一次 web 指纹，让 Dify/Gitea/Flask 等产品命中 wiki。
+            web_url = url or recon_recipe.derive_web_url(target, host.get("open_ports") or [])
+            if web_url:
+                with contextlib.suppress(Exception):
+                    result["web"] = recon_recipe.recon_web(web_url)
+            return _with_kb(result)
         if mode == "web":
             if not url and target.startswith(("http://", "https://")):
                 url = target
