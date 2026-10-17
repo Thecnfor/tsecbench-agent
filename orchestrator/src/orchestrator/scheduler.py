@@ -106,9 +106,11 @@ def slice_for(
     return max(floor, min(slice_max_s, base_slice * slice_weight(rec)))
 
 
-def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
+def priority_key(rec: ChallengeRecord) -> tuple[int, int, float, int, str]:
     """排序键（§4.2，从高到低）：
 
+    0. 零进展 pass 数 > 0 的题整体沉底（槽位经济学，对齐 CyberPenda）：
+       「从未开过 / 还剩 flag」的题都试完之前，不再给零进展题补位。
     1. is_completed == false（已通关直接跳过，在 eligible 里已过滤）
     2. 不在 LOCKED 集合（locked 在 eligible 已过滤）
     3. 性价比 = 剩余可得分数 / 预估成本（降序 → 取负）
@@ -120,11 +122,17 @@ def priority_key(rec: ChallengeRecord) -> tuple[float, int, int, str]:
     # 已尝试过的题按 attempts 降权（最多 +2）：被 probe_stop/超时反复打断的
     # “伪 easy”题不再长期霸占槽，未跑过的 medium/hard 可以排到它们前面。
     rank = DIFFICULTY_RANK.get(rec.difficulty, 1) + min(rec.attempts, 2)
-    return (rank, -value, rec.level, rec.unique_code)
+    zero = 0 if rec.zero_progress_passes == 0 else 1
+    return (zero, rank, -value, rec.level, rec.unique_code)
 
 
 def eligible(records: dict[str, ChallengeRecord]) -> list[ChallengeRecord]:
-    """可启动的题：未通关、未 LOCKED、不在终态、本地无活跃容器。"""
+    """可启动的题：未通关、未 LOCKED、不在终态、本地无活跃容器。
+
+    零进展止损：只要还有非零进展（未开过 / 有过事实或 flag）的候选，
+    零进展题就不补位。全部候选都是零进展时才允许重投 —— 空槽优于
+    把同一个失败 pass 再填进配额。
+    """
     out = []
     for rec in records.values():
         if rec.is_completed or rec.locked:
@@ -136,6 +144,9 @@ def eligible(records: dict[str, ChallengeRecord]) -> list[ChallengeRecord]:
         if rec.state in ("STARTING", "POLLING", "SOLVING", "HARVESTING", "SUBMITTING"):
             continue  # 已在途
         out.append(rec)
+    fresh = [rec for rec in out if rec.zero_progress_passes == 0]
+    if fresh and len(fresh) != len(out):
+        out = fresh
     return sorted(out, key=priority_key)
 
 

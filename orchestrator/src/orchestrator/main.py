@@ -222,6 +222,14 @@ def _merge_prior(old: dict | None, new: dict) -> dict:
     # 跨 attempt 的 harness 状态：优先最新一轮（solver 每轮覆盖落盘）
     history = str((new or {}).get("history") or (old or {}).get("history") or "")
     merged["history"] = history[-4000:]
+    old_obs = (old or {}).get("observer")
+    if isinstance(old_obs, dict) and old_obs:
+        merged["observer"] = old_obs
+    new_obs = (new or {}).get("observer")
+    if isinstance(new_obs, dict) and new_obs:
+        old_rev = int(old_obs.get("revision") or 0) if isinstance(old_obs, dict) else -1
+        if int(new_obs.get("revision") or 0) >= old_rev:
+            merged["observer"] = new_obs
     return merged
 
 
@@ -340,6 +348,21 @@ def _probe_decision(stage: int, has_progress: bool, high_value: bool, remaining_
     return "full"
 
 
+def _v2_enabled_for(code: str) -> bool:
+    """v2 灰度：HARNESS_V2 总闸 + 可选 V2_CODES 白名单（逗号分隔）。
+
+    白名单存在时只有列出的题走 v2，其余题保持原串行路径 —— 可以在真实
+    跑分里只灰度一道 hard/多阶段题，异常时清空白名单即可回退。
+    """
+    if not config_module.HARNESS_V2:
+        return False
+    raw = os.environ.get("V2_CODES", "").strip()
+    if not raw:
+        return True
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return code in allowed
+
+
 def _active_slots(ctx: RunContext) -> int:
     """并发槽真值 = 在飞 pipeline 数。
 
@@ -426,16 +449,27 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     solver_started = time.monotonic()
     slice_count = 0
     try:
-        if config_module.HARNESS_V2:
+        if _v2_enabled_for(code):
             from types import SimpleNamespace
 
-            from .v2_controller import StagePlanner, V2Controller
+            from .v2_controller import StagePlanner, SurfacePlanner, V2Controller
 
             v2_started = time.monotonic()
-            planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
+            surfaces = os.environ.get("V2_SURFACES", "").strip().lower() in (
+                "1",
+                "on",
+                "true",
+                "yes",
+            )
+            if surfaces:
+                planner = SurfacePlanner()
+                max_parallel = 2
+            else:
+                planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
+                max_parallel = min(3, ctx.config.concurrency_limit)
             controller = V2Controller(
                 runner=None,
-                max_parallel=min(3, ctx.config.concurrency_limit),
+                max_parallel=max_parallel,
                 node_timeout_s=max(60.0, slice_s),
             )
             await controller.run_task(
@@ -531,6 +565,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         unique_code=code,
         exit_code=outcome.exit_code,
         timed_out=outcome.timed_out,
+        stalled=outcome.stalled,
         duration_s=round(time.monotonic() - solver_started, 1),
         slices=slice_count,
     )
@@ -557,6 +592,20 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         # 也会 409）。降级为关题重排队；token 真死由下一轮 _safe_list 兜底。
         ctx.journal.append("submit_rejected", unique_code=code)
         report.task_ended = False
+
+    # 槽位经济学：pass 级进展信号。无新 flag 且无新事实 → 零进展次数 +1，
+    # 调度器会把该题沉底并停止补位；一旦出现事实/flag 则清零。
+    pass_progress = bool(report.new_matches or early_new) or _slice_has_progress(ws)
+    if pass_progress:
+        rec.zero_progress_passes = 0
+    elif not (rec.is_completed or report.completed or early_completed):
+        rec.zero_progress_passes += 1
+        ctx.journal.append(
+            "zero_progress_pass",
+            unique_code=code,
+            count=rec.zero_progress_passes,
+        )
+
     if report.new_matches or early_new:
         # EVOSTER 锚定（§5）：上一轮修复动作命中 → 权重 +25%
         last = ctx.last_repair.get(code)

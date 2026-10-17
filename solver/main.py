@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 import common
+import reflect
 import state
 from common import (  # 函数引用安全：内部读 common 自身全局，转发无陈旧问题
     build_system_prompt,
@@ -199,6 +200,7 @@ def main() -> int:
     client = OpenAI(api_key=API_KEY, base_url=common.BASE_URL, timeout=180.0, max_retries=2)
 
     tools = common.build_tool_specs()
+    out_dir = Path(common.SOLVER_TASK_PATH).parent / "out" if common.SOLVER_TASK_PATH else None
 
     messages: list[dict] = [
         {"role": "system", "content": build_system_prompt()},
@@ -232,6 +234,7 @@ def main() -> int:
     last_fact_turn = 0
     fact_nudged = False
     no_fact_nudges = 0
+    reflects = 0
     consecutive_errors = 0
     overflow_recoveries = 0
     turn = 0
@@ -461,21 +464,43 @@ def main() -> int:
                     flush=True,
                 )
                 break
-            print(
-                f"[solver] no new facts for {factless_turns} turns; switching surface",
-                flush=True,
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"No new asset/credential/endpoint in the last {factless_turns} turns. "
-                        "This surface looks exhausted: switch to the next candidate from the "
-                        "FAST PATH/KB, or stop and report your best hypothesis. Do not repeat "
-                        "the same request shape."
-                    ),
-                }
-            )
+            remaining = common.remaining_seconds()
+            obs = None
+            if reflect.should_reflect(reflects=reflects, remaining_s=remaining):
+                obs = reflect.observe(
+                    client,
+                    common.MODEL,
+                    getattr(common, "TASK", {}) or {},
+                    messages,
+                    sorted(common._reported),
+                    remaining,
+                )
+            if obs:
+                reflects += 1
+                if out_dir is not None:
+                    reflect.save(out_dir, obs)
+                display = obs.get("lock") or (obs.get("angles") or [""])[0]
+                print(
+                    f"[solver] observer reflection #{reflects}: {display[:100]}",
+                    flush=True,
+                )
+                messages.append({"role": "user", "content": reflect.render(obs)})
+            else:
+                print(
+                    f"[solver] no new facts for {factless_turns} turns; switching surface",
+                    flush=True,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"No new asset/credential/endpoint in the last {factless_turns} turns. "
+                            "This surface looks exhausted: switch to the next candidate from the "
+                            "FAST PATH/KB, or stop and report your best hypothesis. Do not repeat "
+                            "the same request shape."
+                        ),
+                    }
+                )
         if turn >= common.MAX_TURNS_NO_FLAG and not common._reported:
             print(f"[solver] turn cap without flag ({turn}); stopping", flush=True)
             break

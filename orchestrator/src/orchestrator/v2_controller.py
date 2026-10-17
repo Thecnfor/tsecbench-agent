@@ -86,6 +86,58 @@ class StagePlanner:
         return Finish("all stages explored")
 
 
+SURFACE_DIRECTIVES = {
+    "probe-web": "Focus only on the web/application surface: routes, parameters, auth and "
+    "session logic, injection, SSRF, upload, deserialization. Do not brute-force credentials.",
+    "probe-creds": "Focus only on credential discovery and reuse: leaked secrets, weak/default "
+    "logins, config/backup files, DB or admin panels, and lateral movement with any credential. "
+    "Do not repeat web injection testing.",
+    "exploit": "Use the strongest confirmed lead from prior assets/credentials; weaponize it "
+    "to obtain the flag(s). Do not re-run broad recon.",
+}
+
+
+class SurfacePlanner:
+    """单题双攻击面 planner：recon 串行 → 两个互斥 probe 并行 → exploit。
+
+    与 StagePlanner 的区别只在 probe 段：两个 probe 节点同时占用并发槽
+    （GraphController max_parallel>=2），各自在 node-* 子目录独立求解，
+    完成后 prior 合并给 exploit。父阶段失败仍视为终态，不会卡死整链。
+    """
+
+    def __init__(
+        self,
+        *,
+        probes: tuple[str, ...] = ("probe-web", "probe-creds"),
+        directives: dict[str, str] | None = None,
+    ) -> None:
+        self.probes = list(probes)
+        self.directives = {
+            **STAGE_DIRECTIVES,
+            **SURFACE_DIRECTIVES,
+            **(directives or {}),
+        }
+
+    def next_action(self, snapshot: dict) -> Delegate | Finish | Wait:
+        recon = snapshot.get("recon")
+        if recon is None or _state_name(recon) == "UNEXPLORED":
+            return Delegate("recon", self.directives["recon"], None)
+        if _state_name(recon) not in _TERMINAL_STATES:
+            return Wait("recon not finished")
+        for key in self.probes:
+            info = snapshot.get(key)
+            if info is None or _state_name(info) == "UNEXPLORED":
+                return Delegate(key, self.directives[key], parent="recon")
+        if any(_state_name(snapshot.get(key)) not in _TERMINAL_STATES for key in self.probes):
+            return Wait("probes not finished")
+        exploit = snapshot.get("exploit")
+        if exploit is None or _state_name(exploit) == "UNEXPLORED":
+            return Delegate("exploit", self.directives["exploit"], parent=self.probes[0])
+        if _state_name(exploit) not in _TERMINAL_STATES:
+            return Wait("exploit not finished")
+        return Finish("surfaces explored")
+
+
 _PRIOR_LOCKS: dict[str, threading.Lock] = {}
 _PRIOR_LOCKS_GUARD = threading.Lock()
 

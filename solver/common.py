@@ -1348,6 +1348,23 @@ def setup_orch_mode() -> None:
         items = prior.get(key) or []
         if items:
             parts.append(render_prior_items(title, items, limit=limits[key]))
+    observer = prior.get("observer")
+    if isinstance(observer, dict) and observer:
+        lines = ["# OBSERVER (advisory; new evidence beats this)"]
+        if observer.get("hypothesis"):
+            lines.append(f"HYPOTHESIS: {observer['hypothesis']}")
+        if observer.get("confirmed"):
+            lines.append("CONFIRMED:")
+            lines.extend(f"- {item}" for item in observer["confirmed"][:6])
+        if observer.get("lock"):
+            lines.append(f"LOCK: {observer['lock']}")
+        if observer.get("angles"):
+            lines.append("ANGLES:")
+            lines.extend(f"- {item}" for item in observer["angles"][:5])
+        if observer.get("tension"):
+            lines.append("TENSION:")
+            lines.extend(f"- {item}" for item in observer["tension"][:2])
+        parts.append("\n".join(lines))
     history = str(prior.get("history") or "").strip()
     if history:
         # relay 已给出 worked/failed 摘要时，history 只留最近一小段，

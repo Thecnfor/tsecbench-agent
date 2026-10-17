@@ -36,6 +36,7 @@ class SolverOutcome:
     duration_s: float
     stdout_path: Path
     stderr_path: Path
+    stalled: bool = False  # 停滞看门狗：进程活着但长时间无输出/无新产物
 
 
 # ---------------------------------------------------------------- workspace ----
@@ -121,6 +122,12 @@ def _merge_prior(base: dict, extra: dict) -> dict:
     history = "\n".join(part for part in histories if part)
     if history:
         merged["history"] = history[-4000:]
+    new_obs = (extra or {}).get("observer")
+    if isinstance(new_obs, dict) and new_obs:
+        old_obs = (base or {}).get("observer")
+        old_rev = int(old_obs.get("revision") or 0) if isinstance(old_obs, dict) else -1
+        if int(new_obs.get("revision") or 0) >= old_rev:
+            merged["observer"] = new_obs
     return merged
 
 
@@ -181,6 +188,17 @@ def collect_prior(ws: Path) -> dict:
     # 跨 attempt 记忆：solver 每轮落盘的命令/结果摘要，下一投不再从零开始
     with contextlib.suppress(OSError):
         prior["history"] = (ws / "out" / "harness_state.txt").read_text(encoding="utf-8")[:4000]
+    # Observer-lite：卡住时的一次反思，跨切片/跨 attempt 注入下一轮 system
+    try:
+        obs = json.loads((ws / "out" / "observer.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        obs = None
+    if isinstance(obs, dict):
+        prior["observer"] = {
+            key: obs.get(key)
+            for key in ("revision", "hypothesis", "lock", "confirmed", "angles", "tension")
+            if obs.get(key)
+        }
     return prior
 
 
