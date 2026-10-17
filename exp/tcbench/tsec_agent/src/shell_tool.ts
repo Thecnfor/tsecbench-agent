@@ -24,6 +24,10 @@ export const SHELL_TOOL_SCHEMA = {
       "the output survives kills and you can tail it. Jobs are killed at the hard " +
       "limit (default 1800s); kill sooner if stuck — output stays on disk. Max 8 " +
       "concurrent jobs (new run is rejected until you wait/kill). " +
+      "Multiple shell calls in ONE assistant message run in parallel (no ordering " +
+      "between them — merge dependent steps into a single command). Pass `label` " +
+      'to name a job semantically (e.g. "oa-brute"); labels show in list/status ' +
+      "and can replace job_id in wait/status/kill when unique. " +
       "Multimodal: to look at an image (screenshot, chart, captcha, photo) call " +
       "action=view with path — the picture itself is returned to you, so you can " +
       "read/understand it directly; if the gateway rejects images it degrades to " +
@@ -44,6 +48,13 @@ export const SHELL_TOOL_SCHEMA = {
             "view=show an image to yourself (multimodal)",
         },
         command: { type: "string", description: "shell command (action=run)" },
+        label: {
+          type: "string",
+          description:
+            "action=run: short semantic name for this job (shown in list/status/wait " +
+            'as label=..., e.g. "oa-brute"), also usable as job_id in ' +
+            "wait/status/kill when no other running job shares the name",
+        },
         path: {
           type: "string",
           description: "image file path (action=view), absolute or relative to cwd",
@@ -293,6 +304,7 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
       }
       const out = await SHELL.run({
         command: String(command),
+        label: (args.label as string) ?? null,
         cwd: (args.cwd as string) ?? null,
         timeout: toFloat(args.timeout_sec, null), // 缺省→配置默认 1800s
         wait_ms: toInt(args.wait_ms),

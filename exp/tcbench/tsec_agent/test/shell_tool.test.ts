@@ -71,6 +71,33 @@ describe("shell：边沿等待 / 分页 / 落盘 / job 上限", () => {
       CFG.shell_max_jobs = old;
     }
   }, 30_000);
+
+  it("label 语义名：list/status 显示，wait 可按名指认，重名报错", async () => {
+    setTaskCwd(w);
+    const p = await SHELL.run({
+      command: "echo labeled; sleep 0.3",
+      label: "oa-brute",
+      wait_ms: 0,
+      wait_sec: 3,
+    });
+    const jid = jobIdOf(p);
+    expect(p).toContain("label=oa-brute");
+    // wait/status/kill 按 label 寻址（唯一同名）
+    const byLabel = String(await dispatchShell({ action: "wait", job_id: "oa-brute" }));
+    expect(byLabel).toContain(`[job ${jid}]`);
+    expect(byLabel).toContain("labeled");
+    expect(String(SHELL.status("oa-brute"))).toContain("label=oa-brute");
+    // list 显示 label
+    expect(String(await dispatchShell({ action: "list" }))).toContain("label=oa-brute");
+    // 重名 label：寻址报错（但 run 本身不拒绝）
+    const d1 = jobIdOf(String(await SHELL.run({ command: "sleep 5", label: "dup", wait_ms: 0 })));
+    const d2 = jobIdOf(String(await SHELL.run({ command: "sleep 5", label: "dup", wait_ms: 0 })));
+    const dup = String(await dispatchShell({ action: "status", job_id: "dup" }));
+    expect(dup).toContain("对应多个 job");
+    await SHELL.kill(jid);
+    await SHELL.kill(d1);
+    await SHELL.kill(d2);
+  }, 30_000);
 });
 
 describe("多模态 action=view", () => {

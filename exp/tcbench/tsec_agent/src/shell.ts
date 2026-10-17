@@ -31,6 +31,8 @@ export function getTaskCwd(): string | null {
 
 export class Job {
   jobId: string;
+  /** 模型给 job 起的语义名（如 "oa-brute"）：list/status 显示，wait/status/kill 也可按名指认。 */
+  label: string;
   command: string;
   cwd: string;
   child: ChildProcess;
@@ -44,6 +46,7 @@ export class Job {
 
   constructor(init: {
     jobId: string;
+    label?: string | null;
     command: string;
     cwd: string;
     child: ChildProcess;
@@ -51,6 +54,7 @@ export class Job {
     timeout: number | null;
   }) {
     this.jobId = init.jobId;
+    this.label = init.label ?? "";
     this.command = init.command;
     this.cwd = init.cwd;
     this.child = init.child;
@@ -246,6 +250,7 @@ export class ShellManager {
   // ---- 动作：启动（后台） ----
   async run(opts: {
     command: string;
+    label?: string | null;
     cwd?: string | null;
     timeout?: number | null;
     wait_ms?: number | null;
@@ -253,6 +258,11 @@ export class ShellManager {
     out_file?: string | null;
   }): Promise<string> {
     const { command } = opts;
+    // 语义名：单行、截 48 字符——只用于识别/显示，不参与寻址歧义之外的逻辑
+    const label = String(opts.label ?? "")
+      .replace(/[\r\n\t]+/g, " ")
+      .trim()
+      .slice(0, 48);
     let cwd = opts.cwd || getTaskCwd() || this.cwd;
     if (!isDir(cwd)) {
       try {
@@ -311,7 +321,7 @@ export class ShellManager {
       return `error: failed to start command: ${e instanceof Error ? e.message : e}`;
     }
 
-    const job = new Job({ jobId, command, cwd, child, outPath, timeout });
+    const job = new Job({ jobId, label, command, cwd, child, outPath, timeout });
     this.jobs.set(jobId, job);
 
     // 小窗口同步等待：快速命令直接带完整输出返回，减少一轮交互
@@ -329,7 +339,7 @@ export class ShellManager {
     const payload = this.statusPayload(job);
     const others = [...this.jobs.values()]
       .filter((j) => !j.finished && j.jobId !== job.jobId)
-      .map((j) => j.jobId);
+      .map((j) => (j.label ? `${j.jobId}(${j.label})` : j.jobId));
     const extra: string[] = [];
     if (others.length) {
       extra.push(
@@ -352,7 +362,7 @@ export class ShellManager {
     lines?: number | null,
   ): Promise<string> {
     const job = this.get(jobId);
-    if (!job) return `error: unknown job_id ${jobId}`;
+    if (!job) return this.unknownJobMsg(jobId);
     const deadline = Date.now() + Math.max(0, Math.min(timeout, 300)) * 1000;
     const base = offset !== null && offset !== undefined ? Math.trunc(offset) : job.size();
     while (!job.finished && Date.now() < deadline) {
@@ -392,7 +402,7 @@ export class ShellManager {
   // ---- 动作：查看状态/输出（不阻塞，支持分页） ----
   status(jobId: string, offset?: number | null, lines?: number | null): string {
     const job = this.get(jobId);
-    if (!job) return `error: unknown job_id ${jobId}`;
+    if (!job) return this.unknownJobMsg(jobId);
     return this.statusPayload(job, offset, lines);
   }
 
@@ -406,8 +416,9 @@ export class ShellManager {
         ? `done rc=${j.exitCode}`
         : `RUN ${Math.trunc(Date.now() / 1000 - j.startedAt)}s/${Math.trunc(j.timeout ?? 0)}s`;
       const mark = j.finished ? " " : "*";
+      const label = j.label ? ` label=${j.label}` : "";
       lines.push(
-        `${mark}${j.jobId}  ${state.padEnd(16)} out=${String(j.size()).padStart(8)}B  ` +
+        `${mark}${j.jobId}${label}  ${state.padEnd(16)} out=${String(j.size()).padStart(8)}B  ` +
           `${j.command.slice(0, 72)}`,
       );
     }
@@ -421,7 +432,7 @@ export class ShellManager {
   // ---- 动作：杀掉 ----
   async kill(jobId: string, lines?: number | null): Promise<string> {
     const job = this.get(jobId);
-    if (!job) return `error: unknown job_id ${jobId}`;
+    if (!job) return this.unknownJobMsg(jobId);
     job.kill("user");
     await sleep(200);
     const payload = this.statusPayload(job, undefined, lines ?? 40);
@@ -501,8 +512,24 @@ export class ShellManager {
     ];
   }
 
-  private get(jobId: string): Job | undefined {
-    return this.jobs.get(jobId);
+  private get(key: string): Job | undefined {
+    const byId = this.jobs.get(key);
+    if (byId) return byId;
+    // label 兜底寻址：唯一同名 job 可直接用语义名指认（重名 → undefined，见 unknownJobMsg）
+    const hits = [...this.jobs.values()].filter((j) => j.label !== "" && j.label === key);
+    return hits.length === 1 ? hits[0] : undefined;
+  }
+
+  /** 找不到 job 时的错误文案：label 重名要提示用 job_id，纯未知给通用文案。 */
+  private unknownJobMsg(key: string): string {
+    const hits = [...this.jobs.values()].filter((j) => j.label !== "" && j.label === key);
+    if (hits.length > 1) {
+      return (
+        `error: label ${JSON.stringify(key)} 对应多个 job (${hits.map((j) => j.jobId).join(", ")})：` +
+        `请改用 job_id，或给 job 换个不重名的 label`
+      );
+    }
+    return `error: unknown job_id/label ${key}`;
   }
 
   /** 读输出分页：offset 给定 → 从该字节续读；否则 → 末尾 N 行（默认 200）。 */
@@ -557,8 +584,10 @@ export class ShellManager {
       job.command.length > 600
         ? `${job.command.slice(0, 600)} …[命令超长已截，全文见 tool_calls]`
         : job.command;
+    const label = job.label ? ` label=${job.label}` : "";
     const header =
-      `[job ${job.jobId}] ${state} out=${job.size()}B\n` + `log: ${job.outPath}\ncmd: ${cmd}`;
+      `[job ${job.jobId}]${label} ${state} out=${job.size()}B\n` +
+      `log: ${job.outPath}\ncmd: ${cmd}`;
     if (!page) return `${header}\noutput: (empty)`;
     const pos = offset !== null && offset !== undefined ? `from_offset=${offset}` : "tail";
     const tail = `\nnext_offset=${nxt}${more ? ` ${more}` : ""}`;

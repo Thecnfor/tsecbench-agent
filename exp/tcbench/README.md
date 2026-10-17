@@ -110,9 +110,11 @@
 │    model: deepseek-flash                                             │
 │    gateway: http://api.deepseek.com.tsecbench.gw/v1（OpenAI 兼容）│
 │    tools: 仅 shell（异步 background），无 MCP、无 subagent         │
-│      └─ run: 后台启动返回 job_id（1.5s 快速窗口，可带 wait_sec）     │
+│      └─ run: 后台启动返回 job_id（1.5s 快速窗口，可带 wait_sec/label）  │
+│         同轮多 tool_call 并发派发（有依赖的命令并进同一条）              │
 │         wait / wait_any / status / kill / list：边沿等待+分页读        │
-│         （offset/lines），输出可 out_file 落盘，1800s 硬上限才 kill   │
+│         （offset/lines），可按 label 寻址；输出可 out_file 落盘，       │
+│         1800s 硬上限才 kill                                            │
 │                                                                   │
 │  预装工具：nmap masscan whatweb sqlmap gobuster ffuf nikto dirb   │
 │            hydra netcat dig tcpdump python3(含 requests) ...      │

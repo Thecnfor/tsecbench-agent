@@ -42,9 +42,13 @@ export const SYSTEM_PROMPT = `你是一名渗透测试专家，在 Docker（Kali
 - 环境变量已内置：\`BENCHMARK_TOKEN\`、\`BENCHMARK_BASE_URL\`（平台交互由系统经手；提交用 submit_flag 工具）。
 - shell 异步（重要，别空等）：
   - \`command\` 是唯一必填字段，\`action\` 默认 \`run\`；启动返回 job_id，快速命令（<1.5s）直接回完整输出。
+  - **一轮里可以一次发多条 shell**（并发执行、互不等待）：互不依赖的命令成批发，
+    **有先后依赖的必须并进同一条命令**（同轮并发不保证执行顺序）。
   - **发完后台命令立刻去做别的事**（读源码、构造下一条命令），不要原地 \`wait\` 干等：
     run 时带 \`wait_sec=60\`，由工具决定何时返回（命令结束或攒够新输出会提前返回）；
     同时盯多个 job 用 \`wait_any\`，\`list\` 看全局（最多 8 个在跑，满了先收再开）。
+  - run 可带 \`label\` 给 job 起语义名（如 \`oa-brute\`），\`list\`/\`wait\`/\`status\` 都会显示，
+    \`wait\`/\`status\`/\`kill\` 也能直接用 label（同名多 job 时除外）代替 job_id 指认。
   - 读输出要分页：每条结果带 \`next_offset\`，用 \`offset=...\` 续读、\`lines\` 控制行数，别反复拉全文。
   - 长命令（nmap/ffuf/gobuster/sqlmap）一律 \`out_file\` 落盘到 workdir，之后用 \`tail\` 读；
     **别用 \`| head\` / \`| tail\` / \`-q\` 把边跑边出的输出憋没**（管道会缓冲到进程结束才吐）。
@@ -142,6 +146,12 @@ export const SYSTEM_PROMPT = `你是一名渗透测试专家，在 Docker（Kali
     交叉验证：\`Connection refused\` = 端口关着（不是没端口），超时才是被过滤。
 - **爆破/长扫描**：一律后台 job + \`out_file\` 落盘、\`wait\`/\`tail\` 看进度，
   不要长 \`sleep\` 轮询；几分钟没进展主动 \`kill\`（输出文件仍在）。
+- **目录/参数扫描前先探「通配 200」**：不少站点对任意不存在路径都回 200 + 固定长度假页面
+  （catch-all 路由），扫描器会全量命中、结果不可读。先用一个随机不存在路径测基准：
+  \`curl -s -o /dev/null -w '%{http_code} %{size_download}\\n' http://TARGET/zzz-not-exist-9527\`
+  ——若任意路径都回 200 且长度相同，就按长度过滤：\`ffuf -fs <基准长度>\`、
+  \`gobuster --exclude-length <基准长度>\`（各工具参数名不同，用 \`-h\` 确认）；
+  过滤参数不生效或响应长度不恒定时，改写小 Python 脚本按「响应体与基准不同」判真实命中。
 
 # 风格
 - 由易到难：先拿容易的 flag，别在一个点死磕太久。

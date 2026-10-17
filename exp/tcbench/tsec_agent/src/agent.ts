@@ -953,32 +953,100 @@ export async function solveTask(
     }
 
     const pendingForks: PendingFork[] = [];
-    for (const tc of toolCallsRaw) {
-      let args: Record<string, unknown> = {};
+    // 阶段1：同轮多个 tool_call 并发派发——shell 的 wait 窗口、submit 的网络往返同时起跑，
+    // 不再互相排队；分支/未知工具是同步的，留到阶段2按原序执行。
+    // done 一律用 settled 包装（{value}|{error}），避免阶段2收割前触发 unhandledRejection。
+    type PreparedCall = {
+      tc: (typeof toolCallsRaw)[number];
+      args: Record<string, unknown>;
+      fix: string | null;
+      parseError: string | null;
+      submitFlag: string | null;
+      startedAt: number;
+      done?: Promise<{ value?: unknown; error?: unknown }>;
+    };
+    const prepared: PreparedCall[] = toolCallsRaw.map((tc) => {
       const rawArgs = tc.function.arguments || "{}";
-      const tToolStart = nowSec();
-      let result: unknown;
+      const base: PreparedCall = {
+        tc,
+        args: {},
+        fix: null,
+        parseError: null,
+        submitFlag: null,
+        startedAt: nowSec(),
+      };
       if (tc.function.name === "shell") {
         const [parsed, fix] = parseToolArguments(rawArgs);
         if (parsed === null) {
-          result = `error: ${fix || "invalid tool arguments"}`;
+          return { ...base, parseError: fix || "invalid tool arguments" };
+        }
+        const args = { ...parsed };
+        // 分支命名空间：shell 默认 cwd = 本分支目录（显式传 cwd 优先；trunk 不改）
+        if (br.id !== 0 && !args.cwd) args.cwd = br.cwd;
+        if (fix) {
+          // 模型把参数序列化坏了：直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
+          log(`[${code}] tool args repaired: ${fix}`);
+          rec().event("tool_arg_repaired", {
+            code,
+            tool_call_id: tc.id,
+            fix,
+            raw: rawArgs.slice(0, 400),
+          });
+        }
+        return {
+          ...base,
+          args,
+          fix,
+          done: dispatchShell(args).then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          ),
+        };
+      }
+      if (tc.function.name === "submit_flag") {
+        let parsed: Record<string, unknown> = {};
+        try {
+          parsed = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+        } catch {
+          parsed = {};
+        }
+        const flagVal = String(parsed.flag ?? "").trim();
+        if (!flagVal) return { ...base, args: parsed, parseError: "`flag` is required" };
+        return {
+          ...base,
+          args: parsed,
+          submitFlag: flagVal,
+          done: bench.submitFlag(code, flagVal).then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          ),
+        };
+      }
+      if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
+        let parsedArgs: Record<string, unknown> = {};
+        try {
+          parsedArgs = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+        } catch {
+          parsedArgs = {};
+        }
+        return { ...base, args: parsedArgs };
+      }
+      return base;
+    });
+    // 阶段2：按 tool_calls 原序收割结果与副作用（消息配对/记录顺序与串行语义一致）
+    for (const p of prepared) {
+      const tc = p.tc;
+      const args = p.args;
+      const tToolStart = p.startedAt;
+      let result: unknown;
+      if (p.parseError !== null) {
+        result = `error: ${p.parseError}`;
+      } else if (tc.function.name === "shell") {
+        const settled = await p.done;
+        if (settled && "error" in settled) {
+          result = `error: shell dispatch failed: ${settled.error instanceof Error ? settled.error.message : settled.error}`;
         } else {
-          args = parsed;
-          // 分支命名空间：shell 默认 cwd = 本分支目录（显式传 cwd 优先；trunk 不改）
-          if (br.id !== 0 && !args.cwd) args.cwd = br.cwd;
-          if (fix) {
-            // 模型把参数序列化坏了：直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
-            log(`[${code}] tool args repaired: ${fix}`);
-            rec().event("tool_arg_repaired", {
-              code,
-              tool_call_id: tc.id,
-              fix,
-              raw: rawArgs.slice(0, 400),
-            });
-            result = withFixNote(await dispatchShell(args), fix);
-          } else {
-            result = await dispatchShell(args);
-          }
+          result = p.fix ? withFixNote(settled?.value, p.fix) : settled?.value;
           if (typeof args.command === "string") bm.pushCmd(br.id, args.command);
           // 信号④/⑤数据源：硬失败（连接/解析/命令缺失——对幻觉目标空转）与连续错提交
           {
@@ -1012,61 +1080,46 @@ export async function solveTask(
         }
       } else if (tc.function.name === "submit_flag") {
         // 唯一提交通道：结构化响应直喂账本/flag 卡/时钟；多 flag 未完 → 总结轮触发器
-        let parsed: Record<string, unknown> = {};
-        try {
-          parsed = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
-        } catch {
-          parsed = {};
-        }
-        args = parsed;
-        const flagVal = String(parsed.flag ?? "").trim();
-        if (!flagVal) {
-          result = "error: `flag` is required";
+        const settled = await p.done;
+        if (settled && "error" in settled) {
+          const e = settled.error;
+          if (e instanceof TaskFinishedError) {
+            platformEnded("submit", e as Error); // 评测截止终态：全局收敛，不当工具错误
+            result = "评测已截止：平台返回终态，停止提交";
+          } else {
+            result = `error: submit failed: ${e instanceof Error ? e.message : e}`;
+          }
         } else {
-          try {
-            const resp = await bench.submitFlag(code, flagVal);
-            const out = integrateSubmit(resp, ledger, br.id);
-            let extra = "";
-            if (resp?.correct === true) {
-              bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
-              corelog?.write({
-                branch: br.id,
-                kind: "flag",
-                flag_index: out.flagIndex,
-                correct_flag_count: out.correctCount,
-                total_flag_count: out.totalCount || undefined,
-              });
-              bm.recordCore(br.id, nowSec());
-              log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
-              // 总结轮触发器（单/多分流）：多 flag 未全齐→总结后压缩继续；
-              // 单 flag→同样产出总结但不替换、即收尾（跳过 closingSummary）
-              if (out.totalCount > 1 && out.correctCount < out.totalCount) {
-                flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
-                extra = FLAG_SUMMARY_HINT_MULTI;
-              } else if (out.totalCount === 1) {
-                flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
-                extra = FLAG_SUMMARY_HINT_SINGLE;
-              }
-            }
-            result = out.result + extra;
-          } catch (e) {
-            if (e instanceof TaskFinishedError) {
-              platformEnded("submit", e); // 评测截止终态：全局收敛，不当工具错误
-              result = "评测已截止：平台返回终态，停止提交";
-            } else {
-              result = `error: submit failed: ${e instanceof Error ? e.message : e}`;
+          const resp = settled?.value as
+            | { correct?: boolean; matched_flag_index?: number | null }
+            | undefined;
+          const out = integrateSubmit(resp, ledger, br.id);
+          let extra = "";
+          if (resp?.correct === true) {
+            bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
+            corelog?.write({
+              branch: br.id,
+              kind: "flag",
+              flag_index: out.flagIndex,
+              correct_flag_count: out.correctCount,
+              total_flag_count: out.totalCount || undefined,
+            });
+            bm.recordCore(br.id, nowSec());
+            log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
+            // 总结轮触发器（单/多分流）：多 flag 未全齐→总结后压缩继续；
+            // 单 flag→同样产出总结但不替换、即收尾（跳过 closingSummary）
+            if (out.totalCount > 1 && out.correctCount < out.totalCount) {
+              flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
+              extra = FLAG_SUMMARY_HINT_MULTI;
+            } else if (out.totalCount === 1) {
+              flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
+              extra = FLAG_SUMMARY_HINT_SINGLE;
             }
           }
+          result = out.result + extra;
         }
       } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
-        let parsedArgs: Record<string, unknown> = {};
-        try {
-          parsedArgs = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
-        } catch {
-          parsedArgs = {};
-        }
-        args = parsedArgs;
-        const out = dispatchBranchTool(tc.function.name, parsedArgs, toolDeps, br.id, tc.id);
+        const out = dispatchBranchTool(tc.function.name, args, toolDeps, br.id, tc.id);
         if (!out) {
           result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
         } else {

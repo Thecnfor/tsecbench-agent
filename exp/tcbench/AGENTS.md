@@ -62,6 +62,11 @@
    （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-bystander-design.md`，
    缓存实测依据见 `../cache_exp/README.md`。
 2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/wait_any/status/kill/list` 收结果。
+   - **同轮多个 tool_call 并发派发**（方案 A）：一轮里多条 shell/submit 同时起跑，
+     不再串行排队；结果仍按 tool_calls 原序收割配对（`agent.ts` 两阶段：prepared 先派发、
+     再按序 await + 落副作用）。模型侧由 prompt 提示「有依赖的命令并进同一条」。
+   - `run` 可带 `label` 给 job 起语义名（如 `oa-brute`）：list/status/wait 显示，
+     wait/status/kill 也可按 label 寻址（唯一同名才可，重名报错提示用 job_id）。
    - 快速命令有 1.5s 同步窗口（`AGENT_SHELL_WAIT_MS`）；`run` 可带 `wait_sec`（≤300s），
      **工具替模型决定何时返回**（命令结束 / 攒够 ≥2KB 新输出 / 到点，先到先返回）。
    - `wait` 同为**边沿触发**，不再干等；输出分页 `offset/lines`（每条带 `next_offset` 续读），
