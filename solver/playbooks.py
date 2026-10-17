@@ -127,6 +127,25 @@ def match_and_render(text: str, target: str = "") -> str | None:
     return render(playbook, target) if playbook else None
 
 
+_SAFE_GET_PREFIX = ("curl -s", "curl -sS")
+_UNSAFE_TOKENS = ("-X ", "-d ", "|", ";", "&&", "`", "$(", ">", "<")
+
+
+def first_get_step(playbook: dict, target: str = "") -> str | None:
+    """返回可安全自动执行的第一条只读 GET（无管道/重定向/写操作）。"""
+    if not target:
+        return None
+    base = _base_for(target)
+    for step in playbook["steps"]:
+        cmd = step.replace("{base}", base).replace("{target}", target or "<target>")
+        if not cmd.startswith(_SAFE_GET_PREFIX):
+            continue
+        if any(token in cmd for token in _UNSAFE_TOKENS):
+            continue
+        return cmd
+    return None
+
+
 def dump_match(text: str) -> str:
     """调试用：返回匹配 id 或 none。"""
     playbook = match(text)

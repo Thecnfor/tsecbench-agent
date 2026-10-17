@@ -282,6 +282,9 @@ def _kb_query(text: str, fingerprint: str = "") -> str:
         return f"{text} {fingerprint}".strip()
 
 
+_AUTO_PROBED: set[str] = set()
+
+
 def _with_kb(result: dict) -> dict:
     """recon 结果附带离线 KB 命中与 FAST PATH：把「发现指纹 → 第一批动作」压到同一回合。"""
     fingerprint = json.dumps(result, ensure_ascii=False)[:1500]
@@ -293,14 +296,19 @@ def _with_kb(result: dict) -> dict:
         import playbooks
 
         target = TARGET_INFO.split(",")[0].strip()
-        hint = playbooks.match_and_render(
-            " ".join(
-                [str(TASK.get("description") or ""), json.dumps(result, ensure_ascii=False)[:2000]]
-            ),
-            target,
-        )
-        if hint:
-            result["fast_path"] = hint
+        combined = " ".join([str(TASK.get("description") or ""), fingerprint[:2000]])
+        playbook = playbooks.match(combined)
+        if playbook:
+            result["fast_path"] = playbooks.render(playbook, target)
+            probe_cmd = playbooks.first_get_step(playbook, target)
+            if probe_cmd and playbook["id"] not in _AUTO_PROBED:
+                _AUTO_PROBED.add(playbook["id"])
+                probe = run_command(probe_cmd, 6)
+                if str(probe.get("output") or "").strip():
+                    result["fast_probe"] = {
+                        "cmd": probe_cmd,
+                        "output": truncate(str(probe["output"]), 2000),
+                    }
     except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
         pass
     return result

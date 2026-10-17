@@ -192,6 +192,12 @@ def test_recon_attaches_fast_path(common, monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "recon_recipe", fake)
     monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
+    monkeypatch.setattr(common, "_AUTO_PROBED", set())
+    monkeypatch.setattr(
+        common,
+        "run_command",
+        lambda cmd, timeout: {"output": "", "exit_code": 0, "seconds": 0.0, "timed_out": False},
+    )
     out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
     assert "# FAST PATH" in out["fast_path"]
 
@@ -200,3 +206,30 @@ def test_no_fact_guard_constants(common):
     assert common.NO_FACT_NUDGE_TURNS >= 8
     assert common.MAX_NO_FACT_NUDGES >= 2
     assert common.MAX_TURNS_NO_FLAG >= 30
+
+
+def test_recon_auto_probes_first_get_step(common, monkeypatch):
+    fake = types.SimpleNamespace(
+        recon_host=lambda target: {"target": target, "open_ports": ["3000"]},
+        recon_web=lambda url: {"url": url, "title": "Dify", "tech": ["next.js"]},
+        derive_web_url=lambda target, ports: "http://x:3000/",
+    )
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
+    monkeypatch.setattr(common, "_AUTO_PROBED", set())
+    monkeypatch.setattr(common, "TARGET_INFO", "10.0.0.1:3000")
+    seen = {}
+
+    def fake_run(cmd, timeout):
+        seen["cmd"] = cmd
+        return {
+            "output": "HTTP/1.1 200 OK\n{}",
+            "exit_code": 0,
+            "seconds": 0.0,
+            "timed_out": False,
+        }
+
+    monkeypatch.setattr(common, "run_command", fake_run)
+    out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
+    assert "console/api/setup" in seen["cmd"]
+    assert "fast_probe" in out
