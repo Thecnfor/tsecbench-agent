@@ -122,6 +122,9 @@ def _merge_prior(base: dict, extra: dict) -> dict:
     history = "\n".join(part for part in histories if part)
     if history:
         merged["history"] = history[-4000:]
+    stage_state = (extra or {}).get("stage_state") or (base or {}).get("stage_state")
+    if isinstance(stage_state, dict) and stage_state:
+        merged["stage_state"] = stage_state
     new_obs = (extra or {}).get("observer")
     if isinstance(new_obs, dict) and new_obs:
         old_obs = (base or {}).get("observer")
@@ -199,6 +202,12 @@ def collect_prior(ws: Path) -> dict:
             for key in ("revision", "hypothesis", "lock", "confirmed", "angles", "tension")
             if obs.get(key)
         }
+    try:
+        stage_state = json.loads((ws / "out" / "stage_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stage_state = None
+    if isinstance(stage_state, dict):
+        prior["stage_state"] = stage_state
     return prior
 
 

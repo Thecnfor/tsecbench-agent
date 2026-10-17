@@ -230,6 +230,9 @@ def _merge_prior(old: dict | None, new: dict) -> dict:
     # 跨 attempt 的 harness 状态：优先最新一轮（solver 每轮覆盖落盘）
     history = str((new or {}).get("history") or (old or {}).get("history") or "")
     merged["history"] = history[-4000:]
+    stage_state = (new or {}).get("stage_state") or (old or {}).get("stage_state")
+    if isinstance(stage_state, dict) and stage_state:
+        merged["stage_state"] = stage_state
     old_obs = (old or {}).get("observer")
     if isinstance(old_obs, dict) and old_obs:
         merged["observer"] = old_obs
@@ -371,12 +374,14 @@ def _probe_decision(stage: int, has_progress: bool, high_value: bool, remaining_
     return "full"
 
 
-def _v2_enabled_for(code: str) -> bool:
-    """v2 灰度：HARNESS_V2 总闸 + 可选 V2_CODES 白名单（逗号分隔）。
+def _v2_enabled_for(code: str, rec=None, real_solver: bool = False) -> bool:
+    """v2 灰度：多 flag 题默认走 subagent；HARNESS_V2 的 V2_CODES 白名单可额外指定。
 
     白名单存在时只有列出的题走 v2，其余题保持原串行路径 —— 可以在真实
     跑分里只灰度一道 hard/多阶段题，异常时清空白名单即可回退。
     """
+    if rec is not None and rec.flag_count > 1 and real_solver:
+        return True
     if not config_module.HARNESS_V2:
         return False
     raw = os.environ.get("V2_CODES", "").strip()
@@ -495,7 +500,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     solver_started = time.monotonic()
     slice_count = 0
     try:
-        if _v2_enabled_for(code):
+        real_solver = any("solver/main.py" in str(part) for part in ctx.solver_cmd)
+        if _v2_enabled_for(code, rec, real_solver):
             from types import SimpleNamespace
 
             from .v2_controller import StagePlanner, SurfacePlanner, V2Controller
@@ -506,7 +512,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                 "on",
                 "true",
                 "yes",
-            )
+            ) or (rec.flag_count > 1 and real_solver)
             if surfaces:
                 planner = SurfacePlanner()
                 max_parallel = 2

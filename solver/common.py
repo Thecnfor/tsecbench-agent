@@ -416,6 +416,38 @@ def run_gradio(args: dict) -> dict:
     return _http_json(endpoint, method="POST" if data is not None else "GET", body=data)
 
 
+def run_stage(args: dict) -> dict:
+    """多阶段状态：读写 out/stage_state.json，作为跨 attempt 的 relay 协议。"""
+    if not SOLVER_TASK_PATH:
+        return {"error": "stage state requires orchestrator mode"}
+    path = Path(SOLVER_TASK_PATH).parent / "out" / "stage_state.json"
+    state = {
+        "stage": "recon",
+        "goal": "",
+        "assets": [],
+        "creds": [],
+        "flags": [],
+        "next": "",
+        "failed": [],
+    }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            state.update(data)
+    except (OSError, ValueError):
+        pass
+    if str(args.get("action") or "get").lower() == "update":
+        for key in ("stage", "goal", "next"):
+            if args.get(key) is not None:
+                state[key] = str(args[key])[:300]
+        for key in ("assets", "creds", "flags", "failed"):
+            if isinstance(args.get(key), list):
+                state[key] = list(dict.fromkeys([*(state.get(key) or []), *args[key]]))[-50:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
+
+
 def build_tool_specs() -> list[dict]:
     """模型可见的工具面（能力在 harness 里，不靠提示词叮嘱）。"""
     return [
@@ -515,6 +547,27 @@ def build_tool_specs() -> list[dict]:
                         "top_k": {"type": "integer", "description": "default 3"},
                     },
                     "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stage",
+                "description": "Get/update multi-stage relay state (stage, goal, assets, creds, flags, next, failed).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["get", "update"]},
+                        "stage": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "assets": {"type": "array", "items": {"type": "string"}},
+                        "creds": {"type": "array", "items": {"type": "string"}},
+                        "flags": {"type": "array", "items": {"type": "string"}},
+                        "next": {"type": "string"},
+                        "failed": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["action"],
                 },
             },
         },
@@ -643,7 +696,9 @@ def _with_kb(result: dict) -> dict:
                     result["fast_probe"] = collected
         import skills
 
-        skill = skills.match(combined + " " + fingerprint[:2000])
+        skill = skills.match(combined + " " + fingerprint[:2000]) or skills.generic_for(
+            combined, target
+        )
         if skill:
             result["skill"] = skills.render(skill, target)
     except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
@@ -751,7 +806,7 @@ def run_kb(args: dict) -> dict:
     return {"query": query, "snippets": text[:8000]}
 
 
-STRUCTURED_TOOLS = ("recon", "rea", "kb", "gremlin", "gradio")
+STRUCTURED_TOOLS = ("recon", "rea", "kb", "gremlin", "gradio", "stage")
 
 
 def run_structured_tool(name: str, args: dict) -> dict:
@@ -761,6 +816,8 @@ def run_structured_tool(name: str, args: dict) -> dict:
         return run_rea(args)
     if name == "kb":
         return run_kb(args)
+    if name == "stage":
+        return run_stage(args)
     if name == "gremlin":
         return run_gremlin(args)
     if name == "gradio":
@@ -1526,7 +1583,11 @@ def setup_orch_mode() -> None:
         import skills
 
         target = str(targets[0]) if targets else ""
-        skill = skills.match(" ".join([str(task.get("description") or ""), *targets]))
+        skill = skills.match(
+            " ".join([str(task.get("description") or ""), *targets])
+        ) or skills.generic_for(
+            str(task.get("description") or ""), str(targets[0]) if targets else ""
+        )
         if skill:
             parts.append(skills.render(skill, target))
         if int(task.get("flag_count", 1)) > int(task.get("correct_flag_count", 0)):

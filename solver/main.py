@@ -393,6 +393,8 @@ def main() -> int:
                     result = common.run_recon(args)
                 elif tool == "rea":
                     result = common.run_rea(args)
+                elif tool == "stage":
+                    result = common.run_stage(args)
                 elif tool == "gremlin":
                     result = common.run_gremlin(args)
                 elif tool == "gradio":

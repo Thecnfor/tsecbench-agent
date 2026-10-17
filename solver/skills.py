@@ -109,8 +109,8 @@ SKILLS: list[dict] = [
             ("许可证", "授权码", "校验", "凭据"),
         ],
         "steps": [
-            "rea inspect 先看架构/字符串/导入表",
-            "rea decompile 校验函数；找比较/分支/常量",
+            "file/readelf/strings/objdump 先看架构与导入；rea 可用则 rea inspect",
+            "gdb/objdump 定位校验函数；找比较/分支/常量",
             "本地运行/ emulate，构造正确输入；必要时 patch 校验",
         ],
         "stop": "先定位校验函数和成功分支；不要全量反编译后才开始。",
@@ -212,7 +212,58 @@ SKILLS: list[dict] = [
         ],
         "stop": "2 组凭据失败即换；拿到 shell 先读 flag，不要继续交互。",
     },
+    {
+        "id": "generic-web",
+        "require": [("web", "网站", "系统", "平台", "门户", "面板", "http")],
+        "steps": [
+            "recon web：headers/title/tech，再对登录/上传/API 做 3 次探测",
+            "按指纹试 SQLi/LFI/SSRF/XXE/SSTI/未授权；先读源码/备份",
+            "每个入口做一次最小验证，失败就换入口",
+        ],
+        "stop": "先指纹再选漏洞类；同一入口两次失败就换，不要盲扫大字典。",
+    },
+    {
+        "id": "generic-cloud",
+        "require": [("云", "bucket", "sas", "sts", "iam", "对象存储", "serverless")],
+        "steps": [
+            "枚举凭证/令牌权限与 scope",
+            "列对象/函数/角色，找过度授权",
+            "用配置里的凭据读受保护数据",
+        ],
+        "stop": "先 scope 再枚举；403 就换 token/对象，不要重复申请。",
+    },
+    {
+        "id": "generic-pwn",
+        "require": [("二进制", "固件", "逆向", "可执行", "许可证", "pwn")],
+        "steps": [
+            "file/checksec/strings/readelf 先看架构与保护",
+            "objdump/gdb 定位 main/校验函数/成功分支",
+            "本地构造输入；必要时 patch 或写 pwntools 脚本",
+        ],
+        "stop": "先成功分支再全量分析；不要先做完整反编译。",
+    },
 ]
+
+
+def generic_for(text: str, target: str = "") -> dict | None:
+    low = text.lower()
+    t = target.lower()
+    if ":23" in t:
+        return next((s for s in SKILLS if s["id"] == "telnet-interactive"), None)
+    if any(word in low for word in ("固件", "可执行文件", "逆向", "许可证", "mcu")):
+        return next((s for s in SKILLS if s["id"] == "generic-pwn"), None)
+    if any(
+        word in low for word in ("云存储", "sas", "sts", "iam", "bucket", "对象存储", "serverless")
+    ):
+        return next((s for s in SKILLS if s["id"] == "generic-cloud"), None)
+    if any(word in low for word in ("内网", "全链路", "apt", "多阶段")):
+        return next((s for s in SKILLS if s["id"] == "multi-stage-web"), None)
+    if any(
+        port in t
+        for port in (":80", ":443", ":3000", ":5000", ":7860", ":8000", ":8080", ":9000", ":10000")
+    ):
+        return next((s for s in SKILLS if s["id"] == "generic-web"), None)
+    return None
 
 
 def match(text: str) -> dict | None:

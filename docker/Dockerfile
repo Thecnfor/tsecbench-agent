@@ -86,6 +86,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       sqlmap whatweb \
       # 爆破
       hydra john hashcat \
+      # 多阶段 / 横向 / 云 / 取证
+      openssh-client sshpass proxychains4 jq smbclient ldap-utils \
+      libimage-exiftool-perl steghide \
       # 二进制 / Pwn
       gdb binutils patchelf gcc g++ make gcc-multilib \
       # 逆向（trixie 无 rizin/radare2，用 gdb+binutils+binwalk；nikto 也不在 trixie，
@@ -103,6 +106,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 --version \
     # nmap NSE 脚本必须完整保留（image-spec.md §3：>500 个 .nse）
     && test "$(ls /usr/share/nmap/scripts/*.nse | wc -l)" -gt 500
+
+# 1b) 静态 Web 工具（apt 没有的 ffuf/nuclei/chisel）
+RUN set -eux; \
+    curl -fsSL https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz \
+      | tar -xz -C /tmp ffuf && install -m 0755 /tmp/ffuf /usr/local/bin/ffuf; \
+    curl -fsSL https://github.com/projectdiscovery/nuclei/releases/download/v3.3.5/nuclei_3.3.5_linux_amd64.zip \
+      -o /tmp/nuclei.zip && unzip -q /tmp/nuclei.zip -d /tmp && install -m 0755 /tmp/nuclei /usr/local/bin/nuclei; \
+    curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz \
+      | gunzip > /usr/local/bin/chisel && chmod 0755 /usr/local/bin/chisel; \
+    rm -rf /tmp/ffuf /tmp/nuclei.zip /tmp/nuclei
 
 # 2) Node 运行时（pi / ts-workflow 需要）—— 从 pi-vendor 阶段带过来
 COPY --from=pi-vendor /usr/local/bin/node /usr/local/bin/node
@@ -125,7 +138,8 @@ RUN python3 -m venv /opt/tsecbench/venv \
     && /opt/tsecbench/venv/bin/pip install --ignore-requires-python "triviumdb>=0.8.8,<0.9" \
     && /opt/tsecbench/venv/bin/pip install /tmp/build/orchestrator /tmp/build/mock \
     && /opt/tsecbench/venv/bin/pip install "openhands-ai==${OPENHANDS_VERSION}" \
-    && /opt/tsecbench/venv/bin/python -c "import orchestrator, mock_server, openhands; print('py deps ok')" \
+    && /opt/tsecbench/venv/bin/pip install pwntools capstone pyelftools ROPgadget impacket awscli \
+    && /opt/tsecbench/venv/bin/python -c "import orchestrator, mock_server, openhands, pwn, capstone, elftools; print('py deps ok')" \
     && rm -rf /tmp/build
 
 # 4) 交付物落位

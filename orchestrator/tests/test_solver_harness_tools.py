@@ -25,7 +25,7 @@ def common():
 
 def test_tool_list_exposes_structured_tools(common):
     names = {t["function"]["name"] for t in common.build_tool_specs()}
-    assert names == {"run_command", "recon", "rea", "kb", "gremlin", "gradio"}
+    assert names == {"run_command", "recon", "rea", "kb", "gremlin", "gradio", "stage"}
 
 
 def test_rea_decompile_returns_code(common, monkeypatch, tmp_path):
@@ -457,7 +457,7 @@ def test_root_wide_scan_is_blocked(common):
 
 def test_advanced_tools_and_scope(common):
     names = {tool["function"]["name"] for tool in common.build_tool_specs()}
-    assert {"gremlin", "gradio"} <= names
+    assert {"gremlin", "gradio", "stage"} <= names
     assert common.run_gremlin({})["error"]
     assert common.run_gradio({})["error"]
     assert common.run_command("nmap 172.18.0.1", 5)["exit_code"] == 126
