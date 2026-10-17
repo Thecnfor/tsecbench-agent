@@ -69,7 +69,7 @@ def test_recon_dispatch_host_and_web(common, monkeypatch):
     assert common.run_recon({"mode": "host", "target": "10.0.0.1"})["host"]["open_ports"] == ["80"]
     assert common.run_recon({"mode": "web", "url": "http://x/"})["web"]["dirs"] == ["/admin"]
     both = common.run_recon({"mode": "all", "target": "10.0.0.1", "url": "http://x/"})
-    assert set(both) == {"host", "web"}
+    assert {"host", "web"} <= set(both)
 
 
 def test_recon_all_derives_url_from_open_ports(common, monkeypatch):
@@ -166,3 +166,19 @@ def test_lowercase_flag_is_a_named_pattern(common):
 def test_generic_accepts_flag_like_body(common):
     flag = "Flag{abc_def-123}"
     assert common.find_flags(flag, include_generic=True) == [flag]
+
+
+def test_recon_attaches_kb_hits(common, monkeypatch):
+    fake = types.SimpleNamespace(
+        recon_host=lambda target: {"target": target, "open_ports": ["80"]},
+        recon_web=lambda url: {"url": url, "dirs": []},
+        derive_web_url=lambda target, ports: "http://x/",
+    )
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "KBX")
+    out = common.run_recon({"mode": "all", "target": "10.0.0.1"})
+    assert out["kb"] == "KBX"
+
+
+def test_plain_nudge_threshold_is_relaxed(common):
+    assert common.MAX_PLAIN_NUDGES >= 6

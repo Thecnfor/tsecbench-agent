@@ -57,6 +57,8 @@ OUTPUT_LIMIT = int(cfg("SOLVER_OUTPUT_LIMIT", "12000"))
 # 上下文裁剪：DeepSeek 128k 上下文下 45k 过早；长利用链需要更多历史。
 TRIM_TOKENS = int(cfg("SOLVER_TRIM_TOKENS", "90000"))
 TRIM_KEEP_MSGS = int(cfg("SOLVER_TRIM_KEEP_MSGS", "60"))
+# 连续「只说不做」的停机阈值：3 太早，实测会把已拿到 LFI/凭据的链子掐断。
+MAX_PLAIN_NUDGES = int(cfg("SOLVER_MAX_PLAIN_NUDGES", "6"))
 
 
 def effective_command_timeout(
@@ -265,6 +267,17 @@ def build_tool_specs() -> list[dict]:
     ]
 
 
+def _with_kb(result: dict) -> dict:
+    """recon 结果附带离线 KB 命中：把「发现指纹 → payload」压到同一回合。"""
+    query = " ".join(
+        [str(TASK.get("description") or ""), json.dumps(result, ensure_ascii=False)[:1500]]
+    ).strip()
+    hits = kb_snippets(query, top_k=2)
+    if hits:
+        result["kb"] = hits[:4000]
+    return result
+
+
 def run_recon(args: dict) -> dict:
     """recon 工具实现；任何失败都以 {"error": ...} 返回，不打断主循环。"""
     try:
@@ -278,19 +291,19 @@ def run_recon(args: dict) -> dict:
         if mode == "host":
             if not target:
                 return {"error": "target required for mode=host"}
-            return {"host": recon_recipe.recon_host(target)}
+            return _with_kb({"host": recon_recipe.recon_host(target)})
         if mode == "web":
             if not url and target.startswith(("http://", "https://")):
                 url = target
             if not url:
                 return {"error": "url required for mode=web"}
-            return {"web": recon_recipe.recon_web(url)}
+            return _with_kb({"web": recon_recipe.recon_web(url)})
         if mode == "all":
             if not target:
                 return {"error": "target required for mode=all"}
             host = recon_recipe.recon_host(target)
             web_url = url or recon_recipe.derive_web_url(target, host.get("open_ports") or [])
-            return {"host": host, "web": recon_recipe.recon_web(web_url)}
+            return _with_kb({"host": host, "web": recon_recipe.recon_web(web_url)})
         return {"error": f"unknown mode: {mode!r}"}
     except Exception as exc:  # noqa: BLE001 - 网络/工具异常都降级
         return {"error": f"recon failed: {exc}"}
@@ -620,6 +633,13 @@ def setup_orch_mode() -> None:
         parts.append("# Previous attempt (harness state)\n" + history[:4000])
     if parts:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" if TASK_PROMPT else "") + "\n\n".join(parts)
+    # 启动期知识注入：main.py 是线上入口，不像 dual_main 有 profile/skills 层；
+    # 先把与题面最相关的离线 KB 片段直接放进 prompt，减少「盲目 curl」。
+    knowledge = kb_snippets(
+        " ".join(str(x) for x in (task.get("description") or "", *targets)), top_k=2
+    )
+    if knowledge:
+        TASK_PROMPT = (TASK_PROMPT + "\n\n" + knowledge).strip()
     deadline_epoch = os.environ.get("SOLVER_DEADLINE_EPOCH")
     if deadline_epoch:
         try:

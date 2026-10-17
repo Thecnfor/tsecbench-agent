@@ -213,10 +213,11 @@ def main() -> int:
             messages.append(
                 {
                     "role": "user",
-                    "content": "Continue the work: call run_command for the next step. Do not just describe intentions.",
+                    "content": "Continue the work: call run_command for the next step NOW. "
+                    "A plain-text-only turn is wasted time; do not restate the plan.",
                 }
             )
-            if nudges >= 3:
+            if nudges >= common.MAX_PLAIN_NUDGES:
                 print("[solver] too many plain-text turns; stopping", flush=True)
                 break
             continue
