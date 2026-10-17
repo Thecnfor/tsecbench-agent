@@ -248,3 +248,21 @@ def test_empty_slice_env_falls_back_to_defaults(monkeypatch):
     reloaded = importlib.reload(scheduler)
     assert reloaded.PHASE1_SLICE_MAX_S == 420
     assert reloaded.MIN_USEFUL_SLICE_S == 150
+
+
+def test_attempted_easy_demoted_below_unattempted_medium():
+    """attempt-aware：被 probe_stop 过的 easy 不再压住未跑过的 medium。"""
+    records = {
+        "easy_tried": rec("easy_tried", difficulty="easy", total_score=100, attempts=1),
+        "medium_new": rec("medium_new", difficulty="medium", total_score=1200),
+        "easy_new": rec("easy_new", difficulty="easy", total_score=100),
+    }
+    order = [r.unique_code for r in eligible(records)]
+    assert order == ["easy_new", "medium_new", "easy_tried"]
+
+
+def test_attempts_cap_at_two():
+    """attempts 再大也只降两级，避免已失败题永久沉底。"""
+    tried = rec("tried", difficulty="easy", total_score=100, attempts=9)
+    hard_new = rec("hard_new", difficulty="hard", total_score=100)
+    assert priority_key(tried)[0] <= priority_key(hard_new)[0] + 1

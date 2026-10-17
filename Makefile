@@ -26,11 +26,15 @@ fmt:
 check:
 	$(UV) run python scripts/check_access.py
 
+## clean-tmp: 清掉上一 run solver 留在 /tmp 的产物（新 run 前自动执行）
+clean-tmp:
+	scripts/clean_solver_tmp.sh
+
 ## run: 本地评测起编排器（先 make check；LLM key 取自 solver/.env，GATEWAY_MODE=off）
 ## 时间片可调：SLICE_MIN_S/SLICE_MAX_S 覆盖默认 120/1200（v1.1 起默认拉长到 300/1800）
 SLICE_MIN_S ?= 300
 SLICE_MAX_S ?= 1800
-run:
+run: clean-tmp
 	set -a; . ./solver/.env; set +a; SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) $(UV) run python -m orchestrator
 
 ## rerun: 快速调试循环 —— 停掉在跑的编排器与 solver，后台重启（日志 /tmp/tsec-run.log）
