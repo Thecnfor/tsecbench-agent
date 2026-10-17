@@ -27,3 +27,13 @@ convertMessages return 前同款消毒（bundle 内联版才是实际生效路�
 补丁 v4（07:2x）：消毒升级为共享 __tsecSanitize——向前扫描到下一个 assistant/user 收集
 已答 call_id，两侧 id 做 "|" 前缀归一化（OpenAI Responses 格式），缺失即合成 tool 结果。
 （v3 仅查紧邻，d-04 实测仍 400 的变体根因。）
+
+## 知识库语料（solver/kb/unified.db，2026-10-17）
+由 `security-knowledge-base-2026-10-14.tar.gz`（hacktricks-zh、ctf-wiki、
+payloadsallthethings、nuclei-templates、awesome-poc 等）与 `Skills.7z` 抽取生成，
+构建脚本 `solver/kb/build_wiki_db.py`。仅收 .md/.txt；AppleDouble、>256KB 文件、
+隐藏目录跳过；flag 形态内容 fail-closed 整节丢弃。
+来源许可：hacktricks (AGPL-3.0)、ctf-wiki (CC BY-SA)、payloadsallthethings (MIT)、
+nuclei-templates (MIT)、awesome-poc (MIT)、Skills 包内部各自声明。本项目仅作
+离线检索用途，不分发修改版；如评审要求可整体移除（删除 unified.db 即回退到
+自研 9 篇 cheatsheet）。

@@ -93,7 +93,33 @@ class Index:
         self.kb_dir = kb_dir or HERE
         self.sections: list[tuple[str, str, str]] = []  # (doc, title, body)
         self.postings: dict[str, dict[int, float]] = {}  # token -> {section_idx: 权重}
-        self._build()
+        self.db_path = self.kb_dir / "unified.db"
+        # 构建期预生成的 FTS 库优先（百科级语料实时建索引不可行）；
+        # 缺失时退回原内存倒排（自研 cheatsheet 场景）。
+        self._db = None
+        if self.db_path.is_file():
+            import sqlite3
+
+            self._db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        else:
+            self._build()
+
+    def _query_fts(self, text: str, top_k: int) -> list[dict]:
+        toks = _tokenize(text)
+        if not toks:
+            return []
+        # 去重 + OR 连接；每个 token 加引号：'-' 会被 FTS 当 NOT 运算符（实测炸）
+        match = " OR ".join(f'"{t}"' for t in dict.fromkeys(toks))
+        rows = self._db.execute(
+            "SELECT s.doc, s.title, s.body, bm25(ft) AS r "
+            "FROM ft JOIN secs s ON s.rowid = ft.rowid "
+            "WHERE ft MATCH ? ORDER BY r LIMIT ?",
+            (match, top_k),
+        ).fetchall()
+        return [
+            {"doc": row[0], "section": row[1], "score": round(-row[3], 2), "body": row[2][:MAX_SNIPPET_CHARS]}
+            for row in rows
+        ]
 
     def _build(self) -> None:
         for md in sorted(self.kb_dir.glob("*.md")):
@@ -112,6 +138,8 @@ class Index:
         （系统/功能/部署）压过真正相关的节。IDF 让 `pydash` 这种稀有词
         一票顶过十几个「系统」。
         """
+        if self._db is not None:
+            return self._query_fts(text, top_k)
         n = max(1, len(self.sections))
         scores: dict[int, float] = {}
         for token in _tokenize(text):
