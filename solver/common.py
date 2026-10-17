@@ -653,6 +653,39 @@ Hard rules:
 
 
 # ------------------------------------------------------- orchestrator mode ---
+_FAIL_RE = re.compile(
+    r"(?i)(404|403|401|500|error|denied|forbidden|refused|timed out|timeout|not found)"
+)
+
+
+def _render_relay(prior: dict) -> str:
+    """把上一片的历史压成紧凑 relay 协议：已确认资产/凭据、成功路径、不要重复。"""
+    history = str(prior.get("history") or "")
+    failed: list[str] = []
+    worked: list[str] = []
+    for line in history.splitlines():
+        head, sep, rest = line.partition(" => ")
+        if not sep or not head.strip().startswith("$"):
+            continue
+        meta, _, body = rest.partition(" | ")
+        if _FAIL_RE.search(body) or "exit_code=0" not in meta:
+            failed.append(head.strip()[:160])
+        elif "HTTP/1.1 200" in body or "HTTP/1.1 302" in body or "password" in body.lower():
+            worked.append(head.strip()[:160])
+    assets = [str(item) for item in (prior.get("assets") or [])][:12]
+    credentials = [str(item) for item in (prior.get("credentials") or [])][:8]
+    lines = ["# RELAY PROTOCOL (from previous slices — do not redo)"]
+    if assets:
+        lines.append("assets: " + ", ".join(assets))
+    if credentials:
+        lines.append("credentials: " + ", ".join(credentials))
+    if worked:
+        lines.append("worked: " + " | ".join(worked[-8:]))
+    if failed:
+        lines.append("do NOT repeat (failed): " + " | ".join(failed[-10:]))
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def setup_orch_mode() -> None:
     """编排器模式：task.json 注入目标与上下文；时间片截断自 SOLVER_DEADLINE_EPOCH。"""
     global TARGET_INFO, TASK_PROMPT, MAX_MINUTES, DEADLINE_EPOCH, TASK
@@ -686,6 +719,9 @@ def setup_orch_mode() -> None:
     history = str(prior.get("history") or "").strip()
     if history:
         parts.append("# Previous attempt (harness state)\n" + history[:4000])
+    relay = _render_relay(prior)
+    if relay:
+        parts.append(relay)
     if parts:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" if TASK_PROMPT else "") + "\n\n".join(parts)
     # 启动期知识注入：main.py 是线上入口，不像 dual_main 有 profile/skills 层；

@@ -31,6 +31,7 @@ Exit code: 0 on normal completion (flag found, final answer, or budget exhausted
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -103,13 +104,20 @@ def _persist_harness_state(messages: list[dict]) -> None:
 
 
 def _fact_signature(text: str) -> set[str]:
-    """从工具输出提取「新事实」签名：凭据/端点/版本。"""
+    """高价值事实签名：凭据 / 新 host:port / flag。
+
+    只猜出新路径不算进展（a-05 就是靠不断猜文件名把 no-fact 计时器
+    反复重置，跑到 73 轮）。同主机不同路径视为同一事实。
+    """
     findings = state.extract_findings(text)
-    return {
-        f"{kind}:{value}"
-        for kind in ("credentials", "endpoints", "versions")
-        for value in findings.get(kind) or []
-    }
+    facts = {f"cred:{value}" for value in findings.get("credentials") or []}
+    for endpoint in findings.get("endpoints") or []:
+        match = re.match(r"https?://([^/]+)", endpoint) or re.match(r"([^/]+)", endpoint)
+        if match:
+            facts.add(f"host:{match.group(1).lower()}")
+    for flag in find_flags(text):
+        facts.add(f"flag:{flag}")
+    return facts
 
 
 def _flag_nudge(common_mod, reported_before: int) -> str | None:

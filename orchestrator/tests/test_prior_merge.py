@@ -82,3 +82,36 @@ def test_setup_orch_mode_injects_fast_path(monkeypatch, tmp_path):
     common = importlib.import_module("common")
     common.setup_orch_mode()
     assert "# FAST PATH" in common.TASK_PROMPT
+
+
+def test_setup_orch_mode_renders_relay_protocol(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(
+        json.dumps(
+            {
+                "description": "d",
+                "targets": ["10.0.0.1:80"],
+                "prior": {
+                    "assets": ["10.0.0.1:80"],
+                    "credentials": ["admin:pass"],
+                    "history": (
+                        "$ curl http://10.0.0.1/approve.php => exit_code=0 seconds=0.1"
+                        " | 404 not found\n"
+                        "$ curl http://10.0.0.1/dashboard.php => exit_code=0 seconds=0.1"
+                        " | HTTP/1.1 200 OK"
+                    ),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.setenv("SOLVER_DEADLINE_EPOCH", "9999999999")
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    common = importlib.import_module("common")
+    common.setup_orch_mode()
+    assert "RELAY PROTOCOL" in common.TASK_PROMPT
+    assert "do NOT repeat" in common.TASK_PROMPT
+    assert "approve.php" in common.TASK_PROMPT
+    assert "admin:pass" in common.TASK_PROMPT
