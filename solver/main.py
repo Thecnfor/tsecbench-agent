@@ -19,7 +19,8 @@ Config (solver/.env or environment; environment wins):
     LLM_API_KEY | DEEPSEEK_API_KEY   required
     LLM_BASE_URL     default https://api.deepseek.com/v1
     LLM_MODEL        default deepseek-chat
-    SOLVER_MAX_TURNS default 60
+    SOLVER_MAX_TURNS default 60（仅 BoxPwnr 直跑模式的保险丝；编排器模式
+                     以时间片为预算，不按轮数截断）
     SOLVER_MAX_MINUTES default 40
     SOLVER_CMD_TIMEOUT default 120   seconds per single command
     SOLVER_OUTPUT_LIMIT default 12000 chars of command output fed back to the model
@@ -32,13 +33,16 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
 
 import common
+import state
 from common import (  # 函数引用安全：内部读 common 自身全局，转发无陈旧问题
     build_system_prompt,
     find_flags,
     report_candidate,
     run_command,
+    sanitize_tool_messages,
     setup_orch_mode,
     truncate,
     write_result,
@@ -54,6 +58,48 @@ API_KEY = common.API_KEY
 # 变更对 test_solver_contract / pi_main / 本模块循环全部立即可见）。
 def __getattr__(name: str):  # noqa: ANN202, D103
     return getattr(common, name)
+
+
+def _messages_as_events(messages: list[dict]) -> list[dict]:
+    """把消息历史压成 prior 合成需要的事件流（命令 + 工具输出）。"""
+    events: list[dict] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (TypeError, ValueError):
+                    args = {}
+                if fn.get("name") == "run_command":
+                    events.append({"text": "$ " + str(args.get("command") or "")})
+                else:
+                    events.append({"text": f"{fn.get('name')} {args}"})
+        elif role == "tool":
+            events.append({"text": str(message.get("content") or "")})
+    return events
+
+
+def _persist_harness_state(messages: list[dict]) -> None:
+    """跨 attempt 落盘：命令摘要 + 结构化 prior + 追加式 findings。"""
+    if not common.SOLVER_TASK_PATH:
+        return
+    try:
+        out_dir = Path(common.SOLVER_TASK_PATH).parent / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "harness_state.txt").write_text(
+            common.summarize_history(messages, limit=16), encoding="utf-8"
+        )
+        events = _messages_as_events(messages)
+        prior = state.synthesize_prior(events, sorted(common._reported))
+        (out_dir / "prior.json").write_text(
+            json.dumps(prior, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        blob = "\n".join(event["text"] for event in events)
+        state.append_findings(out_dir / "findings.txt", state.extract_findings(blob))
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------- main ---
@@ -73,29 +119,7 @@ def main() -> int:
 
     client = OpenAI(api_key=API_KEY, base_url=common.BASE_URL, timeout=180.0, max_retries=2)
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "run_command",
-                "description": (
-                    "Run a shell command inside the challenge container and return combined "
-                    "stdout/stderr. Non-interactive commands only."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "Shell command to execute."},
-                        "timeout_seconds": {
-                            "type": "integer",
-                            "description": f"Kill the command after this many seconds (default {common.CMD_TIMEOUT}).",
-                        },
-                    },
-                    "required": ["command"],
-                },
-            },
-        }
-    ]
+    tools = common.build_tool_specs()
 
     messages: list[dict] = [
         {"role": "system", "content": build_system_prompt()},
@@ -112,7 +136,8 @@ def main() -> int:
     print(
         f"[solver] model={common.MODEL} base_url={common.BASE_URL} "
         f"container={common.CONTAINER or '(local)'} "
-        f"max_turns={common.MAX_TURNS} max_minutes={common.MAX_MINUTES}",
+        f"max_turns={'time-bounded' if common.ORCH_MODE else common.MAX_TURNS} "
+        f"max_minutes={common.MAX_MINUTES}",
         flush=True,
     )
 
@@ -125,8 +150,10 @@ def main() -> int:
     last_prompt_tokens = 0
     turn = 0
 
-    while turn < common.MAX_TURNS and time.time() < deadline:
+    while turn < common.turn_limit() and time.time() < deadline:
         turn += 1
+        # 历史卫生：任何 user 插话/裁剪都可能切断 tool_calls 组 → DeepSeek 400 永久中毒
+        messages[:] = sanitize_tool_messages(messages)
         try:
             resp = client.chat.completions.create(
                 model=common.MODEL,
@@ -181,8 +208,6 @@ def main() -> int:
         for call in calls:
             try:
                 args = json.loads(call.function.arguments or "{}")
-                command = str(args.get("command", "")).strip()
-                t = int(args.get("timeout_seconds") or common.CMD_TIMEOUT)
             except Exception as exc:
                 messages.append(
                     {
@@ -193,6 +218,38 @@ def main() -> int:
                 )
                 continue
 
+            if call.function.name in ("recon", "rea", "kb"):
+                tool = call.function.name
+                print(
+                    f"[solver] turn {turn} {tool} {args.get('mode') or args.get('query', '')[:40]}",
+                    flush=True,
+                )
+                if tool == "recon":
+                    result = common.run_recon(args)
+                elif tool == "rea":
+                    result = common.run_rea(args)
+                else:
+                    result = common.run_kb(args)
+                text = truncate(json.dumps(result, ensure_ascii=False))
+                for flag in find_flags(text):
+                    report_candidate(flag)
+                remaining = common.remaining_seconds()
+                note = f" | slice_time_left={int(remaining)}s" if remaining is not None else ""
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": f"[{tool}{note}]\n{text}",
+                    }
+                )
+                continue
+
+            command = str(args.get("command", "")).strip()
+            try:
+                requested = int(args.get("timeout_seconds") or common.CMD_TIMEOUT)
+            except (TypeError, ValueError):
+                requested = common.CMD_TIMEOUT
+
             if not command:
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": "empty command rejected"}
@@ -200,11 +257,7 @@ def main() -> int:
                 continue
 
             remaining = common.remaining_seconds()
-            if remaining is not None:
-                # 单条命令不得吃掉整片：最多用掉剩余时间的一半，留出后续轮次。
-                # 实测有题在 300s 片里跑一条 150s 的映射脚本，一轮就烧掉半片。
-                t = min(t, max(20, int(remaining * 0.5)))
-            t = max(5, min(t, 600))
+            t = common.effective_command_timeout(requested, remaining)
             print(f"[solver] turn {turn} $ {command}", flush=True)
             result = run_command(command, t)
             out = truncate(result["output"])
@@ -218,44 +271,42 @@ def main() -> int:
                 report_candidate(flag)
 
             remaining = common.remaining_seconds()
-            # 只在时间紧时附带剩余秒数（常态不注入，省 token）
-            note = ""
-            if remaining is not None and common.SLICE_S and remaining < 0.4 * common.SLICE_S:
-                note = f" | slice_time_left={int(remaining)}s"
+            # 剩余预算是 harness 状态：每条结果都带，模型自定节奏（不靠提示词叮嘱）
+            note = f" | slice_time_left={int(remaining)}s" if remaining is not None else ""
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": f"[{meta}{note}]\n{out}"}
             )
-            # 收尾提示：片快用尽时要求收敛（只改节奏，不打断已有探索）
-            if remaining is not None and remaining < 60 and not closing_nudged:
-                closing_nudged = True
-                print("[solver] closing nudge: slice nearly over", flush=True)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Time slice is nearly over. Stop opening new threads: verify any "
-                        "candidate flag you already have and output it now. If nothing is confirmed, "
-                        "write your best hypothesis and next step to /root/notes.md.",
-                    }
-                )
+
+        # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
+        remaining = common.remaining_seconds()
+        if remaining is not None and remaining < 60 and not closing_nudged:
+            closing_nudged = True
+            print("[solver] closing nudge: slice nearly over", flush=True)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Time slice is nearly over. Stop opening new threads: verify any "
+                    "candidate flag you already have and output it now. If nothing is confirmed, "
+                    "write your best hypothesis and next step to /root/notes.md.",
+                }
+            )
 
         # Context guard: drop oldest tool exchanges when the prompt gets large.
-        if last_prompt_tokens > 45000 or len(messages) > 140:
+        if last_prompt_tokens > common.TRIM_TOKENS or len(messages) > 140:
             head = messages[:2]
-            tail = messages[-30:]
+            tail = messages[-common.TRIM_KEEP_MSGS :]
             while tail and tail[0].get("role") == "tool":
                 tail.pop(0)
-            messages[:] = (
-                head
-                + [
-                    {
-                        "role": "user",
-                        "content": "[context trimmed: older tool exchanges removed; continue solving, reuse files you created]",
-                    }
-                ]
-                + tail
-            )
+            kept = "[context trimmed: older tool exchanges removed; continue solving, reuse files you created]"
+            digest = common.summarize_history(messages[2 : max(2, len(messages) - 30)])
+            if digest:
+                kept += "\n" + digest
+            messages[:] = head + [{"role": "user", "content": kept}] + tail
             last_prompt_tokens = 0
             print("[solver] context trimmed", flush=True)
+
+        # 每轮回写状态：即便下一拍被片超时杀掉，harness 也知道做过什么
+        _persist_harness_state(messages)
 
     elapsed = int(time.time() - start)
     print(

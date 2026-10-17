@@ -54,6 +54,9 @@ CMD_TIMEOUT = int(cfg("SOLVER_CMD_TIMEOUT", "60"))
 # 单条命令的 harness 硬顶：模型可以请求更长，但执行层不允许一条命令吃掉大半片。
 CMD_HARD_MAX_S = int(cfg("SOLVER_CMD_MAX_S", "90"))
 OUTPUT_LIMIT = int(cfg("SOLVER_OUTPUT_LIMIT", "12000"))
+# 上下文裁剪：DeepSeek 128k 上下文下 45k 过早；长利用链需要更多历史。
+TRIM_TOKENS = int(cfg("SOLVER_TRIM_TOKENS", "90000"))
+TRIM_KEEP_MSGS = int(cfg("SOLVER_TRIM_KEEP_MSGS", "60"))
 
 
 def effective_command_timeout(
@@ -91,6 +94,7 @@ SOLVER_TASK_PATH = cfg("SOLVER_TASK", "") or ""
 ORCH_MODE = bool(SOLVER_TASK_PATH) and not TASK_PROMPT
 _flag_seq = 0
 TOTALS: dict = {}  # LLM 用量统计（write_result 收尾用）
+TASK: dict = {}  # 当前 task.json（setup_orch_mode 写入）
 
 
 def turn_limit() -> int:
@@ -565,8 +569,9 @@ Hard rules:
 # ------------------------------------------------------- orchestrator mode ---
 def setup_orch_mode() -> None:
     """编排器模式：task.json 注入目标与上下文；时间片截断自 SOLVER_DEADLINE_EPOCH。"""
-    global TARGET_INFO, TASK_PROMPT, MAX_MINUTES, DEADLINE_EPOCH
+    global TARGET_INFO, TASK_PROMPT, MAX_MINUTES, DEADLINE_EPOCH, TASK
     task = load_task()
+    TASK = task
     targets = task.get("targets") or []
     if targets:
         TARGET_INFO = ", ".join(str(t) for t in targets)
