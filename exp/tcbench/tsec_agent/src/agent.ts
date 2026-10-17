@@ -1385,7 +1385,10 @@ export function estLong(c: Challenge): number {
 }
 
 /** D 调度排序（纯函数，可单测）。给定一组候选，返回启动顺序：
- *  1) 长题早启动——开局就把长题顶上去跑（不能最后才启动），但有短题在等时最多占 cap-1 槽
+ *  1) 长题早启动——开局就把长题顶上去跑（不能最后才启动），但有短题在等时**全局**
+ *     最多占 cap-1 槽（保底 1 槽给短题）——配额按「在跑长题数」扣减：前排长题名额 =
+ *     quota - runningLong（实测 bug：只按排序快照给 2 个前排长题，已在跑的 2 长不计入
+ *     → 短题通关释放的槽被第三长抢走，三长占满 3 槽、几十道短题全部饿死）
  *     （保底 1 槽给短题，防饿死）；
  *  2) 短题最短优先（est 升序）；
  *  3) 暂停题 aging——排队超过 agingSec 的提权插到新题前（防 fresh 无限插队，
@@ -1399,19 +1402,21 @@ export function orderCandidates(opts: {
   agingSec: number;
   nowSec: number;
   waitAgeOf: (c: Challenge) => number; // 暂停题已等秒数
+  runningLong: number; // 当前在跑的长题数（配额扣减项）
 }): Challenge[] {
   const { freshLong, freshShort, paused, cap, agingSec, nowSec, waitAgeOf } = opts;
   const waitingShort = freshShort.length + paused.filter((c) => classifyTask(c) === "short").length;
   const longQuota = waitingShort > 0 ? Math.max(1, cap - 1) : cap;
+  const longFront = Math.max(0, longQuota - opts.runningLong); // 已在跑的长题不给前排名额
   const longOrdered = [...freshLong].sort((a, b) => estLong(b) - estLong(a));
   const shortOrdered = [...freshShort].sort((a, b) => estLong(a) - estLong(b));
   const agedPaused = paused.filter((c) => nowSec - waitAgeOf(c) >= agingSec);
   const freshPaused = paused.filter((c) => nowSec - waitAgeOf(c) < agingSec);
   return [
-    ...longOrdered.slice(0, longQuota),
+    ...longOrdered.slice(0, longFront),
     ...shortOrdered,
     ...agedPaused, // aging 提权：暂停够久的插队到新题前
-    ...longOrdered.slice(longQuota),
+    ...longOrdered.slice(longFront),
     ...freshPaused,
   ];
 }
@@ -1919,6 +1924,7 @@ async function runParallel(
         const at = resumeMeta[c.unique_code]?.pausedAt;
         return typeof at === "number" ? Date.now() / 1000 - at : 0;
       },
+      runningLong: countRunningLong(), // 配额扣减：在跑长题不再给前排名额
     });
 
     if (!candidates.length && !running.size) break; // 全部完成或全部结束

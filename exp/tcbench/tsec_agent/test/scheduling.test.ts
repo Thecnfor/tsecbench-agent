@@ -137,7 +137,7 @@ describe("D 调度排序（orderCandidates 纯函数）", () => {
     mk("c-02", "hard", 1), // est 40 long(hard)
     mk("c-03", "easy", 1), // est 30 short
   ];
-  const order = (cap: number) =>
+  const order = (cap: number, runningLong = 0) =>
     orderCandidates({
       freshLong: eight.filter((c) => classifyTask(c) === "long"),
       freshShort: eight.filter((c) => classifyTask(c) === "short"),
@@ -146,6 +146,7 @@ describe("D 调度排序（orderCandidates 纯函数）", () => {
       agingSec: 600,
       nowSec: 0,
       waitAgeOf: () => 0,
+      runningLong,
     });
 
   it("cap=3：长题配额=2（保底 1 槽给短题），首轮应含 1 短", () => {
@@ -177,10 +178,33 @@ describe("D 调度排序（orderCandidates 纯函数）", () => {
       agingSec: 600,
       nowSec: 0,
       waitAgeOf: () => 0,
+      runningLong: 0,
     })
       .slice(0, 3)
       .map((c) => c.unique_code);
     expect(top).toEqual(["b-02", "b-01", "b-03"]);
+  });
+
+  it("回归（1e84c934 实跑）：2 长已在跑时，释放的槽必须给短题而不是第三长", () => {
+    // 实跑时间线：开局 b-02/b-01(长)+a-05(短) 占 3 槽 → a-05 通关释放 →
+    // 旧逻辑按排序快照给 2 个前排长题（不管已在跑 2 长）→ b-03 抢槽 → 三长占满
+    const head = order(3, 2)[0];
+    expect(classifyTask(head)).toBe("short"); // 在跑长题已达配额 → 下一个必须是短题
+    // 长题未达配额（在跑 1 长）时仍可上前排长题
+    expect(classifyTask(order(3, 1)[0])).toBe("long");
+    // 无短题在等：配额=cap，在跑 2 长还能上前排 1 长
+    const longsOnly = eight.filter((c) => classifyTask(c) === "long");
+    const noShort = orderCandidates({
+      freshLong: longsOnly,
+      freshShort: [],
+      paused: [],
+      cap: 3,
+      agingSec: 600,
+      nowSec: 0,
+      waitAgeOf: () => 0,
+      runningLong: 2,
+    });
+    expect(classifyTask(noShort[0])).toBe("long");
   });
 });
 
