@@ -254,6 +254,22 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
             pass
 
 
+async def _salvage_candidates(ctx: RunContext, rec: ChallengeRecord, ws: Path, code: str) -> int:
+    """异常路径兜底收割：提交 solver 已写出但尚未入袋的候选。"""
+    candidates = [flag for flag in harvest(ws) if flag not in rec.submitted]
+    if not candidates:
+        return 0
+    report = await submit_candidates(ctx.client, rec, candidates)
+    ctx.journal.append(
+        "salvage_submit",
+        unique_code=code,
+        candidates=len(candidates),
+        matched=report.new_matches,
+        rejected=report.rejected,
+    )
+    return report.new_matches
+
+
 async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     rec = ctx.registry.records[code]
     rec.attempts += 1
@@ -311,47 +327,53 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     if rec.difficulty == "hard" or rec.attempts > 1:
         ctx.journal.append("model_upgraded", unique_code=code, model=REASONER_MODEL)
     # Staircase 流式切片（§2）：片内节拍早收割，不等整片跑完才提交
-    if config_module.HARNESS_V2:
-        from types import SimpleNamespace
+    try:
+        if config_module.HARNESS_V2:
+            from types import SimpleNamespace
 
-        from .v2_controller import StagePlanner, V2Controller
+            from .v2_controller import StagePlanner, V2Controller
 
-        v2_started = time.monotonic()
-        planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
-        controller = V2Controller(
-            runner=None,
-            max_parallel=min(3, ctx.config.concurrency_limit),
-            node_timeout_s=max(60.0, slice_s),
-        )
-        await controller.run_task(
-            task=rec.description or "",
-            ws=ws,
-            client=ctx.client,
-            journal=ctx.journal,
-            rec=rec,
-            deadline_epoch=deadline_epoch,
-            total_budget_s=slice_s,
-            planner=planner,
-            solver_cmd=ctx.solver_cmd,
-            base_environ=solver_env,
-            slice_s=min(slice_s, streams.STREAM_INTERVAL_S * 20),
-        )
-        outcome = SimpleNamespace(
-            exit_code=0, timed_out=False, duration_s=time.monotonic() - v2_started
-        )
-        early_new, early_completed = 0, False
-    else:
-        outcome, early_new, early_completed = await streams.run_solver_with_stream(
-            solver_cmd=ctx.solver_cmd,
-            ws=ws,
-            deadline_epoch=deadline_epoch,
-            slice_s=slice_s,
-            environ=solver_env,
-            client=ctx.client,
-            journal=ctx.journal,
-            unique_code=code,
-            rec=rec,
-        )
+            v2_started = time.monotonic()
+            planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
+            controller = V2Controller(
+                runner=None,
+                max_parallel=min(3, ctx.config.concurrency_limit),
+                node_timeout_s=max(60.0, slice_s),
+            )
+            await controller.run_task(
+                task=rec.description or "",
+                ws=ws,
+                client=ctx.client,
+                journal=ctx.journal,
+                rec=rec,
+                deadline_epoch=deadline_epoch,
+                total_budget_s=slice_s,
+                planner=planner,
+                solver_cmd=ctx.solver_cmd,
+                base_environ=solver_env,
+                slice_s=min(slice_s, streams.STREAM_INTERVAL_S * 20),
+            )
+            outcome = SimpleNamespace(
+                exit_code=0, timed_out=False, duration_s=time.monotonic() - v2_started
+            )
+            early_new, early_completed = 0, False
+        else:
+            outcome, early_new, early_completed = await streams.run_solver_with_stream(
+                solver_cmd=ctx.solver_cmd,
+                ws=ws,
+                deadline_epoch=deadline_epoch,
+                slice_s=slice_s,
+                environ=solver_env,
+                client=ctx.client,
+                journal=ctx.journal,
+                unique_code=code,
+                rec=rec,
+            )
+    except BaseException:
+        # 提交/WAF/网络异常不能让 solver 已产出的候选随重排丢失（run-35236 c-06）。
+        with contextlib.suppress(Exception):
+            await _salvage_candidates(ctx, rec, ws, code)
+        raise
     ctx.journal.append(
         "solver_done",
         unique_code=code,
