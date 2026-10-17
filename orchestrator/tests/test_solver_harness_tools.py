@@ -182,3 +182,15 @@ def test_recon_attaches_kb_hits(common, monkeypatch):
 
 def test_plain_nudge_threshold_is_relaxed(common):
     assert common.MAX_PLAIN_NUDGES >= 6
+
+
+def test_recon_attaches_fast_path(common, monkeypatch):
+    fake = types.SimpleNamespace(
+        recon_host=lambda target: {"target": target, "open_ports": ["3000"]},
+        recon_web=lambda url: {"url": url, "title": "Dify", "tech": ["next.js"]},
+        derive_web_url=lambda target, ports: "http://x:3000/",
+    )
+    monkeypatch.setitem(sys.modules, "recon_recipe", fake)
+    monkeypatch.setattr(common, "kb_snippets", lambda query, top_k=3: "")
+    out = common.run_recon({"mode": "web", "url": "http://x:3000/"})
+    assert "# FAST PATH" in out["fast_path"]

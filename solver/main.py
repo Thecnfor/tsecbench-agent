@@ -102,6 +102,16 @@ def _persist_harness_state(messages: list[dict]) -> None:
         pass
 
 
+def _fact_signature(text: str) -> set[str]:
+    """从工具输出提取「新事实」签名：凭据/端点/版本。"""
+    findings = state.extract_findings(text)
+    return {
+        f"{kind}:{value}"
+        for kind in ("credentials", "endpoints", "versions")
+        for value in findings.get(kind) or []
+    }
+
+
 def _flag_nudge(common_mod, reported_before: int) -> str | None:
     """多 flag 进度：只在发现新 flag 且仍有剩余时追加一次结构化提示。"""
     task = getattr(common_mod, "TASK", {}) or {}
@@ -163,6 +173,10 @@ def main() -> int:
     nudges = 0
     closing_nudged = False
     last_prompt_tokens = 0
+    seen_facts: set[str] = set()
+    factless_turns = 0
+    last_fact_turn = 0
+    fact_nudged = False
     turn = 0
 
     while turn < common.turn_limit() and time.time() < deadline:
@@ -293,6 +307,44 @@ def main() -> int:
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": f"[{meta}{note}]\n{out}"}
             )
+
+        # 收敛守卫：长时间没有新资产/凭据/端点 → 先提示换面，再无事实则收尾。
+        recent_tools = "\n".join(
+            str(message.get("content") or "")
+            for message in messages[-10:]
+            if message.get("role") == "tool"
+        )
+        facts = _fact_signature(recent_tools)
+        if facts - seen_facts:
+            seen_facts |= facts
+            factless_turns = 0
+            last_fact_turn = turn
+            fact_nudged = False
+        else:
+            factless_turns += 1
+        if factless_turns >= common.NO_FACT_NUDGE_TURNS and not fact_nudged:
+            fact_nudged = True
+            print(
+                f"[solver] no new facts for {factless_turns} turns; switching surface",
+                flush=True,
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"No new asset/credential/endpoint in the last {factless_turns} turns. "
+                        "This surface looks exhausted: switch to the next candidate from the "
+                        "FAST PATH/KB, or stop and report your best hypothesis. Do not repeat "
+                        "the same request shape."
+                    ),
+                }
+            )
+        if turn - last_fact_turn >= common.STALE_HARD_TURNS and not common._reported:
+            print(
+                f"[solver] stale surface for {turn - last_fact_turn} turns; stopping",
+                flush=True,
+            )
+            break
 
         # 收尾提示必须在整组 tool 结果之后追加：插在组中间会让历史永久 400。
         nudge = _flag_nudge(common, reported_before)

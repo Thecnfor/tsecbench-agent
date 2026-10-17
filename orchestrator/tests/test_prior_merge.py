@@ -62,3 +62,23 @@ def test_setup_orch_mode_injects_startup_knowledge(monkeypatch, tmp_path):
     common = importlib.import_module("common")
     common.setup_orch_mode()
     assert "# KNOWLEDGE" in common.TASK_PROMPT
+
+
+def test_setup_orch_mode_injects_fast_path(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(
+        json.dumps(
+            {
+                "description": "合同审批系统 接口 临时调整 管理员审批",
+                "targets": ["10.0.0.1:80"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.setenv("SOLVER_DEADLINE_EPOCH", "9999999999")
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    common = importlib.import_module("common")
+    common.setup_orch_mode()
+    assert "# FAST PATH" in common.TASK_PROMPT

@@ -70,3 +70,17 @@ def test_flag_nudge_only_when_new_flag_and_flags_remain(monkeypatch, tmp_path):
     assert "FLAG{a}" not in (nudge or "")
     assert "2" in (nudge or "")
     assert main._flag_nudge(common, 1) is None
+
+
+def test_fact_signature_detects_credentials_and_endpoints(monkeypatch, tmp_path):
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"unique_code": "x1"}), encoding="utf-8")
+    monkeypatch.setenv("SOLVER_TASK", str(task))
+    monkeypatch.syspath_prepend(str(SOLVER_DIR))
+    sys.modules.pop("common", None)
+    sys.modules.pop("main", None)
+    main = importlib.import_module("main")
+    facts = main._fact_signature('{"DATABASE_PASSWORD":"flag{pwd}"} http://10.0.0.1:8080/api')
+    assert any(item.startswith("credentials:") for item in facts)
+    assert any(item.startswith("endpoints:") for item in facts)
+    assert main._fact_signature("just prose, no facts") == set()

@@ -59,6 +59,9 @@ TRIM_TOKENS = int(cfg("SOLVER_TRIM_TOKENS", "90000"))
 TRIM_KEEP_MSGS = int(cfg("SOLVER_TRIM_KEEP_MSGS", "60"))
 # 连续「只说不做」的停机阈值：3 太早，实测会把已拿到 LFI/凭据的链子掐断。
 MAX_PLAIN_NUDGES = int(cfg("SOLVER_MAX_PLAIN_NUDGES", "6"))
+# 收敛守卫：连续多少轮没有新资产/凭据/端点就提示换面；多少轮无新事实直接收尾。
+NO_FACT_NUDGE_TURNS = int(cfg("SOLVER_NO_FACT_NUDGE_TURNS", "8"))
+STALE_HARD_TURNS = int(cfg("SOLVER_STALE_HARD_TURNS", "30"))
 
 
 def effective_command_timeout(
@@ -268,13 +271,27 @@ def build_tool_specs() -> list[dict]:
 
 
 def _with_kb(result: dict) -> dict:
-    """recon 结果附带离线 KB 命中：把「发现指纹 → payload」压到同一回合。"""
+    """recon 结果附带离线 KB 命中与 FAST PATH：把「发现指纹 → 第一批动作」压到同一回合。"""
     query = " ".join(
         [str(TASK.get("description") or ""), json.dumps(result, ensure_ascii=False)[:1500]]
     ).strip()
     hits = kb_snippets(query, top_k=2)
     if hits:
         result["kb"] = hits[:4000]
+    try:
+        import playbooks
+
+        target = TARGET_INFO.split(",")[0].strip()
+        hint = playbooks.match_and_render(
+            " ".join(
+                [str(TASK.get("description") or ""), json.dumps(result, ensure_ascii=False)[:2000]]
+            ),
+            target,
+        )
+        if hint:
+            result["fast_path"] = hint
+    except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
+        pass
     return result
 
 
@@ -640,6 +657,17 @@ def setup_orch_mode() -> None:
     )
     if knowledge:
         TASK_PROMPT = (TASK_PROMPT + "\n\n" + knowledge).strip()
+    try:
+        import playbooks
+
+        target = str(targets[0]) if targets else ""
+        hint = playbooks.match_and_render(
+            " ".join([task.get("description") or "", *targets]), target
+        )
+        if hint:
+            TASK_PROMPT = (TASK_PROMPT + "\n\n" + hint).strip()
+    except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
+        pass
     deadline_epoch = os.environ.get("SOLVER_DEADLINE_EPOCH")
     if deadline_epoch:
         try:
