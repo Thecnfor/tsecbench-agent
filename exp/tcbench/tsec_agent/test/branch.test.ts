@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { type BranchCfg, BranchManager, normalizeNote } from "../src/branch.js";
+import { dispatchBranchTool } from "../src/branch_tools.js";
 import {
   BYSTANDER_SYSTEM,
   buildBystanderInput,
@@ -21,7 +22,7 @@ import {
   FlagLedger,
   readCorelog,
 } from "../src/corelog.js";
-import { FORK_PROMPT_EXTRA } from "../src/prompt.js";
+import { CORE_LOG_PROMPT_EXTRA, FORK_PROMPT_EXTRA } from "../src/prompt.js";
 import { rebuildBranches, rebuildMessages } from "../src/records.js";
 import type { ChatMessage } from "../src/types.js";
 
@@ -666,5 +667,31 @@ describe("旁观者越权建议检测（run5 真实判例集）", () => {
     // 执行侧同样声明：界由 fork 划定、broadcast 只上行主分支
     expect(FORK_PROMPT_EXTRA).toContain("不要轻易跨界");
     expect(FORK_PROMPT_EXTRA).toContain("只上行给主分支");
+  });
+});
+
+describe("core_log 检查方向归 sys（不逐次塞工具结果）", () => {
+  it("工具结果只回确认事实；六要素/置信要求/黑板路径在 sys extras", () => {
+    const bm = mkBm();
+    const out = dispatchBranchTool(
+      "core_log",
+      { note: "方法:探测 /download 得 validator ELF(已验证)" },
+      { bm, corelog: null, ledger: null, now: () => 1000, log: () => {} },
+      0,
+      "c1",
+    );
+    expect(out).not.toBeNull();
+    // 工具结果 = 确认事实，不带教学检查行（arena 实测 8/8 结果重复下发——归 sys）
+    expect(out!.result).toContain("logged to core log (branch 0)");
+    expect(out!.result).not.toContain("六要素自查");
+    expect(out!.result).not.toContain("齐了吗");
+    expect(out!.result).not.toContain("判断带置信");
+    // 检查方向与信心要求常驻 sys（fork / 旁观者两种模式都覆盖）
+    expect(FORK_PROMPT_EXTRA).toContain("报告六要素");
+    expect(FORK_PROMPT_EXTRA).toContain("判断必须明确写信心");
+    expect(FORK_PROMPT_EXTRA).toContain("corelog.jsonl");
+    expect(CORE_LOG_PROMPT_EXTRA).toContain("报告六要素");
+    expect(CORE_LOG_PROMPT_EXTRA).toContain("不敢保证");
+    expect(CORE_LOG_PROMPT_EXTRA).toContain("corelog.jsonl");
   });
 });
