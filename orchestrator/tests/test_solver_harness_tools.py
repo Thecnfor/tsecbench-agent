@@ -19,6 +19,7 @@ def common():
     sys.modules.pop("common", None)
     mod = importlib.import_module("common")
     yield mod
+    mod.reset_shell_session()
     sys.modules.pop("common", None)
 
 
@@ -241,3 +242,20 @@ def test_placeholder_flags_are_rejected(common):
     assert common.find_flags("FLAG{xxx}") == []
     real = "flag{ce38f9c5-2635-4c27-8209-ee21e32559f0}"
     assert common.find_flags(real) == [real]
+
+
+def test_persistent_shell_keeps_vars_and_cwd(common, tmp_path):
+    common.reset_shell_session()
+    assert common.run_command("X=hello", 5)["exit_code"] == 0
+    assert "hello" in common.run_command("echo $X", 5)["output"]
+    common.run_command(f"cd {tmp_path}", 5)
+    assert str(tmp_path) in common.run_command("pwd", 5)["output"]
+    common.reset_shell_session()
+
+
+def test_persistent_shell_timeout_restarts(common):
+    common.reset_shell_session()
+    out = common.run_command("sleep 30", 1)
+    assert out["timed_out"] is True
+    assert "ok" in common.run_command("echo ok", 5)["output"]
+    common.reset_shell_session()

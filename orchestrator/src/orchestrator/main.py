@@ -269,6 +269,17 @@ def _should_extend(remaining_s: float, completed: bool, has_progress: bool) -> b
     return not completed and remaining_s > 5.0 and has_progress
 
 
+def _probe_decision(stage: int, has_progress: bool, high_value: bool, remaining_s: float) -> str:
+    """分层试探：60s 有资产 → 再 60s → 只有凭据/候选才继续吃剩余片。"""
+    if remaining_s <= 5.0:
+        return "stop"
+    if stage == 1:
+        return "second" if has_progress else "stop"
+    if stage == 2:
+        return "full" if high_value else "stop"
+    return "full"
+
+
 def _active_slots(ctx: RunContext) -> int:
     """并发槽真值 = 在飞 pipeline 数。
 
@@ -389,11 +400,15 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
             probe_slice = min(PROBE_SLICE_S, remaining_slice)
             early_new, early_completed = 0, False
             outcome = None
-            first = True
+            stage = 1
             while True:
-                run_slice = max(
-                    5.0, min(probe_slice if first else remaining_slice, remaining_slice)
-                )
+                if stage == 1:
+                    run_slice = probe_slice
+                elif stage == 2:
+                    run_slice = min(PROBE_SLICE_S, remaining_slice)
+                else:
+                    run_slice = remaining_slice
+                run_slice = max(5.0, min(run_slice, remaining_slice))
                 slice_count += 1
                 sub_deadline = min(time.time() + run_slice, ctx.t0 + ctx.config.total_time_limit_s)
                 outcome, sub_new, sub_completed = await streams.run_solver_with_stream(
@@ -415,19 +430,27 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                 prior = _merge_prior(ctx.priors.get(code), collect_prior(ws))
                 ctx.priors[code] = prior
                 has_progress = _slice_has_progress(ws) or bool(prior.get("credentials"))
-                if not _should_extend(remaining_slice, early_completed, has_progress):
+                high_value = bool(prior.get("credentials")) or bool(harvest(ws))
+                decision = _probe_decision(stage, has_progress, high_value, remaining_slice)
+                if decision == "stop":
                     ctx.journal.append(
-                        "probe_stop", unique_code=code, remaining_s=round(remaining_slice, 1)
+                        "probe_stop",
+                        unique_code=code,
+                        stage=stage,
+                        remaining_s=round(remaining_slice, 1),
                     )
                     break
                 ctx.journal.append(
-                    "probe_extend", unique_code=code, remaining_s=round(remaining_slice, 1)
+                    "probe_extend",
+                    unique_code=code,
+                    stage=stage,
+                    remaining_s=round(remaining_slice, 1),
                 )
                 for name in ("stdout.log", "stderr.log"):
                     source = ws / name
                     if source.is_file():
                         with contextlib.suppress(OSError):
-                            shutil.copyfile(source, ws / f"{name}.slice1")
+                            shutil.copyfile(source, ws / f"{name}.slice{stage}.log")
                 prepare_workspace(
                     ctx.workspace_root,
                     rec,
@@ -436,7 +459,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                     sops=sops,
                     repair_note=ctx.repair_notes.get(code),
                 )
-                first = False
+                stage = 2 if decision == "second" else 3
     except BaseException:
         # 提交/WAF/网络异常不能让 solver 已产出的候选随重排丢失（run-35236 c-06）。
         with contextlib.suppress(Exception):

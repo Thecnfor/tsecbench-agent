@@ -26,3 +26,14 @@ def test_should_extend_rules():
     assert _should_extend(0, False, True) is False
     assert _should_extend(240, True, True) is False
     assert _should_extend(240, False, False) is False
+
+
+def test_probe_decision_tiers():
+    from orchestrator.main import _probe_decision
+
+    assert _probe_decision(1, True, False, 240) == "second"
+    assert _probe_decision(1, False, False, 240) == "stop"
+    assert _probe_decision(2, True, False, 240) == "stop"
+    assert _probe_decision(2, True, True, 240) == "full"
+    assert _probe_decision(3, True, False, 240) == "full"
+    assert _probe_decision(1, True, True, 0) == "stop"

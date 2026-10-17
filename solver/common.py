@@ -11,12 +11,15 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import os
 import re
+import select
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -112,16 +115,146 @@ def turn_limit() -> int:
 
 
 # ---------------------------------------------------------------- executor ---
+PERSISTENT_SHELL = (cfg("SOLVER_PERSISTENT_SHELL", "on") or "").strip().lower() in (
+    "1",
+    "on",
+    "true",
+    "yes",
+) and os.name == "posix"
+_SHELL_LOCK = threading.Lock()
+_SHELL: _PersistentShell | None = None
+
+
+class _PersistentShell:
+    """长驻 bash：变量/cwd/导出跨 run_command 保留（SWE-agent ACI 思路）。
+
+    每条命令后打印唯一 sentinel + `$?`；超时/异常时杀整个进程组并重启。
+    """
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.start()
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            ["bash", "--noprofile", "--norc"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+            bufsize=0,
+            start_new_session=True,
+        )
+
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            self.proc.wait(timeout=2)
+        self.proc = None
+
+    def run(self, command: str, timeout: int) -> dict:
+        with _SHELL_LOCK:
+            if self.proc is None or self.proc.poll() is not None:
+                self.stop()
+                self.start()
+            sentinel = f"__TSEC_DONE_{os.getpid()}_{time.time_ns()}__"
+            payload = f"{command}\nprintf '\\n%s%s\\n' '{sentinel}' \"$?\"\n"
+            started = time.time()
+            try:
+                assert self.proc.stdin is not None
+                self.proc.stdin.write(payload.encode("utf-8"))
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.stop()
+                self.start()
+                return {
+                    "exit_code": 127,
+                    "output": "shell restarted",
+                    "timed_out": False,
+                    "seconds": 0.0,
+                }
+            buffer = b""
+            marker = sentinel.encode()
+            deadline = time.time() + timeout
+            assert self.proc.stdout is not None
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self.stop()
+                    self.start()
+                    return {
+                        "exit_code": 124,
+                        "output": buffer.decode("utf-8", errors="replace"),
+                        "timed_out": True,
+                        "seconds": round(time.time() - started, 1),
+                    }
+                ready, _, _ = select.select([self.proc.stdout], [], [], min(0.2, remaining))
+                if not ready:
+                    continue
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    exit_code = self.proc.returncode or 1
+                    self.stop()
+                    self.start()
+                    return {
+                        "exit_code": exit_code,
+                        "output": buffer.decode("utf-8", errors="replace"),
+                        "timed_out": False,
+                        "seconds": round(time.time() - started, 2),
+                    }
+                buffer += chunk
+                index = buffer.find(marker)
+                if index < 0:
+                    continue
+                after = buffer[index + len(marker) :]
+                code_line, _, _rest = after.partition(b"\n")
+                try:
+                    exit_code = int(code_line.strip() or b"0")
+                except ValueError:
+                    exit_code = 0
+                output = buffer[:index]
+                if output.startswith(b"\n"):
+                    output = output[1:]
+                return {
+                    "exit_code": exit_code,
+                    "output": output.decode("utf-8", errors="replace"),
+                    "timed_out": False,
+                    "seconds": round(time.time() - started, 2),
+                }
+
+
+def reset_shell_session() -> None:
+    """测试/收尾用：杀掉长驻 shell。"""
+    global _SHELL
+    if _SHELL is not None:
+        _SHELL.stop()
+        _SHELL = None
+
+
+atexit.register(reset_shell_session)
+
+
 def run_command(command: str, timeout: int) -> dict:
     """Run a shell command inside the challenge container (or locally).
 
-    **一律用 `timeout -k 3 <t>` 包一层**（非容器模式也一样）。实测：solver 常写
-    无超时的命令（如 `curl -s -i http://T/`），目标挂死时只有宿主侧 `t+20` 的
-    粗杀兜底 —— 一条命令白烧 120s+ 时间片。内层 timeout 让超时精确到 t。
+    **默认使用长驻 bash**（变量/cwd 跨命令保留）；每条命令带唯一 sentinel
+    与 `$?`，超时杀整个进程组并重启。容器模式/关闭开关时退回逐条
+    `timeout -k` 执行。
 
-    外层仍 kill 整个进程组：内层 `timeout` 只终止直接子进程（bash），孙子进程
-    （curl/nmap）会成孤儿，必须按组清。
+    逐条路径的说明：实测 solver 常写无超时的命令（如 `curl -s -i http://T/`），
+    目标挂死时只有宿主侧 `t+20` 的粗杀兜底 —— 一条命令白烧 120s+ 时间片。
+    内层 timeout 让超时精确到 t；外层仍 kill 整个进程组防孤儿。
     """
+    if PERSISTENT_SHELL and not CONTAINER:
+        global _SHELL
+        if _SHELL is None:
+            _SHELL = _PersistentShell()
+        return _SHELL.run(command, timeout)
+
     inner = ["bash", "-lc", command]
     if CONTAINER:
         inner = ["docker", "exec", "-i", CONTAINER, *inner]
@@ -301,15 +434,17 @@ def _with_kb(result: dict) -> dict:
         playbook = playbooks.match(combined)
         if playbook:
             result["fast_path"] = playbooks.render(playbook, target)
-            probe_cmd = playbooks.first_get_step(playbook, target)
-            if probe_cmd and playbook["id"] not in _AUTO_PROBED:
+            probes = playbooks.safe_probes(playbook, target)
+            if probes and playbook["id"] not in _AUTO_PROBED:
                 _AUTO_PROBED.add(playbook["id"])
-                probe = run_command(probe_cmd, 6)
-                if str(probe.get("output") or "").strip():
-                    result["fast_probe"] = {
-                        "cmd": probe_cmd,
-                        "output": truncate(str(probe["output"]), 2000),
-                    }
+                collected = []
+                for probe_cmd in probes:
+                    probe = run_command(probe_cmd, 6)
+                    output = str(probe.get("output") or "").strip()
+                    if output:
+                        collected.append({"cmd": probe_cmd, "output": truncate(output, 1200)})
+                if collected:
+                    result["fast_probe"] = collected
     except Exception:  # noqa: BLE001 - 快速路径是增强，不是必需
         pass
     return result
