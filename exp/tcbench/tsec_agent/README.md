@@ -102,7 +102,7 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
 | `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸，轮数防极端空转） | 120 |
 | `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | 300 |
-| `AGENT_COMPACT_CHARS` | 上下文自动压缩阈值（字符估算；超限压缩为交接文档：凭据原值/产物与在途/死路/进度；0=关） | 120000 |
+| `AGENT_COMPACT_CHARS` | 上下文压缩兜底阈值（字符估算；主触发器是「找到 flag」回合末强制压缩；交接文档：凭据原值/产物与在途/死路/进度；0=只留 flag 触发） | 120000 |
 | `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |

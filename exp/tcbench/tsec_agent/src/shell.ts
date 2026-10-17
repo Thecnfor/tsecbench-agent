@@ -239,21 +239,6 @@ function shrink(src: string, capBytes: number): string | null {
   return null;
 }
 
-/** 文本模式（网关不支持图像）时的兜底：tesseract 英文 OCR。 */
-function ocr(file: string): string {
-  try {
-    const r = spawnSync("tesseract", [file, "stdout", "-l", "eng"], {
-      timeout: 25_000,
-      encoding: "utf8",
-    });
-    const txt = (r.stdout || "").trim();
-    if (txt) return txt.slice(0, 4000);
-  } catch {
-    /* ignore */
-  }
-  return "";
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -509,12 +494,11 @@ export class ShellManager {
     }
     const header = `[image] ${file}  ${dims}  ${data.length}B  ${mime}  detail=${d} ${note}`;
     if (CFG.vision === "off" || CFG.vision_ok === false) {
-      const text = ocr(file);
       return (
         header +
-        "\n当前为文本模式（AGENT_VISION=off 或网关已拒图），没有图片本体：" +
-        (text ? `\nOCR(tesseract eng):\n${text}\n` : "\nOCR 无输出。\n") +
-        "也可改用 shell 侧分析：file/xxd/strings/exiftool、系统 python3 的 PIL（尺寸/直方图/像素采样），或先裁剪关键区域。"
+        "\n当前为文本模式（AGENT_VISION=off 或网关已拒图），没有图片本体。" +
+        "请改用 shell 侧分析：file/xxd/strings/exiftool、系统 python3 的 PIL（尺寸/直方图/像素采样），或先裁剪/缩放关键区域再 view。" +
+        "验证码类图片可 shell 跑 `tesseract <图> stdout -l eng` 取文字。"
       );
     }
     const url = `data:${mime};base64,${data.toString("base64")}`;

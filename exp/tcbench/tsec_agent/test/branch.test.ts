@@ -22,7 +22,7 @@ import {
   FlagLedger,
   readCorelog,
 } from "../src/corelog.js";
-import { CORE_LOG_PROMPT_EXTRA, FORK_PROMPT_EXTRA } from "../src/prompt.js";
+import { CORE_LOG_PROMPT_EXTRA, FORK_PROMPT_EXTRA, systemPromptWithExtras } from "../src/prompt.js";
 import { rebuildBranches, rebuildMessages } from "../src/records.js";
 import type { ChatMessage } from "../src/types.js";
 
@@ -686,12 +686,14 @@ describe("core_log 检查方向归 sys（不逐次塞工具结果）", () => {
     expect(out!.result).not.toContain("六要素自查");
     expect(out!.result).not.toContain("齐了吗");
     expect(out!.result).not.toContain("判断带置信");
-    // 检查方向与信心要求常驻 sys（fork / 旁观者两种模式都覆盖）
-    expect(FORK_PROMPT_EXTRA).toContain("报告六要素");
-    expect(FORK_PROMPT_EXTRA).toContain("判断必须明确写信心");
+    // 信心要求 + 自动记黑板声明常驻 sys（fork / 旁观者两种模式都覆盖）
+    expect(FORK_PROMPT_EXTRA).toContain("判断明确写信心");
+    expect(FORK_PROMPT_EXTRA).toContain("自动记入黑板");
     expect(FORK_PROMPT_EXTRA).toContain("corelog.jsonl");
-    expect(CORE_LOG_PROMPT_EXTRA).toContain("报告六要素");
     expect(CORE_LOG_PROMPT_EXTRA).toContain("不敢保证");
+    expect(CORE_LOG_PROMPT_EXTRA).toContain("自动记入黑板");
     expect(CORE_LOG_PROMPT_EXTRA).toContain("corelog.jsonl");
+    // 六要素一行在基础 sys（core_log 工具在场时）
+    expect(systemPromptWithExtras(true, false)).toContain("报告六要素");
   });
 });

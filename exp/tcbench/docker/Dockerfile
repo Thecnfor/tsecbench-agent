@@ -41,12 +41,12 @@ RUN set -eux; \
 #       隧道 / 漏洞库 / 杂项 / 基础运行时
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nmap masscan whatweb \
-        sqlmap gobuster ffuf dirb nikto \
+        sqlmap gobuster ffuf dirb nikto feroxbuster \
         wpscan wafw00f sslscan \
         hydra john sshpass \
         openvpn \
         curl wget ca-certificates \
-        netcat-openbsd dnsutils xxd jq git \
+        netcat-openbsd busybox-static dnsutils xxd jq git \
         python3 python3-pip python3-venv \
         python3-requests python3-pil python3-scapy python3-cryptography \
         procps iproute2 iputils-ping traceroute tcpdump \
@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tshark arp-scan hping3 net-tools \
         binutils file gdb strace ltrace radare2 ropper python3-pwntools \
         binwalk libimage-exiftool-perl steghide foremost \
+        tesseract-ocr tesseract-ocr-eng \
         exploitdb \
         wordlists seclists \
         expect rlwrap lsof p7zip-full zip unzip rsync tmux vim-tiny \
@@ -66,7 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN find /usr/share/seclists -mindepth 1 -maxdepth 1 \
         ! -name "Discovery" ! -name "Payloads" ! -name "Passwords" -exec rm -rf {} + ; \
     find /usr/share/seclists/Discovery -mindepth 1 -maxdepth 1 \
-        ! -name "Web-Content" -exec rm -rf {} + ; \
+        ! -name "Web-Content" ! -name "DNS" -exec rm -rf {} + ; \
     find /usr/share/seclists -type f -size +2M -delete ; \
     find /usr/share/exploitdb -maxdepth 1 -type d ! -name exploitdb \
         ! -name "exploits" ! -name "shellcodes" ! -name "www" -exec rm -rf {} + 2>/dev/null || true ; \
@@ -156,6 +157,51 @@ RUN pip3 install --break-system-packages --no-cache-dir volatility3==2.28.2 \
 # 放尾部独立层：只新建一层，前面全部缓存命中（Dockerfile 缓存纪律同 Ghidra/独立层先例）。
 RUN pip3 install --break-system-packages --no-cache-dir ruff \
     || pip3 install --no-cache-dir ruff
+
+# ── 可搬运静态客户端（/opt/portable）：靶机缺 mysql/redis/socat 时直接 scp 上去用 ──
+# 起因（b-03 复盘）：Web 容器无 mysql/redis-cli/nc，横向时被迫手写 MySQL/Redis 协议客户端。
+# 做法：把 Kali 里的动态二进制 + 它依赖的全部 .so + ld-linux loader 打包成单目录 + run.sh，
+#  用 loader --library-path 指向包内库执行 —— 不依赖目标机装了什么、glibc 版本也自带，
+#  scp 整个目录后 ./run.sh 即跑（比真·musl 静态更好维护：不用交叉编译，直接用 apt 的产物）。
+RUN set -eux; \
+    mkdir -p /opt/portable; \
+    bundle() { \
+        bin="$1"; dir="/opt/portable/$(basename "$bin")"; mkdir -p "$dir"; \
+        cp "$(command -v "$bin")" "$dir/"; \
+        ldd "$(command -v "$bin")" | awk '{print $3}' | grep '^/' | sort -u \
+            | while read -r lib; do cp -n "$lib" "$dir/" 2>/dev/null || true; done; \
+        loader=$(ldd "$(command -v "$bin")" | awk '/ld-linux/{print $1}' | head -1); \
+        [ -n "$loader" ] && cp -n "$loader" "$dir/"; \
+        { echo '#!/bin/sh'; \
+          echo 'D=$(cd "$(dirname "$0")" && pwd)'; \
+          echo "exec \"\$D/$(basename "$loader")\" --library-path \"\$D\" \"\$D/$(basename "$bin")\" \"\$@\""; \
+        } > "$dir/run.sh"; \
+        chmod +x "$dir/run.sh"; \
+    }; \
+    bundle mysql; bundle redis-cli; bundle socat; \
+    ls -la /opt/portable
+
+# ── LFI / 403 绕过专用小工具（源码构建；apt 无包）────────────────────────────
+#   kadimus   : LFI 扫描/利用（b-01 曾自写多线程 LFI oracle 代替它）
+#   nomore403 : 403/40X 绕过（b-01/b-03 的面板 403 卡过）
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev libpcre3-dev libssh-dev \
+    ; \
+    git clone --depth 1 https://github.com/P0cL4bs/Kadimus /tmp/kadimus \
+    && make -C /tmp/kadimus -j"$(nproc)" \
+    && cp /tmp/kadimus/kadimus /usr/local/bin/kadimus \
+    && rm -rf /tmp/kadimus \
+    ; \
+    export GOPROXY=https://goproxy.cn,direct GOFLAGS=-mod=mod; \
+    git clone --depth 1 https://github.com/devploit/nomore403 /tmp/n403 \
+    && (cd /tmp/n403 && go build -o /usr/local/bin/nomore403 .) \
+    && rm -rf /tmp/n403 "$(go env GOPATH)"/pkg/mod \
+    ; \
+    apt-get purge -y --auto-remove libcurl4-openssl-dev libpcre3-dev libssh-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    ; \
+    kadimus --help 2>&1 | head -1; nomore403 -h 2>&1 | head -1
 
 # ── 最终瘦身（builder 的最后一次清理，删掉的东西不进成品文件系统）──────────
 # 前面每个工具层都会把自己那批 doc/man/locale 带回来（清理层在它们之前），这里统一收口：

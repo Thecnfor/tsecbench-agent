@@ -140,7 +140,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     "/work/tasks/t-c2/ffuf.log（目录爆破结果）③死路：news.php 无注入（intval 判定）" +
     "④进度：后台已登录待枚举 ⑤flag 进度 0/2";
 
-  it("多 flag：超阈值自动压缩交接（黑板落卡）+ 最后 flag 响应即收束；rebuild 等价", async () => {
+  it("多 flag：找到 flag 即压缩交接（主触发，阈值不参与）+ 最后 flag 响应即收束", async () => {
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact_"));
     setRecordsDir(recdir);
     resetRecords();
@@ -163,18 +163,12 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     );
     CFG.benchmark_token = "t";
     CFG.benchmark_base_url = "http://bench.test";
-    // 阈值：系统提示词 + 卡 + 轮1 的 assistant/tool 越线；压缩后（短交接文档）回线内
-    CFG.compact_chars = systemPromptWithExtras(false, false).length + 600;
+    CFG.compact_chars = 999_999; // 阈值不参与——压缩只由「找到 flag」触发
     const { client, taskCalls } = makeClient(
       [
-        // 任务轮 1：shell 长输出推高上下文
-        {
-          content: null,
-          tool_calls: [tc("s1", "shell", { command: `echo "${"x".repeat(700)}"`, wait_ms: 3000 })],
-        },
-        // 任务轮 2：submit flag#0（1/2——多 flag 不再要求逐 flag 总结）
+        // 任务轮 1：submit flag#0（1/2）→ 找到 flag → 回合末强制压缩交接
         { content: null, tool_calls: [tc("s2", "submit_flag", { flag: "flag{aaa}" })] },
-        // 任务轮 3：submit flag#1（2/2）→ 响应即收束（不等模型尾轮）
+        // 任务轮 2：submit flag#1（2/2）→ 响应即收束（不等模型尾轮）
         { content: null, tool_calls: [tc("s3", "submit_flag", { flag: "flag{bbb}" })] },
       ],
       COMPACT_DOC,
@@ -182,7 +176,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     const conv = rec().conversation("t-c2");
     const r = await solveTask(client, "t-c2", "卡", 600, conv, { flagTotal: 2 });
     expect(r.status).toBe("done");
-    expect(r.turnsUsed).toBe(3); // 压缩是元调用，不占轮次
+    expect(r.turnsUsed).toBe(2); // 压缩是元调用，不占轮次
     // 压缩发生：末尾 = [head…, 交接文档, 最后 flag 的 submit, tool]；文档前无过程残留
     const notes = r.messages.filter((m) =>
       String(m.content ?? "").startsWith("【系统·上下文压缩】"),
@@ -197,9 +191,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     ); // 文档后是最后一次提交
     // conv 锚 + 提交记录 + corelog【压缩交接】卡（凭据原值不截断）
     const convRecs = readJsonl(recdir, "tasks/t-c2/conversation.jsonl");
-    expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBeGreaterThanOrEqual(
-      1,
-    );
+    expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBe(1); // 仅 flag#0 后一次
     expect(convRecs.filter((x) => x.kind === "tool" && x.tool === "submit_flag").length).toBe(2);
     const coreRecs = readJsonl(recdir, "tasks/t-c2/corelog.jsonl");
     const handoff = coreRecs.filter((x) => String(x.note ?? "").startsWith("【压缩交接】"));
@@ -275,5 +267,68 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
     // 过程完整保留（单 flag 短上下文不压缩）
     expect(rec().loadMessages("t-c1").length).toBe(r.messages.length);
+  });
+
+  it("阈值兜底：无 flag 也压（长 shell 越线）；自动黑板把进展叙述落卡", async () => {
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact3_"));
+    setRecordsDir(recdir);
+    resetRecords();
+    initRecords("local", "deepseek-flash");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              correct: true,
+              matched_flag_index: 0,
+              correct_flag_count: 1,
+              total_flag_count: 1,
+            }),
+            { status: 200 },
+          ),
+      ),
+    );
+    CFG.benchmark_token = "t";
+    CFG.benchmark_base_url = "http://bench.test";
+    CFG.compact_chars = systemPromptWithExtras(false, false).length + 600; // shell 700B 越线
+    const script: Array<Record<string, unknown>> = [
+      // 轮 1：长 shell 输出推高上下文
+      {
+        content: null,
+        tool_calls: [tc("s1", "shell", { command: `echo "${"x".repeat(700)}"`, wait_ms: 3000 })],
+      },
+      // 轮 2：submit（1/1）→ 单 flag 收尾总结指示
+      { content: null, tool_calls: [tc("s2", "submit_flag", { flag: "flag{single}" })] },
+      // 轮 3：收尾总结（≥8 字叙述 → 自动落黑板卡）
+      { content: "注入拿到，本题收束：后台弱口令已验证。" },
+    ];
+    let i = 0;
+    const client = {
+      async create(opts: { messages: ChatMessage[]; tools?: unknown[] }) {
+        const last = String(opts.messages.at(-1)?.content ?? "");
+        if (last.includes("即将被压缩为一份")) {
+          return { choices: [{ message: { role: "assistant", content: COMPACT_DOC } }] };
+        }
+        const r = script[Math.min(i, script.length - 1)];
+        i++;
+        return { choices: [{ message: { role: "assistant", ...r } }] };
+      },
+    } as LlmClient;
+    const conv = rec().conversation("t-c3");
+    const r = await solveTask(client, "t-c3", "卡", 600, conv, { flagTotal: 1 });
+    expect(r.status).toBe("done");
+    expect(r.flagSummaryDone).toBe(true);
+    expect(r.turnsUsed).toBe(3); // 阈值压缩发生在轮 2 开头（元调用不占轮次）
+    const convRecs = readJsonl(recdir, "tasks/t-c3/conversation.jsonl");
+    // 紧阈值下每个轮起点都可能再压（元调用不占轮次）——兜底路径触发即可，次数不作断言
+    expect(convRecs.filter((x) => x.kind_note === "context_compact").length).toBeGreaterThanOrEqual(
+      1,
+    );
+    expect(convRecs.filter((x) => x.kind_note === "flag_summary").length).toBe(1);
+    // 自动黑板：进展叙述（≥8 字 content）落卡；【压缩交接】卡同步
+    const core = readJsonl(recdir, "tasks/t-c3/corelog.jsonl");
+    expect(core.some((x) => String(x.note ?? "").includes("注入拿到"))).toBe(true);
+    expect(core.some((x) => String(x.note ?? "").startsWith("【压缩交接】"))).toBe(true);
   });
 });

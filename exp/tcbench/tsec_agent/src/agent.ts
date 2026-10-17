@@ -526,9 +526,10 @@ export async function solveTask(
   const ledger = new FlagLedger();
   const flagTotal = opts.flagTotal ?? 0;
   if (flagTotal) ledger.setTotal(flagTotal);
-  // 单 flag 收尾总结轮（branchId→flag_index+设置轮次）；多 flag 不再逐 flag 总结——
-  // 上下文压缩由 maybeCompact 按阈值自动触发（与 flag 无关，单/多 flag 同机制）
+  // 单 flag 收尾总结轮（branchId→flag_index+设置轮次）
   const flagSummariesPending = new Map<number, { idx: number; turn: number }>();
+  // 找到 flag（多 flag 未全齐）→ 回合末强制压缩交接（主触发器；阈值兜底）
+  const compactAfterFlag = new Set<number>();
   const taskClass = opts.taskClass ?? "short";
   const stallSec = taskClass === "long" ? CFG.stall_long_sec : CFG.stall_short_sec;
   // 思考档位分档：短题 low 省 thinking（实测占成本 37-69%），长题不发=模型默认档；
@@ -748,11 +749,12 @@ export async function solveTask(
    *  ② shell 产物（workdir 文件）无人交接。文档同步落 corelog 当【压缩交接】卡
    *  （压缩点 = 强制采集点，顺带治"对话大量信息不进黑板"）。失败退避 3 轮重试。 */
   const compactFailedAt = new Map<number, number>();
-  const maybeCompact = async (br: BranchState): Promise<boolean> => {
-    const limit = CFG.compact_chars;
-    if (limit <= 0) return false;
+  const maybeCompact = async (br: BranchState, force = false): Promise<boolean> => {
     const before = estMsgChars(br.messages);
-    if (before < limit) return false;
+    if (!force) {
+      // 阈值兜底路径（长探索不靠 flag 也能压）；flag 触发走 force（信息密度最高时刻）
+      if (CFG.compact_chars <= 0 || before < CFG.compact_chars) return false;
+    }
     if (turn - (compactFailedAt.get(br.id) ?? -99) < 3) return false;
     try {
       const ac = new AbortController();
@@ -938,6 +940,16 @@ export async function solveTask(
       ended_at: tLlmEnd,
     });
     if (msg.content) lastContent = msg.content;
+    // 自动黑板：模型的进展叙述（content，不含 thinking/tool）直接落 corelog——
+    // 治"提示词暗示不可靠"（b-02 实测 123 次 shell 仅 1 张实质卡）；短应答(<8字)跳过防噪。
+    // 记卡即核心事件：停滞时钟随之刷新（黑板确实在长，不算隐形空转）
+    {
+      const narr = typeof msg.content === "string" ? msg.content.trim() : "";
+      if (narr.length >= 8) {
+        corelog?.write({ branch: br.id, kind: "core", note: narr.slice(0, 400) });
+        bm.recordCore(br.id, nowSec());
+      }
+    }
 
     const clean: ChatMessage = { role: "assistant" as const };
     if (msg.content) clean.content = msg.content;
@@ -1120,8 +1132,9 @@ export async function solveTask(
           // 多 flag 全齐：submit 响应是权威（correct_flag_count == total）→ 回合末立即
           // 收束——不等 watcher 缓存（20s 刷新）与模型尾轮（衔接优化，槽位早释放）；
           // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
-          if (resp?.correct === true && out.totalCount > 1 && out.correctCount >= out.totalCount) {
-            allFlagsSubmitted = true;
+          if (resp?.correct === true && out.totalCount > 1) {
+            if (out.correctCount >= out.totalCount) allFlagsSubmitted = true;
+            else compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
           }
           if (resp?.correct === true) {
             bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
@@ -1235,6 +1248,10 @@ export async function solveTask(
     if (allFlagsSubmitted) {
       log(`[${code}] all flags confirmed by submit response; closing segment now`);
       return finish("done");
+    }
+    // 找到 flag 是信息密度最高的压缩时机（主触发器）：回合末强制交接压缩
+    if (compactAfterFlag.delete(br.id)) {
+      await maybeCompact(br, true);
     }
   }
 }
