@@ -15,10 +15,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import threading
+import time
+from pathlib import Path
 
 from . import streams
 from .supervisor import collect_prior
-from .v2_bridge import Delegate, Finish, PlannerBridge
+from .v2_bridge import Delegate, Finish, PlannerBridge, Wait
 from .v2_state import IllegalTransition, SlotFullError
 
 
@@ -40,9 +44,20 @@ STAGE_DIRECTIVES = {
     "pivot": "Reuse confirmed credentials/assets to reach the next stage; find remaining flags.",
 }
 
+_TERMINAL_STATES = frozenset({"EXPLORED", "DEAD_END"})
+
+
+def _state_name(info: dict | None) -> str | None:
+    state = (info or {}).get("state")
+    return getattr(state, "value", state)
+
 
 class StagePlanner:
-    """确定性阶段 planner：按 recon→probe→exploit→verify(→pivot) 顺序委派。"""
+    """确定性阶段 planner：按 recon→probe→exploit→verify(→pivot) 顺序委派。
+
+    图边是硬约束：父阶段进入终态（EXPLORED/DEAD_END）之前不委派子阶段。
+    父阶段失败视为终态，避免单点失败把整条链卡死。
+    """
 
     def __init__(
         self,
@@ -54,16 +69,64 @@ class StagePlanner:
         self.stages = list(stages) + (["pivot"] if multi_flag else [])
         self.directives = {**STAGE_DIRECTIVES, **(directives or {})}
 
-    def next_action(self, snapshot: dict) -> Delegate | Finish:
+    def _delegate(self, key: str, parent: str | None) -> Delegate:
+        return Delegate(key=key, directive=self.directives.get(key, ""), parent=parent)
+
+    def next_action(self, snapshot: dict) -> Delegate | Finish | Wait:
         previous: str | None = None
         for key in self.stages:
             info = snapshot.get(key)
-            if info is None:
-                return Delegate(key=key, directive=self.directives.get(key, ""), parent=previous)
-            if info["state"].value == "UNEXPLORED":
-                return Delegate(key=key, directive=self.directives.get(key, ""), parent=previous)
+            if info is None or _state_name(info) == "UNEXPLORED":
+                if previous is not None and _state_name(snapshot.get(previous)) not in (
+                    _TERMINAL_STATES
+                ):
+                    return Wait(f"{previous} not finished")
+                return self._delegate(key, previous)
             previous = key
         return Finish("all stages explored")
+
+
+_PRIOR_LOCKS: dict[str, threading.Lock] = {}
+_PRIOR_LOCKS_GUARD = threading.Lock()
+
+
+def _prior_lock(accum: Path) -> threading.Lock:
+    key = str(accum.resolve())
+    with _PRIOR_LOCKS_GUARD:
+        return _PRIOR_LOCKS.setdefault(key, threading.Lock())
+
+
+def merge_prior_file(accum: Path, new: dict) -> None:
+    """并发安全的 prior 累积：锁内读改写 + 原子替换。
+
+    节点并行完成时「读旧-合并-写回」会互相覆盖；锁保证不丢更新，
+    os.replace 保证读者永远看到完整文件。
+    """
+    with _prior_lock(accum):
+        try:
+            old = json.loads(accum.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        if not isinstance(old, dict):
+            old = {}
+        merged: dict = {}
+        for field in ("assets", "explored", "open_leads", "credentials", "findings"):
+            values = list(old.get(field) or []) + list(new.get(field) or [])
+            merged[field] = list(dict.fromkeys(str(value) for value in values))
+        tmp = accum.with_name(accum.name + ".tmp")
+        accum.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, accum)
+
+
+def allocate_node_slice(
+    *, remaining_s: float, stages_left: int, cap_s: float, floor_s: float = 60.0
+) -> float:
+    """顺序阶段共享一个片预算：按剩余阶段均分，既不让前段吃光，也保底 60s。"""
+    if remaining_s <= 0:
+        return 0.0
+    share = remaining_s / max(1, stages_left)
+    return max(min(floor_s, remaining_s), min(cap_s, share))
 
 
 def make_stream_runner(
@@ -76,15 +139,27 @@ def make_stream_runner(
     journal,
     rec,
     deadline_epoch: float,
+    stage_count: int = 1,
 ):
     """把 streams.run_solver_with_stream 包成节点级 runner（生产装配）。
 
     runner 契约（与 FakeRunner 一致）：`await runner(key=..., directive=...)`
     返回 (text, exit_code, success) 三元组；第三位真值 = 节点 EXPLORED。
     早收割 / 去重 / 计分经济学全部沿用 run_solver_with_stream 既有路径。
+
+    阶段按图顺序串行执行，因此每个节点只拿「剩余预算 / 剩余阶段数」，
+    避免 recon 吃掉整片后 probe/exploit 无预算可用。
     """
+    started_nodes = 0
 
     async def runner(*, key: str, directive: str) -> tuple[str, int, bool]:
+        nonlocal started_nodes
+        node_slice = allocate_node_slice(
+            remaining_s=max(0.0, deadline_epoch - time.time()),
+            stages_left=max(1, stage_count - started_nodes),
+            cap_s=slice_s,
+        )
+        started_nodes += 1
         node_dir = ws / f"node-{key}"
         node_dir.mkdir(parents=True, exist_ok=True)
         (node_dir / "out" / "flags").mkdir(parents=True, exist_ok=True)
@@ -111,7 +186,7 @@ def make_stream_runner(
             solver_cmd=solver_cmd,
             ws=node_dir,
             deadline_epoch=deadline_epoch,
-            slice_s=slice_s,
+            slice_s=node_slice,
             environ=environ,
             client=client,
             journal=journal,
@@ -126,16 +201,7 @@ def make_stream_runner(
                 flag_file.read_text(encoding="utf-8"), encoding="utf-8"
             )
         # prior 累积：下一节点 task.json 带上前面节点的资产/凭据/线索。
-        try:
-            old = json.loads(accum.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            old = {}
-        new = collect_prior(node_dir)
-        merged: dict = {}
-        for field in ("assets", "explored", "open_leads", "credentials", "findings"):
-            values = list(old.get(field) or []) + list(new.get(field) or [])
-            merged[field] = list(dict.fromkeys(str(value) for value in values))
-        accum.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        merge_prior_file(accum, collect_prior(node_dir))
         return str(outcome), outcome.exit_code, not outcome.timed_out and outcome.exit_code == 0
 
     return runner
@@ -171,6 +237,9 @@ class V2Controller:
                     )
                     if isinstance(action, Finish):
                         finished = True
+                        break
+                    if isinstance(action, Wait):
+                        # 父阶段仍在 EXPLORING：本拍不再派新节点，等它完成
                         break
                     try:
                         self.bridge.handle_delegate(action)
@@ -233,6 +302,7 @@ class V2Controller:
         base_environ 之上按节点追加 SOLVER_NODE_DIRECTIVE。
         """
         del total_budget_s, task  # 预算截断由 planner/deadline 负责，此处只透传语义
+        stage_count = len(getattr(planner, "stages", ()) or ()) or 1
         runner = make_stream_runner(
             solver_cmd=solver_cmd,
             base_environ=base_environ,
@@ -242,6 +312,7 @@ class V2Controller:
             journal=journal,
             rec=rec,
             deadline_epoch=deadline_epoch,
+            stage_count=stage_count,
         )
         self.runner = runner
         await self._drive(planner)

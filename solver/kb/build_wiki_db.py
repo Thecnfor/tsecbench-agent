@@ -23,9 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from index import _split_sections, _tokenize  # 同一套分词，查询/建库对称
 
-FLAG_RE = re.compile(
-    r"(?:flag|FLAG|ctf|CTF|HTB|htb|[A-Za-z0-9_]{2,24})\{[^}\n]{4,120}\}"
-)
+FLAG_RE = re.compile(r"(?:flag|FLAG|ctf|CTF|HTB|htb|[A-Za-z0-9_]{2,24})\{[^}\n]{4,120}\}")
 # 宽松探测：任何 flag-ish 前导 + 花括号/下划线形态 —— 命中即整节丢弃（宁缺毋滥）
 FLAG_ISH_RE = re.compile(r"(?:flag|FLAG|HTB|htb|ctf|CTF)[{_]")
 MAX_FILE_BYTES = 256 * 1024
@@ -88,11 +86,11 @@ def main() -> int:
                 cur = db.execute(
                     "INSERT INTO secs(doc,title,body) VALUES(?,?,?)", (rel, title[:200], body)
                 )
-                db.execute("INSERT INTO rowmap(rid,sec) VALUES(?,?)", (cur.lastrowid, cur.lastrowid))
-                toks = " ".join(_tokenize(title + "\n" + body))
                 db.execute(
-                    "INSERT INTO ft(rowid,tokens) VALUES(?,?)", (cur.lastrowid, toks)
+                    "INSERT INTO rowmap(rid,sec) VALUES(?,?)", (cur.lastrowid, cur.lastrowid)
                 )
+                toks = " ".join(_tokenize(title + "\n" + body))
+                db.execute("INSERT INTO ft(rowid,tokens) VALUES(?,?)", (cur.lastrowid, toks))
                 n_secs += 1
             if n_docs % 2000 == 0:
                 db.commit()
