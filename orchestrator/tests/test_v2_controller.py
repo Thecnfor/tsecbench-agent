@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 
-from orchestrator.v2_bridge import Delegate, Finish
-from orchestrator.v2_controller import StubPlanner, V2Controller
+from orchestrator.v2_bridge import Delegate, Finish, Wait
+from orchestrator.v2_controller import (
+    StubPlanner,
+    V2Controller,
+    allocate_node_slice,
+    merge_prior_file,
+)
 from orchestrator.v2_state import DEAD_END, EXPLORED
 
 
@@ -101,8 +108,8 @@ class TestReDelegate:
         assert states == {"recon": EXPLORED, "probe": EXPLORED}
 
 
-def test_stage_planner_orders_stages_and_skips_exploring():
-    from orchestrator.v2_bridge import Delegate, Finish
+def test_stage_planner_waits_for_exploring_parent():
+    """图边是硬约束：父阶段还在 EXPLORING 时不得委派子阶段。"""
     from orchestrator.v2_controller import StagePlanner
     from orchestrator.v2_state import NodeState
 
@@ -114,10 +121,60 @@ def test_stage_planner_orders_stages_and_skips_exploring():
         "probe": {"state": NodeState.EXPLORING, "parent": "recon"},
     }
     action = planner.next_action(snapshot)
-    assert isinstance(action, Delegate) and action.key == "exploit"
-    assert action.parent == "probe"
+    assert isinstance(action, Wait)
     done = {key: {"state": NodeState.EXPLORED, "parent": None} for key in planner.stages}
     assert isinstance(planner.next_action(done), Finish)
+
+
+def test_stage_planner_advances_when_parent_dead_end():
+    """父阶段失败（DEAD_END）是终态：不得让整条链卡死。"""
+    from orchestrator.v2_bridge import Delegate
+    from orchestrator.v2_controller import StagePlanner
+    from orchestrator.v2_state import NodeState
+
+    planner = StagePlanner()
+    snapshot = {"recon": {"state": NodeState.DEAD_END, "parent": None}}
+    action = planner.next_action(snapshot)
+    assert isinstance(action, Delegate) and action.key == "probe"
+    assert action.parent == "recon"
+
+
+class TestPriorMerge:
+    def test_concurrent_merges_keep_every_write(self, tmp_path):
+        """无锁读改写会丢更新：并发完成的节点必须全部入账。"""
+        accum = tmp_path / "v2_prior.json"
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                merge_prior_file(accum, {"assets": [f"10.0.0.{index}:80"]})
+            except BaseException as exc:  # noqa: BLE001 - 线程异常要带回主线程断言
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(1, 9)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not errors
+        merged = json.loads(accum.read_text(encoding="utf-8"))
+        assert sorted(merged["assets"]) == [f"10.0.0.{i}:80" for i in range(1, 9)]
+
+
+class TestNodeSliceBudget:
+    def test_even_split_across_remaining_stages(self):
+        assert allocate_node_slice(remaining_s=400, stages_left=4, cap_s=900) == 100
+
+    def test_floor_never_exceeds_remaining(self):
+        assert allocate_node_slice(remaining_s=20, stages_left=4, cap_s=900) == 20
+
+    def test_cap_wins_on_short_chains(self):
+        assert allocate_node_slice(remaining_s=4000, stages_left=2, cap_s=900) == 900
+
+    def test_no_budget_left(self):
+        assert allocate_node_slice(remaining_s=0, stages_left=4, cap_s=900) == 0
 
 
 def test_stage_planner_adds_pivot_for_multi_flag():

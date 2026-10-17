@@ -27,6 +27,13 @@ class Finish:
     reason: str = ""
 
 
+@dataclass
+class Wait:
+    """planner 暂时不能委派（父阶段还在 EXPLORING）；下一拍重试。"""
+
+    reason: str = ""
+
+
 class RejectedAction(Exception):
     pass
 

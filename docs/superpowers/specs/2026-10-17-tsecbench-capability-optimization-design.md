@@ -201,7 +201,7 @@ def should_start(
 
 文件：`orchestrator/src/orchestrator/v2_controller.py`、`orchestrator/src/orchestrator/main.py`
 
-- 新增 `StagePlanner`（放在 `orchestrator/v2_controller.py`，不 import `solver/gov`，因 solver 不是安装包）：按固定阶段顺序委派 `recon → probe → exploit → verify`，多 flag 题追加 `pivot`。`next_action(snapshot)` 返回 `Delegate`/`Finish`；无 LLM 依赖。
+- 新增 `StagePlanner`（放在 `orchestrator/v2_controller.py`，不 import `solver/gov`，因 solver 不是安装包）：按固定阶段顺序委派 `recon → probe → exploit → verify`，多 flag 题追加 `pivot`。`next_action(snapshot)` 返回 `Delegate`/`Wait`/`Finish`；父阶段进入终态（EXPLORED/DEAD_END）前返回 `Wait`（图边是硬约束，阶段串行执行），无 LLM 依赖。
 - `_pipeline_inner` 中：当 `config.HARNESS_V2` 为真时，用 `V2Controller` + `StagePlanner` + `make_stream_runner` 替代单次 `run_solver_with_stream`；每节点独立 `node-{key}` 目录，`SOLVER_NODE_DIRECTIVE` 注入指令；最终沿用 `harvest/submit` 与 `v2_verify`。
 - `HARNESS_V2=off` 路径零改动（默认）。
 - 新增集成测试：FakeRunner + StagePlanner 走通图探索并产出候选；不依赖网络/LLM。

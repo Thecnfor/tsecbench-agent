@@ -224,20 +224,71 @@ def _remaining_score(registry: Registry) -> float:
 
 
 # ---------------------------------------------------------------- pipeline ----
-def _slice_has_progress(ws: Path) -> bool:
-    """widen 门控的进展信号（实测：零线索题 widen 是纯烧片）。
-    prior 双图有任何资产/线索/已探面，或会话有足量动作 → 有进展。"""
-    prior_path = ws / "out" / "prior.json"
+_HIGH_VALUE_PRIOR_KEYS = ("credentials", "findings")
+
+
+def _endpoint_of(value: str) -> tuple[str, int | None]:
+    """从 URL / host:port / 裸主机取 (host, port)；无端口时 port=None。"""
+    text = str(value).strip().lower()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0]
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        port = rest.lstrip(":")
+        return host, int(port) if port.isdigit() else None
+    if text.count(":") == 1:
+        host, port = text.rsplit(":", 1)
+        return host, int(port) if port.isdigit() else None
+    return text, None
+
+
+def _target_endpoints(ws: Path) -> tuple[set[tuple[str, int | None]], set[str]]:
     try:
-        prior = json.loads(prior_path.read_text(encoding="utf-8"))
-        if any(prior.get(k) for k in ("assets", "explored", "open_leads")):
-            return True
+        task = json.loads((ws / "task.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        pass
-    session_path = ws / "out" / "session.jsonl"
+        return set(), set()
+    endpoints: set[tuple[str, int | None]] = set()
+    hosts: set[str] = set()
+    for target in task.get("targets") or []:
+        host, port = _endpoint_of(str(target))
+        if host:
+            endpoints.add((host, port))
+            hosts.add(host)
+    return endpoints, hosts
+
+
+def _is_new_endpoint(value: str, endpoints: set, hosts: set) -> bool:
+    host, port = _endpoint_of(value)
+    if not host:
+        return False
+    if port is not None:
+        return (host, port) not in endpoints
+    return host not in hosts
+
+
+def _slice_has_progress(ws: Path) -> bool:
+    """widen/续片门控的进展信号：只认**新信息**。
+
+    explored 命令、session 行数、以及回显目标本身的资产都不算进展——
+    任何一次命令都会产生它们，实测让 60s 试探闸门 27 次续片 / 0 次停止。
+    真正算进展的只有：新端点（新主机或同主机新端口）、凭据、版本指纹、候选 flag。
+    """
     try:
-        with session_path.open(encoding="utf-8") as fh:
-            return sum(1 for _ in fh) >= 8
+        prior = json.loads((ws / "out" / "prior.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    if any(prior.get(key) for key in _HIGH_VALUE_PRIOR_KEYS):
+        return True
+    endpoints, hosts = _target_endpoints(ws)
+    for key in ("assets", "open_leads"):
+        for item in prior.get(key) or []:
+            if _is_new_endpoint(str(item), endpoints, hosts):
+                return True
+    try:
+        return any((ws / "out" / "flags").glob("*.txt"))
     except OSError:
         return False
 
