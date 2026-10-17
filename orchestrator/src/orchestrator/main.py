@@ -407,6 +407,26 @@ async def _salvage_candidates(ctx: RunContext, rec: ChallengeRecord, ws: Path, c
     return report.new_matches
 
 
+def _submitted_ledger(ws: Path) -> set[str]:
+    found: set[str] = set()
+    code = ws.name.rsplit("_attempt", 1)[0]
+    for path in ws.parent.glob(f"{code}_attempt*/out/submitted.txt"):
+        with contextlib.suppress(OSError):
+            found.update(
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+    return found
+
+
+def _save_submitted(ws: Path, rec: ChallengeRecord) -> None:
+    with contextlib.suppress(OSError):
+        (ws / "out" / "submitted.txt").write_text(
+            "\n".join(sorted(rec.submitted)), encoding="utf-8"
+        )
+
+
 async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
     rec = ctx.registry.records[code]
     rec.attempts += 1
@@ -458,6 +478,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         sops=sops,
         repair_note=ctx.repair_notes.get(code),
     )
+    rec.submitted |= _submitted_ledger(ws)
     deadline_epoch = min(time.time() + slice_s, ctx.t0 + ctx.config.total_time_limit_s)
     # 分级模型调度（实测 reasoner 支持 tool calls 且延迟 ~3s）：hard 题与
     # 失败过的题用 reasoner 攻坚提首片解出率，其余用 chat 保吞吐。
@@ -600,6 +621,7 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
 
     rec.state = "SUBMITTING"
     report = await submit_candidates(ctx.client, rec, candidates)
+    _save_submitted(ws, rec)
     if report.new_matches or report.rejected or report.duplicates:
         ctx.journal.append(
             "submit_result",
@@ -656,7 +678,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
         await _safe_close(ctx, rec)
         rec.state = "QUEUED"
         return
-    if rec.attempts >= MAX_ATTEMPTS:
+    max_attempts = MAX_ATTEMPTS + max(0, rec.flag_count - 1) * 2
+    if rec.attempts >= max_attempts:
         rec.state = "ABANDONED"
         await _safe_close(ctx, rec)
         rec.state = "CLOSED"

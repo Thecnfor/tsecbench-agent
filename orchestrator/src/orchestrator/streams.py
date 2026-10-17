@@ -139,6 +139,10 @@ async def run_solver_with_stream(
             if not candidates:
                 continue
             report = await submit_candidates(client, rec, candidates)
+            with contextlib.suppress(OSError):
+                (ws / "out" / "submitted.txt").write_text(
+                    "\n".join(sorted(rec.submitted)), encoding="utf-8"
+                )
             if report.new_matches or report.rejected or report.duplicates:
                 journal.append(
                     "submit_result",
