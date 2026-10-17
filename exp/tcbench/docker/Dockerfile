@@ -206,10 +206,16 @@ RUN mkdir -p /work
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# ── 离线安全知识库（196MB：CVE POC 文章 + nuclei 模板 + hacktricks 等 16 源）──
+# ── 离线安全知识库（CVE POC 文章 + nuclei 模板 + hacktricks 等 16 源 + KEV/NVD 数据）──
 #   放最后：更新知识库只重建这一层（venv/工具层缓存不受影响）。
-#   agent 用传统 Linux 搜索查它，检索路径与"别整库 grep"的规则写在 system prompt。
 COPY security-knowledge-base /opt/security-knowledge-base
+
+# ── kb 检索引擎（索引 CLI + 改写检索子 agent；索引构建期一次性，约 10 秒）──
+#   产物：<KB>/.index/（kb.sqlite 等）；检索通道与纪律写在 system prompt，用法见 docs/kb-search.md
+COPY scripts/build_kb_index.py scripts/build_cve_data.py scripts/kb \
+     scripts/kb-hunter.py scripts/kb-hunter.md /usr/local/bin/
+RUN chmod +x /usr/local/bin/kb /usr/local/bin/kb-hunter.py \
+    && python3 /usr/local/bin/build_kb_index.py --kb /opt/security-knowledge-base
 
 # ── agent 代码（hosted 交付镜像必须自带：官方平台没有 run.sh 去挂载 /agent）──
 #   本地开发不受影响：run.sh 仍 `-v tsec_agent:/agent` 覆盖此层，改代码即时生效。

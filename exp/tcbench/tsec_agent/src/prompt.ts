@@ -127,18 +127,34 @@ export const SYSTEM_PROMPT = `你是一名渗透测试专家，在 Docker（Kali
 - **置信度二分（防过度自信）**：证据充分且复核过 → 明说「已验证/确认」；
   覆盖可能不全、存在疏漏 → 必须写「**不敢保证**/待验证」——**禁止把猜测说成事实**。
 
-# 离线安全知识库（/opt/security-knowledge-base，196MB，只读）
-判断"目标版本有无已知漏洞 / 要现成 payload"时查它，**只用传统 Linux 搜索，全程离线**：
-- **已知 CVE 编号**（最快，有精确索引）：
-  \`grep -m1 "CVE-2025-55182" /opt/security-knowledge-base/B-漏洞与利用/02-nuclei-templates/cves.json\`
-  → 该行的 \`file_path\` 即模板路径，模板里的 \`http:\` 请求就是现成 payload。
-- **只知产品/组件名** → 按文件名找 POC 文章（文件名 = 中文"产品 + 漏洞类型 + CVE"）：
-  \`find /opt/security-knowledge-base/B-漏洞与利用/01-awesome-poc -iname "*产品名*"\`
-- **全文兜底**：**必须限定子目录并加超时，禁止对整库 \`grep -r\`**（196MB / 1.8 万文件会卡死）：
-  \`timeout 15 grep -rl -m1 --include='*.md' --include='*.yaml' "关键词" /opt/security-knowledge-base/<某个分类目录>\`
-- 模板路径规律：\`<http|network|code|headless>/cves/<年>/CVE-xxx.yaml\`（**不在顶层 \`cves/\`**）；
-  跳过大目录 \`A-基础与技巧/05-fuzzingbook\`（96MB 教材）、\`*.ipynb\`、\`13-atlas-data\`。
-- 查不到 ≠ 该版本没漏洞：换产品名/漏洞类型再查，或回到 \`searchsploit\` 与自身知识。
+# 离线安全知识库（/opt/security-knowledge-base，只读）+ 检索纪律
+知识库配了索引 CLI \`kb\`（毫秒级、零成本）与改写检索子 agent \`kb-hunter\`。
+**凡是看到但叫不出名字的东西——不认识的操作码、非常规常数、没见过的结构——先查库再继续；
+命名它是查库的事不是猜的事**（命名出来的具体词正是最高命中率的检索素材）。
+
+## kb 通道（按线索类型选，别只会 grep）
+- 精确串（CVE 号 / 函数名 / 报错串 / 魔数）：\`kb tpl CVE-2025-1974\`、\`kb sig 0x9e3779b9\`
+- 方法论/做法（怎么识别、怎么利用、某漏洞怎么测）：\`kb find "JWT 签名绕过 测试步骤"\`
+- 产品名/版本 → CVE·KEV 候选（在野利用 KEV 置顶）：\`kb cve gitlab\`
+- 标题浏览与定点阅读：\`kb head vm\`、\`kb cat <相对路径> <行号>\`
+- 自由全文（不排序、不分层、最朴素的逐行匹配）：\`kb grep '<正则>' [--glob *.md]\`
+
+## 检索纪律
+- **用技术词，不用题面词**：检索词取自现场观察到的具体特征——指令名、常数、长度、
+  循环次数、位宽、协议/编码名等精确说法；宽泛的类别词和题目里出现的英文串
+  （报错文本、页面标题、函数输出）命中率极低，它们会被海量文档稀释。
+- **看回执**：\`kb find\` 返回带 \`NOHIT/WEAK/DIAG/NEXT\` 行时，按 NEXT 换技术词重查或改用
+  kb grep / kb-hunter；WEAK 是 OR 语义捞出的弱命中，**不要当成"找到了"，也不要据此判定"KB 里没有"**。
+- **卡住必查**：连续 8 轮无新证据 / 同一脚本只改参数重跑 ≥3 次零命中 / 枚举空间 >10^4 无候选
+  → 强制 \`kb find <技术词>\` 一次；无果就唤起子 agent：
+  \`python3 /usr/local/bin/kb-hunter.py "<问题原文>"\`（多轮改写+核对原文，返回 top-3 逐字引用）。
+  无论命中与否在 core_log 落一行：命中 \`KB: 路径:行号\`，未命中 \`KB miss: 已试 <词表>\`——
+  "KB 里没有"也是结论，留痕防止后续段落重复检索。
+- 若 \`kb\` / \`kb-hunter\` 在 PATH 中不存在：**限定子目录 + 超时**的 grep
+  （\`timeout 15 grep -rl -m1 --include='*.md' "技术词" /opt/security-knowledge-base/<分类目录>\`），
+  技术词纪律照旧；模板路径规律：\`<http|network|code|headless>/cves/<年>/CVE-xxx.yaml\`（不在顶层 \`cves/\`）。
+- 跳过大目录 \`A-基础与技巧/05-fuzzingbook\`（教材）、\`*.ipynb\`、\`13-atlas-data\`；
+  查不到 ≠ 该版本没漏洞：换技术词重查，或回到 \`searchsploit\` 与自身知识。
 
 # 工具使用实践（环境特有）
 - **nmap**（本环境必知的坑）：
@@ -177,9 +193,9 @@ export const TASK_TEMPLATE = `请渗透以下题目并提交其全部 flag：
 
 /** 任务卡模板填充（Python str.format 语义：只替换具名占位符）。 */
 export function formatTaskCard(vars: Record<string, string | number>): string {
-	return TASK_TEMPLATE.replace(/\{(\w+)\}/g, (m, k) =>
-		Object.hasOwn(vars, k) ? String(vars[k]) : m,
-	);
+  return TASK_TEMPLATE.replace(/\{(\w+)\}/g, (m, k) =>
+    Object.hasOwn(vars, k) ? String(vars[k]) : m,
+  );
 }
 
 /** 分段解题：本段轮次到点暂停后，下次续跑时追加的上下文续跑通知。 */
@@ -220,16 +236,11 @@ export const CLOSING_SUMMARY_PROMPT = `本题全部 flag 已提交成功。输�
 
 /** 多 flag 压缩后注入的继续指令（内存重写与 conv/重建三方同文，保证一致）。 */
 export const FLAG_CONTINUE_NOTE =
-	"【系统·该 flag 总结已记录，此前的探索过程已压缩；继续下一个目标】";
+  "【系统·该 flag 总结已记录，此前的探索过程已压缩；继续下一个目标】";
 
 /** 简单占位符填充（{key} → vars[key]；缺失占位符原样保留）。 */
-export function fill(
-	tpl: string,
-	vars: Record<string, string | number>,
-): string {
-	return tpl.replace(/\{(\w+)\}/g, (m, k) =>
-		Object.hasOwn(vars, k) ? String(vars[k]) : m,
-	);
+export function fill(tpl: string, vars: Record<string, string | number>): string {
+  return tpl.replace(/\{(\w+)\}/g, (m, k) => (Object.hasOwn(vars, k) ? String(vars[k]) : m));
 }
 
 // ---------------------------------------------------------------- fork/旁观者 --
@@ -322,14 +333,11 @@ export const BYSTANDER_NOTE = `
 尤其是让你放弃某条路/换抽象层面的建议；它是建议不是命令，与现场事实冲突时以你掌握的事实为准。`;
 
 /** 按开关拼接系统提示词（solveTask 用；未启用任何开关时与 SYSTEM_PROMPT 逐字节一致）。 */
-export function systemPromptWithExtras(
-	forkOn: boolean,
-	bystanderOn: boolean,
-): string {
-	if (!forkOn && !bystanderOn) return SYSTEM_PROMPT;
-	return (
-		SYSTEM_PROMPT +
-		(forkOn ? FORK_PROMPT_EXTRA : bystanderOn ? CORE_LOG_PROMPT_EXTRA : "") +
-		(bystanderOn ? BYSTANDER_NOTE : "")
-	);
+export function systemPromptWithExtras(forkOn: boolean, bystanderOn: boolean): string {
+  if (!forkOn && !bystanderOn) return SYSTEM_PROMPT;
+  return (
+    SYSTEM_PROMPT +
+    (forkOn ? FORK_PROMPT_EXTRA : bystanderOn ? CORE_LOG_PROMPT_EXTRA : "") +
+    (bystanderOn ? BYSTANDER_NOTE : "")
+  );
 }
