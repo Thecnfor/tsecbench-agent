@@ -454,6 +454,9 @@ NAMED_FLAG_PATTERNS = [
 # `: ; ( ) # , 空白` 等代码/CSS 语法。
 GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
 GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
+# 通用兜底只认真实 flag 前缀；代码标识符（collect/it.name、
+# JSAPI_Event_*_{uuid}）一律拒绝。
+GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
 
 _reported: set[str] = set()
 
@@ -467,6 +470,8 @@ def find_flags(text: str, include_generic: bool = False) -> list[str]:
                 found.append(value)
     if include_generic:
         for match in GENERIC_FLAG_PATTERN.finditer(text):
+            if match.group(1).lower() not in GENERIC_PREFIXES:
+                continue
             if not GENERIC_BODY_RE.match(match.group(2)):
                 continue
             value = match.group(0)

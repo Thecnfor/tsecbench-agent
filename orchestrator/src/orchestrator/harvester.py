@@ -35,6 +35,7 @@ NAMED_FLAG_PATTERNS = (
 # 线上 run-35236 实测 stdout 里的 CSS 被当作 flag 连投 10 次全部失败。
 GENERIC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{2,24})\{([^}\n]{4,120})\}")
 GENERIC_BODY_RE = re.compile(r"^[A-Za-z0-9_\-+=/.]{4,120}$")
+GENERIC_PREFIXES = frozenset({"flag", "ctf", "htb", "thm", "picoctf", "xben"})
 
 FLAG_MIN_LEN, FLAG_MAX_LEN = 1, 4096
 _SCAN_SUFFIX_BLOCKLIST = (".log.bak",)  # 无实际用途，占位说明只按内容扫
@@ -52,6 +53,8 @@ def extract_flags(text: str) -> list[str]:
                 seen.add(value)
                 found.append(value)
     for m in GENERIC_FLAG_PATTERN.finditer(text):
+        if m.group(1).lower() not in GENERIC_PREFIXES:
+            continue
         if not GENERIC_BODY_RE.match(m.group(2)):
             continue
         value = m.group(0)

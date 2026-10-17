@@ -33,8 +33,8 @@ def factory():
 
 # ---- 收割 ----
 def test_extract_named_and_generic_order():
-    text = "noise FLAG{aaa} HTB{bbb} weird{abc-123} FLAG{aaa} end"
-    assert extract_flags(text) == ["FLAG{aaa}", "HTB{bbb}", "weird{abc-123}"]
+    text = "noise FLAG{aaa} HTB{bbb} Flag{abc-123} FLAG{aaa} end"
+    assert extract_flags(text) == ["FLAG{aaa}", "HTB{bbb}", "Flag{abc-123}"]
 
 
 def test_extract_rejects_css_and_js_generic():
@@ -139,3 +139,8 @@ def test_submit_stops_on_task_ended(factory):
 def test_submit_report_type():
     r = SubmitReport()
     assert r.new_matches == 0 and r.completed is False
+
+
+def test_extract_rejects_code_identifier_prefixes():
+    text = "JSAPI_Event_Abandon_{83e44378-6c8c-4be3-b3e5-29d6dfde1d55} collect{it.name}"
+    assert extract_flags(text) == []

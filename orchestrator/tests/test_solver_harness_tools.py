@@ -164,5 +164,5 @@ def test_lowercase_flag_is_a_named_pattern(common):
 
 
 def test_generic_accepts_flag_like_body(common):
-    flag = "SOME{abc_def-123}"
+    flag = "Flag{abc_def-123}"
     assert common.find_flags(flag, include_generic=True) == [flag]
