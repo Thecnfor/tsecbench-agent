@@ -18,12 +18,57 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+import time
 from urllib.parse import urlparse
 
 TOOL_TIMEOUT = 120
+# 目录爆破硬上限：对 Next.js/软 404 站点，common.txt 全量扫能把整片烧光
+# （实测 c-03：两次 gobuster 共 ~115s，零产出）。
+DIRBUST_TIMEOUT = 25
+
+_PREFERRED_PORTS = ("443", "8443", "80", "8080", "8000", "3000", "7860", "5000")
+
+
+def resolve_budget_seconds(explicit: float | None = None) -> float | None:
+    """显式预算 > SOLVER_DEADLINE_EPOCH - now；两者皆无返回 None（保持旧行为）。"""
+    if explicit is not None:
+        return max(1.0, float(explicit))
+    raw = os.environ.get("SOLVER_DEADLINE_EPOCH", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw) - time.time())
+    except ValueError:
+        return None
+
+
+def derive_web_url(target: str, open_ports: list[str]) -> str:
+    """从 nmap 开放端口推导最可能的 Web 入口。"""
+    ports = {str(port) for port in open_ports}
+    for port in _PREFERRED_PORTS:
+        if port not in ports:
+            continue
+        scheme = "https" if port in ("443", "8443") else "http"
+        if (scheme == "https" and port == "443") or (scheme == "http" and port == "80"):
+            return f"{scheme}://{target}"
+        return f"{scheme}://{target}:{port}"
+    return f"http://{target}"
+
+
+def _kb_hits(*parts: str, top_k: int = 2) -> list[dict]:
+    query = " ".join(part for part in parts if part).strip()
+    if not query:
+        return []
+    try:
+        from kb.index import Index
+
+        return Index().query(query, top_k=top_k)
+    except Exception:  # noqa: BLE001 - KB 是增强，不是必需路径
+        return []
 
 
 def _run(argv: list[str], timeout: int = TOOL_TIMEOUT) -> str:
@@ -40,14 +85,21 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def recon_host(target: str) -> dict:
+def recon_host(target: str, budget_s: float | None = None) -> dict:
     """主机侦察：nmap top-1000 端口 + 服务版本；nmap 缺失则返回错误标注。"""
     result: dict = {"target": target, "open_ports": [], "services": [], "raw": ""}
     nmap = _which("nmap")
     if not nmap:
         result["raw"] = "[tool-error] nmap not installed"
         return result
-    out = _run([nmap, "-Pn", "--top-ports", "1000", "-sV", "--open", target])
+    budget = resolve_budget_seconds(budget_s)
+    ports = "1000"
+    timeout = TOOL_TIMEOUT
+    if budget is not None:
+        if budget < 45:
+            ports = "100"
+        timeout = max(10, min(TOOL_TIMEOUT, int(budget * 0.6)))
+    out = _run([nmap, "-Pn", "--top-ports", ports, "-sV", "--open", target], timeout=timeout)
     result["raw"] = out[-4000:]
     for line in out.splitlines():
         # 典型行：80/tcp   open  http    nginx 1.18.0
@@ -63,7 +115,24 @@ def recon_host(target: str) -> dict:
     return result
 
 
-def recon_web(url: str) -> dict:
+def _curl_page(curl: str, url: str) -> str:
+    """抓页面；502/503/连接类失败自动重试一次（后端冷启动 ≠ 死）。"""
+    argv = [curl, "-sS", "--compressed", "-m", "20", "-D", "-", "-o", "-", url]
+    out = _run(argv, timeout=30)
+    transient = (
+        not out.strip()
+        or "[tool-error]" in out
+        or "502 Bad Gateway" in out
+        or "503 Service Unavailable" in out
+        or "Connection reset" in out
+    )
+    if transient:
+        time.sleep(5)
+        out = _run(argv, timeout=30)
+    return out
+
+
+def recon_web(url: str, budget_s: float | None = None) -> dict:
     """Web 侦察：响应头 + 标题 + 技术栈线索 + 目录枚举（gobuster/feroxbuster 二选一）。"""
     result: dict = {"url": url, "headers": {}, "title": "", "tech": [], "dirs": [], "raw": ""}
     parsed = urlparse(url)
@@ -73,7 +142,7 @@ def recon_web(url: str) -> dict:
 
     curl = _which("curl")
     if curl:
-        out = _run([curl, "-sS", "-m", "30", "-D", "-", "-o", "-", url], timeout=60)
+        out = _curl_page(curl, url)
         head, _, body = out.partition("\r\n\r\n")
         if not body:
             head, _, body = out.partition("\n\n")
@@ -104,12 +173,47 @@ def recon_web(url: str) -> dict:
 
     dirbust = _which("feroxbuster") or _which("gobuster")
     wordlist = "/usr/share/dirb/wordlists/common.txt"
+    budget = resolve_budget_seconds(budget_s)
+    if dirbust and budget is not None and budget < 20:
+        result["dirs"] = []
+        result["dirbust_skipped"] = "low-budget"
+        dirbust = None
     if dirbust:
         if dirbust.endswith("feroxbuster"):
-            argv = [dirbust, "-u", url, "-w", wordlist, "--silent", "-t", "30", "-d", "1"]
+            argv = [
+                dirbust,
+                "-u",
+                url,
+                "-w",
+                wordlist,
+                "--silent",
+                "-t",
+                "30",
+                "-d",
+                "1",
+                "--time-limit",
+                "20s",
+                "--filter-status",
+                "404",
+            ]
         else:
-            argv = [dirbust, "dir", "-u", url, "-w", wordlist, "-q", "--no-error", "-t", "30"]
-        out = _run(argv, timeout=TOOL_TIMEOUT)
+            argv = [
+                dirbust,
+                "dir",
+                "-u",
+                url,
+                "-w",
+                wordlist,
+                "-q",
+                "--no-error",
+                "-t",
+                "30",
+                "-b",
+                "404",
+                "--timeout",
+                "3s",
+            ]
+        out = _run(argv, timeout=DIRBUST_TIMEOUT)
         for line in out.splitlines():
             parts = line.split()
             if parts and (parts[0].isdigit() or parts[0].startswith("/")):
@@ -117,6 +221,16 @@ def recon_web(url: str) -> dict:
         result["dirs"] = result["dirs"][:50]
     else:
         result["dirs"] = ["[tool-error] neither feroxbuster nor gobuster installed"]
+    hits = _kb_hits(
+        result.get("title", ""),
+        " ".join(result.get("tech") or []),
+        result.get("headers", {}).get("server", ""),
+    )
+    if hits:
+        result["kb_hits"] = [
+            {"doc": hit["doc"], "section": hit["section"], "body": hit["body"][:800]}
+            for hit in hits
+        ]
     return result
 
 
@@ -130,23 +244,21 @@ def main() -> int:
     p_all = sub.add_parser("all")
     p_all.add_argument("--target", required=True)
     p_all.add_argument("--url")
+    for sub_parser in (p_host, p_web, p_all):
+        sub_parser.add_argument("--budget-seconds", type=float, default=None)
 
     args = parser.parse_args()
     report: dict = {"mode": args.mode, "errors": []}
     try:
         if args.mode == "host":
-            report["host"] = recon_host(args.target)
+            report["host"] = recon_host(args.target, budget_s=args.budget_seconds)
         elif args.mode == "web":
-            report["web"] = recon_web(args.url)
+            report["web"] = recon_web(args.url, budget_s=args.budget_seconds)
         else:
-            report["host"] = recon_host(args.target)
-            url = args.url or (
-                f"http://{args.target}:80"
-                if 80 in [int(p) for p in report["host"]["open_ports"] if p.isdigit()]
-                else None
-            )
-            if url:
-                report["web"] = recon_web(url)
+            host = recon_host(args.target, budget_s=args.budget_seconds)
+            report["host"] = host
+            url = args.url or derive_web_url(args.target, host.get("open_ports") or [])
+            report["web"] = recon_web(url, budget_s=args.budget_seconds)
     except Exception as exc:  # 永不崩，JSON 兜底
         report["errors"].append(f"{type(exc).__name__}: {exc}")
 
