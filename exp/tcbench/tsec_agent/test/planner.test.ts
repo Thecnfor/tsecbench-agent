@@ -1,7 +1,12 @@
 /** Planner 启发式单测：只做“deadend + next → checkpoint spawn”的最小决策，
  * 与 BranchManager 的真实执行解耦。 */
 import { describe, expect, it } from "vitest";
-import { heuristicPlan, type ReportEvent, selectRecoveryOwner } from "../src/planner.js";
+import {
+  type CoverageEvent,
+  heuristicPlan,
+  type ReportEvent,
+  selectRecoveryOwner,
+} from "../src/planner.js";
 
 const base: ReportEvent = {
   type: "report",
@@ -81,6 +86,26 @@ describe("heuristic planner", () => {
     expect(heuristicPlan({ ...base, next: [] }, ctx)).toEqual([]);
     expect(heuristicPlan({ ...base, scopeStatus: "satisfied" }, ctx)).toEqual([]);
     expect(heuristicPlan(base, { ...ctx, enabled: false })).toEqual([]);
+  });
+
+  it("coverage：active/scope 不足 → 提醒按 fork 分类补全；覆盖到位不动作", () => {
+    const coverage: CoverageEvent = {
+      type: "coverage",
+      attempt: 0,
+      scopeId: 0,
+      active: 1,
+      scopes: 1,
+      desired: 2,
+    };
+    const actions = heuristicPlan(coverage, ctx);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].type).toBe("remind");
+    expect(JSON.stringify(actions)).toContain("覆盖检查");
+    expect(JSON.stringify(actions)).toContain("fork");
+    expect(heuristicPlan({ ...coverage, active: 2, scopes: 2 }, ctx)).toEqual([]);
+    expect(heuristicPlan({ ...coverage, active: 2, scopes: 1 }, ctx)[0]?.type).toBe("remind");
+    expect(heuristicPlan(coverage, { ...ctx, canSpawn: () => false })).toEqual([]);
+    expect(heuristicPlan(coverage, { ...ctx, nudgeAvailable: () => false })).toEqual([]);
   });
 
   it("stall：有额度→remind；额度耗尽→retire（含初始 Attempt）", () => {

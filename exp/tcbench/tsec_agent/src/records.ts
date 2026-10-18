@@ -271,6 +271,8 @@ export function rebuildBranches(file: string): Array<{
   }
   if (!forks.size) return [];
 
+  const hasCompactAnchor = (rs: ConvRecord[]): boolean =>
+    rs.some((r) => r.kind_note === "context_compact" || r.kind_note === "flag_continue");
   const cache = new Map<string, ChatMessage[]>();
   const build = (id: number, seqLimit: number): ChatMessage[] => {
     const key = `${id}:${seqLimit}`;
@@ -287,11 +289,14 @@ export function rebuildBranches(file: string): Array<{
       if (!f) return [];
       const parentMsgs = build(f.parent, Math.min(seqLimit, f.forkSeq));
       if (!parentMsgs.length) return [];
-      const own = recordsToMessagesLoose(
-        recs.filter((r) => (r.branch ?? 0) === id && r.seq <= seqLimit),
-      );
+      const ownRecs = recs.filter((r) => (r.branch ?? 0) === id && r.seq <= seqLimit);
+      const own = recordsToMessagesLoose(ownRecs);
       if (!own.length) return [];
-      out = [...parentMsgs, ...own];
+      // 分支压缩锚是自包含的（摘要覆盖父前缀 + 分支前缀）；重建时只保留 system/任务卡头，
+      // 不能再拼完整父上下文，否则父前缀与摘要重复。
+      out = hasCompactAnchor(ownRecs)
+        ? [...parentMsgs.slice(0, 2), ...own]
+        : [...parentMsgs, ...own];
     }
     cache.set(key, out);
     return out;

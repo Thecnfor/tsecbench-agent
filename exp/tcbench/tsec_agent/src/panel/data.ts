@@ -284,6 +284,9 @@ export interface LiveAttempt {
   label: string;
   status: string;
   depth: number;
+  /** 最近记录窗口内的消息条数（面板用于区分“只有 initial 标签”和真实活动）。 */
+  messages?: number;
+  last_at?: string;
 }
 
 export interface LiveView {
@@ -369,6 +372,14 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
       if (e.kind === "prune") pruned.add(id);
       if (e.kind === "result" && e.status) statusById.set(id, String(e.status));
     }
+    const msgStats = new Map<number, { messages: number; lastAt?: string }>();
+    for (const r of allMsgs) {
+      const id = Number(r.branch ?? 0);
+      const st = msgStats.get(id) ?? { messages: 0 };
+      st.messages++;
+      if (r.ts) st.lastAt = String(r.ts);
+      msgStats.set(id, st);
+    }
     const byId = new Map<number, LiveAttempt>();
     byId.set(0, {
       id: 0,
@@ -377,6 +388,8 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
       label: "initial",
       status: "active",
       depth: 0,
+      messages: msgStats.get(0)?.messages ?? 0,
+      last_at: msgStats.get(0)?.lastAt,
     });
     for (const r of allMsgs) {
       if (r.kind === "user" && r.kind_note === "fork_directive") {
@@ -389,6 +402,8 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
           label: String(r.fork_label ?? "").slice(0, 60),
           status: pruned.has(id) ? "pruned" : (statusById.get(id) ?? "active"),
           depth: 0,
+          messages: msgStats.get(id)?.messages ?? 0,
+          last_at: msgStats.get(id)?.lastAt,
         });
       }
     }

@@ -27,6 +27,8 @@ interface TaskRow {
       label: string;
       status: string;
       depth: number;
+      messages?: number;
+      last_at?: string;
     }>;
     log_tail?: string[];
   };
@@ -338,6 +340,7 @@ export function App() {
                       <div key={a.id} style={{ paddingLeft: `${a.depth * 12}px` }}>
                         {a.id === 0 ? "●" : "└"} Attempt {a.id} · {a.label || "(initial)"}{" "}
                         <span style={{ opacity: 0.7 }}>[{a.status}]</span>
+                        {a.messages ? <span className="muted"> · {a.messages} msgs</span> : null}
                       </div>
                     ))}
                   </div>

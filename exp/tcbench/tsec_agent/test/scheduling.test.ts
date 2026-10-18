@@ -91,6 +91,10 @@ describe("C：段墙钟预算换算", () => {
     const { CFG } = await import("../src/config.js");
     expect(CFG.resume_aging_sec).toBe(600);
   });
+  it("单 Attempt 上下文压缩阈值 400k token", async () => {
+    const { CFG } = await import("../src/config.js");
+    expect(CFG.compact_tokens).toBe(400000);
+  });
 });
 
 describe("A：通关检测与限时总结的接口契约", () => {

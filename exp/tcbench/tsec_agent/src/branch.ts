@@ -255,11 +255,33 @@ export class BranchManager {
     if (b && b.priority > 0) b.priority--;
   }
 
-  /** 按优先级排序的 active 列表（不消费优先票；并发 fill 用）。 */
+  /** 按优先级 + 轮转排序的 active 列表（不消费优先票；并发 fill 用）。
+   *  同优先级按“rr 之后”的循环距离排序，避免刚跑完的 branch 立刻再次被选中，
+   *  也避免高 id 新分支被 id 顺序永久饿死。 */
   ranked(exclude: Set<number> = new Set()): BranchState[] {
-    return this.active()
-      .filter((b) => !exclude.has(b.id))
+    const active = this.active();
+    const list = active.filter((b) => !exclude.has(b.id));
+    const boosted = list
+      .filter((b) => b.priority > 0)
       .sort((a, b) => b.priority - a.priority || a.id - b.id);
+    const normal = list.filter((b) => b.priority === 0);
+    if (!normal.length) return boosted;
+    const pos = new Map(active.map((b, i) => [b.id, i]));
+    const last = this.rr >= 0 && this.rr < active.length ? this.rr : -1;
+    normal.sort((a, b) => {
+      const ia = pos.get(a.id)!;
+      const ib = pos.get(b.id)!;
+      const da = last < 0 ? ia : (ia - last - 1 + active.length) % active.length;
+      const db = last < 0 ? ib : (ib - last - 1 + active.length) % active.length;
+      return da - db || a.id - b.id;
+    });
+    return [...boosted, ...normal];
+  }
+
+  /** 并发 scheduler 选中一轮后推进轮转游标（与 pickExcept 的 rr 同源）。 */
+  noteScheduled(id: number): void {
+    const idx = this.active().findIndex((b) => b.id === id);
+    if (idx >= 0) this.rr = idx;
   }
 
   /** 单飞轮转（兼容旧调用）。 */

@@ -32,7 +32,7 @@ docker/work/                  # 遗留目录，当前 run.sh 已不用
 ```bash
 pnpm install          # 首次
 pnpm build            # 构建 agent（dist/agent.js、dist/panel-server.js）+ 面板（dist/panel/）
-pnpm test             # 离线自测（183 个用例，不依赖 VPN/网关/平台）
+pnpm test             # 离线自测（193 个用例，不依赖 VPN/网关/平台）
 pnpm check            # 提交前自查：tsc --noEmit + biome check + pnpm test
 pnpm typecheck        # 仅类型检查
 pnpm lint             # biome 检查（配置 biome.jsonc）
@@ -107,17 +107,24 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `AGENT_TASK_SEGMENT_SHORT_SEC` | 短题段墙钟预算（主闸；到点暂停保留上下文） | 600 |
 | `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
 | `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸，轮数防极端空转） | 120 |
+| `AGENT_GIVEUP_MAX` | 有其他题等槽时，连续「未通关就收束」上限 | 3 |
+| `AGENT_NO_WAITER_GIVEUP_MAX` | 无题等槽时 giveup 上限；0=不限，最后几题持续跑 | 0 |
 | `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | 300 |
-| `AGENT_COMPACT_TOKENS` | 上下文压缩兜底阈值（**token 实测**：上一次 LLM 调用 usage.prompt_tokens；主触发器是「找到 flag」回合末强制压缩；交接文档：凭据原值/产物与在途/死路/进度；0=只留 flag 触发） | 500000 |
+| `AGENT_COMPACT_TOKENS` | 单 Attempt 压缩阈值（**token 实测**：上一次 LLM 调用 usage.prompt_tokens）；优先压共享 fork 前缀并保留 tail，其他 Attempt 到阈值复用；找到 flag 仍可强制压缩 | 400000 |
 | `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
 | `AGENT_FORK` | fork 多 Attempt 与协作工具（fork/report/log/state_change） | 1 |
 | `AGENT_PLANNER` | planner 统筹（fork 开启时生效；0=关闭自动提醒/spawn） | 1 |
-| `AGENT_BRANCH_CONCURRENCY` | 同时推进的 Attempt turn 数（1=旧单飞；2–4=真并发） | 2 |
+| `AGENT_BRANCH_CONCURRENCY` | 同时推进的 Attempt turn 数（1=旧单飞；2–4=真并发） | 4 |
+| `AGENT_MAX_BRANCHES` | 单题存活 Attempt 上限（含 Attempt 0） | 5 |
+| `AGENT_FORK_MAX` | 单题 fork/spawn 总次数上限 | 8 |
 | `AGENT_SHELL_MAX_JOBS_PER_BRANCH` | 每个 Attempt 的后台 job 上限（每题 `AGENT_SHELL_MAX_JOBS` 仍为 8） | 4 |
 | `AGENT_PLANNER_NUDGE_MAX` | 每段每 Attempt 的 planner 提醒上限 | 2 |
 | `AGENT_PLANNER_NUDGE_COOLDOWN_SEC` | planner 提醒冷却（秒） | 400 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |
+| `AGENT_REQUEST_TIMEOUT` | 单次 LLM 请求超时秒数；超时后按固定间隔重试 | 90 |
+| `AGENT_LLM_RETRY_INTERVAL_SEC` | 网络/超时/429/5xx 的固定重试间隔（秒；forever 模式） | 2 |
+| `AGENT_LLM_RETRY_MODE` | `forever`=固定间隔轮询到时限；`finite`=按 `AGENT_API_RETRIES` 放弃 | forever |
 | `VPN_GUARD` | VPN 运行时守卫：`auto`（hosted 开/local 关）/1/0 | `auto` |
 | `PANEL_PORT` | 面板端口 | 8791 |
 

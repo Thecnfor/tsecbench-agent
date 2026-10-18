@@ -14,7 +14,7 @@ import {
   pendingMutations,
   readCorelog,
 } from "../src/corelog.js";
-import { FORK_PROMPT_EXTRA, systemPromptWithExtras } from "../src/prompt.js";
+import { FORK_PROMPT_EXTRA, FORK_SYSTEM_HINT, systemPromptWithExtras } from "../src/prompt.js";
 import { rebuildBranches, rebuildMessages } from "../src/records.js";
 import { evaluateStall, recentDigest, shouldIntervene } from "../src/stall.js";
 import type { ChatMessage } from "../src/types.js";
@@ -283,6 +283,25 @@ describe("fork 优先调度", () => {
     // boost 只消费一次，之后回到 RR
     expect(bm.get(0)!.priority).toBe(0);
     expect(bm.get(1)!.priority).toBe(1); // 新 fork 两票，剩一票
+  });
+});
+
+describe("并发调度公平性", () => {
+  it("ranked 同优先级按 rr 轮转，不让高 id 新分支永久挨饿", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    bm.materializeFork(2, 0, "B", 4, 1002, (id) => `/w/br/${id}`);
+    for (const id of [0, 1, 2]) bm.get(id)!.priority = 0;
+    const seen: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const first = bm.ranked()[0];
+      seen.push(first.id);
+      bm.noteScheduled(first.id);
+    }
+    expect(seen).toEqual([0, 1, 2]);
+    // 刚跑过 branch1 后，branch0 仍在 inflight：下一个必须是 branch2，不能又选 branch1。
+    bm.noteScheduled(1);
+    expect(bm.ranked(new Set([0]))[0]?.id).toBe(2);
   });
 });
 
@@ -684,5 +703,8 @@ describe("log 检查方向归 sys（不逐次塞工具结果）", () => {
     expect(FORK_PROMPT_EXTRA).toContain("log.jsonl");
     // 六要素一行在基础 sys（log 工具在场时）
     expect(systemPromptWithExtras(true)).toContain("报告六要素");
+    expect(systemPromptWithExtras(true).startsWith(FORK_SYSTEM_HINT)).toBe(true);
+    expect(systemPromptWithExtras(true)).toContain("先看：多 Attempt 协作");
+    expect(systemPromptWithExtras(false)).not.toContain("先看：多 Attempt 协作");
   });
 });

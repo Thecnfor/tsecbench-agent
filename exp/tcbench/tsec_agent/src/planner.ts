@@ -42,7 +42,17 @@ export interface LogEvent {
   kind: "core" | "result" | "flag" | "mutation" | "artifact";
 }
 
-export type PlannerEvent = ReportEvent | StallEvent | LogEvent;
+/** 分支覆盖检查：当前 active 线/scope 数不够时，planner 提醒补 fork。 */
+export interface CoverageEvent {
+  type: "coverage";
+  attempt: number;
+  scopeId: number;
+  active: number;
+  scopes: number;
+  desired: number;
+}
+
+export type PlannerEvent = ReportEvent | StallEvent | LogEvent | CoverageEvent;
 
 export type PlannerAction =
   | { type: "retire"; attempt: number; reason: string }
@@ -61,6 +71,18 @@ export interface PlannerContext {
 export function heuristicPlan(ev: PlannerEvent, ctx: PlannerContext): PlannerAction[] {
   if (!ctx.enabled) return [];
   if (ev.type === "log") return []; // 当前 heuristic 只吸收；LLM planner 可在未来据此路由/提醒
+  if (ev.type === "coverage") {
+    if (ev.active >= ev.desired && ev.scopes >= 2) return [];
+    if (!ctx.canSpawn(ev.attempt) || !ctx.nudgeAvailable(ev.attempt)) return [];
+    return [
+      {
+        type: "remind",
+        attempt: ev.attempt,
+        text: coverageNudgeText(ev),
+        reason: "coverage check; not enough independent Attempts/scan scopes",
+      },
+    ];
+  }
   if (ev.type === "stall") {
     if (ctx.nudgeAvailable(ev.attempt)) {
       return [
@@ -113,6 +135,17 @@ export function heuristicPlan(ev: PlannerEvent, ctx: PlannerContext): PlannerAct
     reason: "planner backtrack from checkpoint (no failed tail copied)",
   });
   return actions;
+}
+
+/** planner 覆盖检查提醒：要求对照 fork 分类补全独立方向，而不是只开一条线。 */
+export function coverageNudgeText(ev: CoverageEvent): string {
+  return (
+    `[planner 提醒·覆盖检查] 当前 ${ev.active} 条 active 探索线（${ev.scopes} 个 scope），` +
+    `目标是至少 ${ev.desired} 条独立线。请对照 fork 分类检查是否覆盖完全：` +
+    `时间（长爆破/扫描）、空间（每个入口/端口/服务/子域）、假设（每条可证伪链）、` +
+    `探索（传统面/题面暗示/线索指向）、产出/权限（每个未拿 flag、不同角色/内网层）。` +
+    `不要只开一条线或只 fork 一个方向；有独立方向就继续 fork 多条（受存活上限/冷却），分头推进并 log。`
+  );
 }
 
 /** 重启恢复：从仍 active 的 Attempt 中选一个 recovery owner。

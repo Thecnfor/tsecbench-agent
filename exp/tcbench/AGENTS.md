@@ -57,7 +57,7 @@
 
 1. **单工具设计（2026-10-16 放宽）**：基础工具只有 `shell`（异步 background 模式），**无 MCP**。
    fork 多 Attempt 与 planner 统筹是**默认开启的控制器层能力**（`AGENT_FORK` 默认 1；
-   `AGENT_PLANNER` 默认 1；`AGENT_BRANCH_CONCURRENCY` 默认 2），
+   `AGENT_PLANNER` 默认 1；`AGENT_BRANCH_CONCURRENCY` 默认 4），
    打开后工具集扩展为 `shell + fork + report + log + state_change`——这是与评测方对齐后的演进
    （单线调试可设 `AGENT_FORK=0`，行为回到旧单分支）。planner 是唯一统筹者，没有特权主分支；`AGENT_BRANCH_CONCURRENCY>1` 时多 Attempt turn 真并发（注入走 inbox）；
    read/write/web 等文件类工具仍禁止
@@ -101,8 +101,10 @@
      关题释放名额 → 上下文保留（`resumeMeta`；需要时由 `records.rebuildMessages` 从
      conversation.jsonl 重建）→ 之后 `start` 续跑（重启靶机），
      续跑在上下文末尾追加 `prompt.RESUME_NOTE`（新 target / 靶机内状态已重置 / workdir 保留 /
-     已提交 flag 不丢 / 从上次进度继续）；**本地全齐但平台复核仍未通关**（计数未同步）时
-     追加 `prompt.COMPLETION_DESYNC_NOTE`（重交已有 flag、不要重做侦察/打新入口）。
+     已提交 flag 不丢 / 从上次进度继续）；`startChallenge` 后还会在所有 recovery 消息之后
+     追加 `prompt.TARGET_NOTE`，用新 target 覆盖旧 mutation 文本里的历史地址；
+     **本地全齐但平台复核仍未通关**（计数未同步）时追加 `prompt.COMPLETION_DESYNC_NOTE`
+     （重交已有 flag、不要重做侦察/打新入口）。
      轮数 `AGENT_TASK_MAX_TURNS`（默认 120，0=关）
      只是安全网——实测段墙钟 p50=4.7min、p90=28.9min、max=158min，同样 60 轮墙钟差 30 倍
      （耗时由工具等待主导），所以墙钟当主闸、轮数防极端空转。
@@ -132,23 +134,31 @@
      防 fresh 无限插队，实测曾有题暂停后等 118 分钟）。分类只用 API 字段
      （flag_count/difficulty/level），**不依赖历史基线**（正式比赛题目必变）。
      策略选择由 `sim/` 离散事件模拟器 bench 验证（74 测试含 `test/sim.test.ts`）。
-   - **无人等名额就不关题（保留的原语义，短题适用）**：短题段到点时若快照里**没有别的题在等
-     这个并发名额**（无新题、也无待续跑的题——典型即"收尾只剩几题且都在跑"）→ 不 `close`、
-     不 `start`，**同一容器、同一上下文直接续一段**（事件 `segment_continue`），省掉靶机
-     重置的代价；有人等名额才照旧关题让位（长题另有配额规则，见上）。快照拿不到时保守按原行为关题。
+   - **无人等名额就不关题（段到点 / giveup 都适用）**：若快照里**没有别的题在等
+     这个并发名额**（无新题、也无待续跑的题——典型即"收尾只剩几题且都在跑"）：
+     ① 段到点：不 `close`、不 `start`，**同一容器、同一上下文直接续一段**
+     （事件 `segment_continue`）；
+     ② giveup（所有 Attempt 已 park）：同样不 `close`、不 `start`，重新打开初始 Attempt、
+     注入 `prompt.GIVEUP_NOTE` 原地续一段（事件 `giveup_continue`）。无题等槽时默认
+     `AGENT_NO_WAITER_GIVEUP_MAX=0`（不限次数，最后几题不主动放弃）；有题等槽时才用
+     `AGENT_GIVEUP_MAX=3` 收束。上下文和 target 都不变，省掉容器重启代价。
+     有人等名额才照旧关题让位（长题另有配额规则，见上）。快照拿不到时保守按原行为关题。
      实测单段最长 158min 平台未超时砍题。
-   - **上下文压缩（通用交接文档，2026-10-17 取代逐 flag 总结）**：**主触发器 =
-     找到 flag**（多 flag 未全齐时回合末强制压缩——flag 时刻信息密度最高）；
-     `AGENT_COMPACT_TOKENS`（默认 **500k token**，取上一次 LLM 调用
-     `usage.prompt_tokens` **实测**——不经常压、口径真实）是**兜底**（长探索不靠
-     flag 也能压）；压缩成功后 token 计数清零（真实 usage 重建口径），失败退避 3 轮。
-     超限则元调用 LLM 生成
-     **交接文档**（①已确认事实**原值保留**②产物与在途：workdir 文件清单 +
+   - **上下文压缩（通用交接文档，2026-10-17 取代逐 flag 总结）**：
+     **触发 = 单个 Attempt 的实测 `usage.prompt_tokens` ≥ `AGENT_COMPACT_TOKENS`（默认 400k）**；
+     找到 flag（多 flag 未全齐）仍可在回合末强制压缩（信息密度最高）。
+     压缩成功后 token 计数清零（真实 usage 重建口径），失败退避 3 轮。
+     **压缩范围优先选 fork 断点前缀**：候选 = 各 Attempt 的 `checkpointMessages` 长度 +
+     当前完整上下文；按**覆盖的存活 Attempt 数**优先、同覆盖取更长前缀。只替换当前
+     Attempt 的前缀，保留它 fork 后的 tail；其他 Attempt 不立刻改，等自己到阈值时
+     复用同一前缀的交接文档（同一 solveTask 内 `sharedCompacts` 缓存；续跑按同样逻辑重算）。
+     没有可共享前缀时退化为整段压缩。
+     元调用 LLM 生成 **交接文档**（①已确认事实**原值保留**②产物与在途：workdir 文件清单 +
      未完成的后台 shell 说明（**生命周期不归压缩管**，job 照跑）③已证伪死路
-     ④当前进度⑤flag 进度，≤1500 字），整体替换为 [system, 任务卡, 文档]——
-     治逐 flag 总结 120 字太瘦导致的重新收集；conv 记 `kind_note:"context_compact"`
-     （**注入全文**，重建锚 = 最后一条该类记录 + 其后过程，三方同文）；
-     黑板同步一张【压缩交接】卡；压缩是元调用不占轮次。
+     ④当前进度⑤flag 进度，≤1500 字）；运行时替换为 [system, 任务卡, 文档, 保留 tail]。
+     conv 记 `kind_note:"context_compact"` 锚 + `compact_tail` 保留段；分支重建遇到
+     `context_compact` 锚时只取 system/任务卡头 + 摘要 + tail，不再拼完整父前缀
+     （防摘要与父前缀重复）；黑板同步一张【压缩交接】卡；压缩是元调用不占轮次。
      **单 flag 收尾总结轮保留**（submit 后 ≤120 字总结即收尾）。
    - **自动黑板（2026-10-17，治"提示词暗示不可靠"）**：模型每轮的**进展叙述**
      （assistant content，不含 thinking/tool；≥8 字）由控制器**自动落黑板卡**
@@ -157,7 +167,7 @@
      log 提示相应减负（撤"立刻记×3/频率/回收威胁"轰炸，保留"写凭据/证伪/flag idx
      + 判断带置信"）；手动 log 仍用于证据卡与 flag idx 记账。
    - **只有三种终止**：上下文超模型窗口（`context_overflow`，立即停不重试）、
-     连续 `AGENT_GIVEUP_MAX`（默认 3）段「未通关就输出总结」、真失败累计
+     有题等槽时连续 `AGENT_GIVEUP_MAX`（默认 3）段「未通关就输出总结」、真失败累计
      `AGENT_MAX_FAILURES`（默认 2）次；其余情况一律续跑到通关或平台终态。
      真失败/启动失败计入 `failures` 字典；`attempts` 只用于 attempt 编号与启动失败计数。
    - 暂停、续跑**不消耗**失败次数。
@@ -223,7 +233,7 @@
 | `tsec_agent/src/stall.ts` | 卡塞信号（flag 主时钟 + 四信号任二）+ planner 提醒模板；由 controller 事件化交给 planner，无独立 observer LLM | 卡塞判定/提醒文本 |
 | `tsec_agent/src/artifacts.ts` | shell 后新文件的有界扫描 + sha256；跨 Attempt/跨段产物去重提示；共享写命令启发式提醒 | 产物去重/扫描阈值 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
-| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/planner 开关 `AGENT_FORK`/`AGENT_PLANNER`、`AGENT_BRANCH_CONCURRENCY` 及护栏/提醒阈值 | 加配置项 |
+| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/planner 开关 `AGENT_FORK`/`AGENT_PLANNER`、`AGENT_BRANCH_CONCURRENCY`/`AGENT_MAX_BRANCHES`/`AGENT_FORK_MAX` 及护栏/提醒阈值 | 加配置项 |
 | `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
 | `arena/` | 内部本地跑分题场：官方 Challenges API 线格式兼容的计分服务 + **docker 真靶机驱动**（题包在 `arena/challenges/`，含 flag 字面量——`.dockerignore` 已排除 `arena/`，**红线别删**）；行为契约见 `arena/README.md`，接入只改 `BENCHMARK_BASE_URL`/`BENCHMARK_TOKEN` | 内部本地跑分、加题 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
@@ -236,7 +246,7 @@
 ## 常用操作
 
 ```bash
-# 离线自测（改完代码先跑这个，不需要 VPN/网关；183 个 vitest 用例）
+# 离线自测（改完代码先跑这个，不需要 VPN/网关；193 个 vitest 用例）
 cd tsec_agent && pnpm install && pnpm test
 
 # 一次性检查：类型检查 + biome lint + 全部测试（提交前自查）

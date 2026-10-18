@@ -95,3 +95,63 @@ describe("并发 Attempt turn", () => {
     expect(maxActive).toBeGreaterThanOrEqual(2);
   }, 30_000);
 });
+
+describe("三分支并发公平性", () => {
+  it("concurrency=2 时 trunk + 两个 fork 都获得 LLM turn，不饿死高 id 分支", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = false;
+    CFG.branch_concurrency = 2;
+    CFG.max_branches = 4;
+    CFG.fork_cooldown_sec = 0;
+    CFG.task_max_turns = 10;
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "conc3_rec_"));
+    setRecordsDir(recdir);
+    const R = initRecords("local", "deepseek-flash");
+    const conv = R.conversation("t-conc3");
+    setTaskCwd(fs.mkdtempSync(path.join(os.tmpdir(), "conc3_work_")));
+    const calls = new Map<number, number>();
+    const client: LlmClient = {
+      async create(opts) {
+        const msgs = opts.messages;
+        const directive = msgs.find((m) => String(m.content ?? "").startsWith("【分支 "));
+        const id = directive ? Number(/【分支 (\d+)/.exec(String(directive.content))?.[1]) : 0;
+        calls.set(id, (calls.get(id) ?? 0) + 1);
+        if (id === 0) {
+          const forkCalls = msgs.filter((m) =>
+            (m.tool_calls ?? []).some((t) => t.function.name === "fork"),
+          ).length;
+          if (forkCalls < 2) {
+            return {
+              choices: [
+                {
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [tc(`f${forkCalls}`, "fork", { direction: `方向${forkCalls}` })],
+                  },
+                },
+              ],
+            };
+          }
+        }
+        return {
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [tc(`s${id}-${calls.get(id)}`, "shell", { command: "echo ok" })],
+              },
+            },
+          ],
+        };
+      },
+    };
+    const r = await solveTask(client, "t-conc3", "卡", 600, conv, { taskClass: "short" });
+    expect(r.status).toBe("paused");
+    expect([...calls.keys()].sort()).toEqual([0, 1, 2]);
+    expect(calls.get(0)).toBeGreaterThan(0);
+    expect(calls.get(1)).toBeGreaterThan(0);
+    expect(calls.get(2)).toBeGreaterThan(0);
+  }, 30_000);
+});

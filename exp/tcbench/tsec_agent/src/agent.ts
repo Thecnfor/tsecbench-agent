@@ -9,6 +9,7 @@
  *   node dist/agent.js            # 运行到完成或超时
  *   node dist/agent.js --smoke    # 冒烟测试：仅验证网关连通 + shell 工具
  */
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { collectNewArtifacts, looksLikeFileCommand, looksLikeSharedWrite } from "./artifacts.js";
@@ -59,6 +60,7 @@ import {
   RECOVERY_NOTICE,
   RESUME_NOTE,
   systemPromptWithExtras,
+  TARGET_NOTE,
 } from "./prompt.js";
 import { getTaskCwd, runWithTaskBranch, ShellManager, setTaskCwd, setTaskShell } from "./shell.js";
 import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
@@ -541,6 +543,14 @@ export async function solveTask(
   // --- fork/planner 基础设施（默认关：单初始 Attempt、无额外工具、无额外调用） ---
   const workdir = getTaskCwd() || "";
   const plannerFile = path.join(workdir || taskWorkdir(code), "planner.json");
+  type SharedCompact = {
+    len: number;
+    summary: string;
+    coverage: number;
+    source: number;
+    at: number;
+  };
+  const sharedCompacts = new Map<string, SharedCompact>();
   const branchCwd = (id: number): string => {
     const d = `${workdir}/branches/${id}`;
     try {
@@ -962,47 +972,123 @@ export async function solveTask(
     applyPlanner();
   };
 
-  /** 通用上下文压缩（与 flag 无关，单/多 flag 同机制）：超 AGENT_COMPACT_CHARS 阈值时
-   *  把该分支此前过程压缩为**交接文档**（已确认事实原值/产物文件清单/死路/进度）并整体
-   *  替换——治两类实测断层：①逐 flag 总结 120 字太瘦，压缩后要重新信息收集；
-   *  ② shell 产物（workdir 文件）无人交接。文档同步落 corelog 当【压缩交接】卡
-   *  （压缩点 = 强制采集点，顺带治"对话大量信息不进黑板"）。失败退避 3 轮重试。 */
+  /** 覆盖检查：难题/多 flag 题 active 线或 scope 不足时，让 planner 提醒补 fork。
+   *  只在还有存活名额时提醒；任务级冷却避免同一检查同时发给多个 Attempt。 */
+  let lastCoverageNudgeAt = 0;
+  const maybePlannerCoverage = (): void => {
+    if (!plannerOn || !multiOn) return;
+    if (flagTotal <= 1 && taskClass !== "long") return;
+    const active = bm.active();
+    if (!active.length) return;
+    const scopes = new Set(active.map((b) => b.scopeId)).size;
+    const desired = Math.min(
+      CFG.max_branches,
+      Math.max(2, Math.min(4, flagTotal > 1 ? flagTotal : 2)),
+    );
+    if (active.length >= desired && scopes >= 2) return;
+    if (bm.alive().length >= CFG.max_branches) return;
+    const now = nowSec();
+    if (now - lastCoverageNudgeAt < CFG.planner_nudge_cooldown_sec) return;
+    const eligible = active.filter((b) => bm.plannerNudgeAvailable(b.id, now));
+    if (!eligible.length) return;
+    const target = eligible.reduce((a, b) => (a.lastCoreTs <= b.lastCoreTs ? a : b));
+    if (!bm.canSpawnFrom(target.id)) return;
+    lastCoverageNudgeAt = now;
+    plannerEvents.push({
+      type: "coverage",
+      attempt: target.id,
+      scopeId: target.scopeId,
+      active: active.length,
+      scopes,
+      desired,
+    });
+    applyPlanner();
+  };
+
+  /** 通用上下文压缩（与 flag 无关，单/多 flag 同机制）：超过 token 阈值时压缩该 Attempt。
+   *  优先选一个 **fork 断点前缀**（被最多 Attempt 共享），只替换当前 Attempt 的前缀，
+   *  保留其分叉后的 tail；同一前缀的交接文档缓存在 sharedCompacts，供后续 Attempt 复用。
+   *  文档同步落 corelog 当【压缩交接】卡。失败退避 3 轮重试。 */
   const compactFailedAt = new Map<number, number>();
+  /** 把保留的 tail 重新追加到 conv：context_compact 锚之后的过程记录 = 新上下文。 */
+  const appendCompactTail = (branchId: number, m: ChatMessage): void => {
+    if (m.role === "user") {
+      conv.write("user", {
+        branch: branchId,
+        kind_note: "compact_tail",
+        content: m.content,
+        turn: `${code}:${turn}`,
+      });
+    } else if (m.role === "assistant") {
+      conv.write("assistant", {
+        branch: branchId,
+        kind_note: "compact_tail",
+        output: typeof m.content === "string" ? m.content : null,
+        tool_calls: m.tool_calls?.map((t) => ({
+          id: t.id,
+          name: t.function.name,
+          arguments: t.function.arguments,
+        })),
+        turn: `${code}:${turn}`,
+      });
+    } else if (m.role === "tool") {
+      conv.write("tool", {
+        branch: branchId,
+        kind_note: "compact_tail",
+        tool_call_id: m.tool_call_id,
+        result: m.content,
+        turn: `${code}:${turn}`,
+      });
+    }
+  };
   const maybeCompact = async (br: BranchState, force = false): Promise<boolean> => {
     const before = estMsgChars(br.messages);
     const beforeTokens = lastPromptTokens.get(br.id) ?? 0;
     if (!force) {
-      // token 兜底路径（500k 实测才压，不经常压）；flag 触发走 force（信息密度最高时刻）
-      const used = lastPromptTokens.get(br.id) ?? 0;
-      if (CFG.compact_tokens <= 0 || used < CFG.compact_tokens) return false;
+      // token 主触发：per-Attempt 实测 usage.prompt_tokens（默认 400k）；flag 触发走 force。
+      if (CFG.compact_tokens <= 0 || beforeTokens < CFG.compact_tokens) return false;
     }
     if (turn - (compactFailedAt.get(br.id) ?? -99) < 3) return false;
+    const scope = selectCompactionScope(bm.alive(), br, new Set(sharedCompacts.keys()));
+    if (!scope) return false;
     try {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), Math.max(CFG.summary_timeout_sec, 60) * 1000);
-      let doc = "";
-      try {
-        const resp = await callLlm(
-          client,
-          [...br.messages, { role: "user", content: COMPACTION_PROMPT }],
-          false,
-          { signal: ac.signal, thinking: { type: "disabled" } },
-        );
-        doc = (resp.choices?.[0]?.message?.content ?? "").trim();
-      } finally {
-        clearTimeout(timer);
+      const cached = sharedCompacts.get(scope.key);
+      let doc = cached?.summary ?? "";
+      if (!doc) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), Math.max(CFG.summary_timeout_sec, 60) * 1000);
+        try {
+          const resp = await callLlm(
+            client,
+            [...br.messages.slice(0, scope.len), { role: "user", content: COMPACTION_PROMPT }],
+            false,
+            { signal: ac.signal, thinking: { type: "disabled" } },
+          );
+          doc = (resp.choices?.[0]?.message?.content ?? "").trim();
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!doc) return false;
+        sharedCompacts.set(scope.key, {
+          len: scope.len,
+          summary: doc,
+          coverage: scope.coverage,
+          source: br.id,
+          at: nowSec(),
+        });
       }
-      if (!doc) return false;
       const head = br.messages.slice(0, 2); // system + 任务卡
+      const tail = br.messages.slice(scope.len);
       const injected = fill(COMPACT_NOTE, { summary: doc });
-      br.messages = [...head, { role: "user", content: injected }];
-      // conv 记录 = 实际注入的全文（重建三方同文 + 对话忠诚不变量）；corelog 卡存原文
+      br.messages = [...head, { role: "user", content: injected }, ...tail];
+      // conv = 实际注入的交接文档 + 保留 tail；锚之后的新 tail 记录用于续跑重建。
       conv.write("user", {
         branch: br.id,
         kind_note: "context_compact",
         content: injected,
         turn: `${code}:${turn}`,
       });
+      for (const m of tail) appendCompactTail(br.id, m);
       corelog?.write({ branch: br.id, kind: "core", note: `【压缩交接】${doc}` });
       rec().event("context_compacted", {
         code,
@@ -1010,10 +1096,14 @@ export async function solveTask(
         beforeTokens,
         beforeChars: before,
         afterChars: estMsgChars(br.messages),
+        prefix_len: scope.len,
+        coverage: scope.coverage,
+        reused: !!cached,
       });
       lastPromptTokens.delete(br.id); // 陈旧高值会反复触发，下一次真实 usage 重建口径
       log(
         `[${code}] branch ${br.id} compacted @${Math.round(beforeTokens / 1000)}k tok: ` +
+          `prefix=${scope.len} coverage=${scope.coverage} reused=${!!cached} ` +
           `${before} -> ${estMsgChars(br.messages)} chars (turn ${turn})`,
       );
       return true;
@@ -1568,6 +1658,7 @@ export async function solveTask(
     const busy = new Set(inflight.keys());
     pruneStalled(busy);
     maybePlannerStall(busy);
+    maybePlannerCoverage();
 
     while (inflight.size < branchConcurrency) {
       const exclude = new Set(inflight.keys());
@@ -1577,7 +1668,10 @@ export async function solveTask(
           ? bm.pickExcept(exclude)
           : bm.ranked(exclude).find((b) => warmed.has(b.id) || !coldBusy);
       if (!br) break;
-      if (branchConcurrency > 1) bm.consumePriority(br.id);
+      if (branchConcurrency > 1) {
+        bm.consumePriority(br.id);
+        bm.noteScheduled(br.id);
+      }
       inflight.set(
         br.id,
         runTurn(br).then((outcome) => {
@@ -1837,7 +1931,63 @@ function taskWorkdir(code: string): string {
   return d;
 }
 
-/** 消息序列的字符估算（压缩阈值判定用；content 与 tool_calls 参数都计入）。 */
+/** 消息前缀的滚动哈希：用于找多个 Attempt 共享的 fork 断点。 */
+function messagePrefixHashes(messages: ChatMessage[]): string[] {
+  const prefix: string[] = [""];
+  let acc = "";
+  for (const m of messages) {
+    const digest = createHash("sha1").update(JSON.stringify(m)).digest("hex");
+    acc = createHash("sha1").update(acc).update(digest).digest("hex");
+    prefix.push(acc);
+  }
+  return prefix;
+}
+
+export interface CompactionScope {
+  len: number;
+  key: string;
+  coverage: number;
+}
+
+/** 选压缩边界：候选 = 各 Attempt 的 fork checkpoint 长度 + 当前完整上下文。
+ *  覆盖数优先（共享同一前缀的存活 Attempt 数；已有缓存算一次复用），同覆盖取更长前缀。
+ *  只返回消息前缀，不修改任何 Attempt。 */
+export function selectCompactionScope(
+  branches: BranchState[],
+  target: BranchState,
+  cachedKeys: ReadonlySet<string> = new Set(),
+): CompactionScope | null {
+  const headLen = 2; // system + 任务卡
+  if (target.messages.length <= headLen) return null;
+  const all = branches.includes(target) ? branches : [...branches, target];
+  const hashes = new Map<number, string[]>();
+  for (const b of all) hashes.set(b.id, messagePrefixHashes(b.messages));
+  const keyAt = (b: BranchState, len: number): string | null => {
+    const p = hashes.get(b.id)!;
+    return len >= 0 && len < p.length ? `${len}:${p[len]}` : null;
+  };
+  const candidates = new Set<number>([target.messages.length]);
+  for (const b of all) {
+    const len = b.checkpointMessages?.length ?? 0;
+    if (len > headLen && len <= target.messages.length) candidates.add(len);
+  }
+  let best: CompactionScope | null = null;
+  for (const len of candidates) {
+    // 截断后 tail 不能从孤立的 tool 结果开始（否则重建会丢尾部配对）。
+    if (target.messages[len]?.role === "tool") continue;
+    const key = keyAt(target, len);
+    if (!key) continue;
+    let coverage = 0;
+    for (const b of all) if (keyAt(b, len) === key) coverage++;
+    if (cachedKeys.has(key)) coverage++; // 已压缩的同前缀 Attempt 可复用
+    if (!best || coverage > best.coverage || (coverage === best.coverage && len > best.len)) {
+      best = { len, key, coverage };
+    }
+  }
+  return best;
+}
+
+/** 消息序列的字符估算（压缩前后对比/日志用；content 与 tool_calls 参数都计入）。 */
 function estMsgChars(msgs: ChatMessage[]): number {
   let n = 0;
   for (const m of msgs) {
@@ -1965,6 +2115,7 @@ async function runParallel(
     const oldTarget = (meta.target as string) ?? "";
     let startTurn = 0;
     let used = 0;
+    let finalWaiters = true; // 本段收束时是否还有别的题等槽（供 giveup 上限判断）
     try {
       const card = formatTaskCard({
         code,
@@ -2066,6 +2217,28 @@ async function runParallel(
               conv.write("user", { branch: 0, turn: `${code}:${startTurn}`, content: assignment });
             }
           }
+          // startChallenge 已分配（可能变化的）target：最后再钉一次，覆盖 mutation/旧上下文里的地址。
+          const targetNote = fill(TARGET_NOTE, {
+            new_target: addr,
+            old_target: oldTarget || "（未知）",
+            workdir: getTaskCwd() || taskWorkdir(code),
+          });
+          messages.push({ role: "user", content: targetNote });
+          conv.write("user", {
+            branch: 0,
+            turn: `${code}:${startTurn}`,
+            kind_note: "target_notice",
+            content: targetNote,
+          });
+          for (const b of branches) {
+            b.messages.push({ role: "user", content: targetNote });
+            conv.write("user", {
+              branch: b.id,
+              turn: `${code}:${startTurn}`,
+              kind_note: "target_notice",
+              content: targetNote,
+            });
+          }
           rec().event("recovery_planned", {
             code,
             count: pending.length,
@@ -2144,6 +2317,50 @@ async function runParallel(
           }
         }
         completed = !!state?.is_completed;
+        if (status !== "done") gives = 0; // 只有连续 done 才累计 give-up
+
+        // giveup 且无人等这个并发名额：不关题、不 start，原地重新打开初始 Attempt 继续。
+        // 页面/上下文都还在（尤其 target 不变），giveup 后的 close→start 纯属浪费。
+        if (status === "done" && !completed && !r.flagsComplete && !completionUnconfirmed) {
+          const noWaiters = !slotWaiters(itemsNow, code);
+          const cap = noWaiters ? CFG.no_waiter_giveup_max : CFG.giveup_max;
+          const nextGives = gives + 1;
+          const tooMany = cap > 0 && nextGives >= cap;
+          if (!tooMany && noWaiters && messages) {
+            gives = nextGives;
+            const note = fill(GIVEUP_NOTE, {
+              new_target: addr,
+              old_target: oldTarget || "（未知）",
+              workdir: getTaskCwd() || taskWorkdir(code),
+              budget_min: Math.round(budgetSec / 60),
+              turns: startTurn + used,
+              platform: String(meta.platform ?? "?"),
+              total_flags: task.flag_count,
+            });
+            messages.push({ role: "user", content: note });
+            conv.write("user", {
+              branch: 0,
+              turn: `${code}:${startTurn + used}`,
+              kind_note: "giveup_continue",
+              content: note,
+            });
+            startTurn += used;
+            segStartFlags = state?.correct_flag_count ?? segStartFlags;
+            budgetSec = segBudgetSec();
+            rec().event("giveup_continue", {
+              code,
+              gives,
+              turns: startTurn,
+              target: addr,
+              no_waiters: true,
+            });
+            log(
+              `[${code}] giveup but no slot waiters; continuing in place ` +
+                `(${startTurn} turns so far, no close/restart)`,
+            );
+            continue;
+          }
+        }
 
         // ---- 段到点处置（保留 segment_continue 收尾语义 + D 配额规则）----
         if (status === "paused" && !completed) {
@@ -2183,6 +2400,7 @@ async function runParallel(
             continue;
           }
         }
+        finalWaiters = slotWaiters(itemsNow, code);
         break;
       }
 
@@ -2233,9 +2451,10 @@ async function runParallel(
         const giveup = status === "done";
         gives = giveup ? gives + 1 : 0;
         pauses += 1;
+        const giveupCap = finalWaiters ? CFG.giveup_max : CFG.no_waiter_giveup_max;
         const tooMany =
-          (CFG.giveup_max > 0 && gives >= CFG.giveup_max) ||
-          (CFG.pause_max > 0 && pauses > CFG.pause_max);
+          (giveupCap > 0 && gives >= giveupCap) ||
+          (finalWaiters && CFG.pause_max > 0 && pauses > CFG.pause_max);
         if (tooMany) {
           // 终止式放弃：直接置满失败上限，不再被重新派发
           failures[code] = Math.max(CFG.max_failures, 1);

@@ -322,8 +322,9 @@ describe("端到端：控制器 + 单题独立上下文 + 分段解题 + 记录"
     expect(evTypes).toContain("run_start");
     expect(evTypes).toContain("run_finish");
     expect(evTypes).toContain("final_summary");
-    // 分段解题：t-02 每段"未通关就收尾" → 暂停关题、带上下文续跑，直到连续收尾达上限判 fail
-    expect(evTypes).toContain("task_paused");
+    // 分段解题：t-02 每次"未通关就收尾" → 无人等名额时原地续段（不 close/start），
+    // 连续收尾达上限判 fail。
+    expect(evTypes).toContain("giveup_continue");
     expect(evTypes).toContain("task_abandoned");
     const t02Events = evs.filter((e) => e.code === "t-02");
     expect(
@@ -331,13 +332,15 @@ describe("端到端：控制器 + 单题独立上下文 + 分段解题 + 记录"
       `t02 events: ${JSON.stringify(t02Events)}`,
     ).toBe(true);
 
-    // 续跑：t-02 的对话里应有"继续解题"通知，且排在重建出的上下文之后
-    // （system + 任务卡只在首段写一次，续跑不重写 → 文件里仍是 1 条 system）
+    // 原地续段：t-02 的对话里应有"继续解题"通知；system + 任务卡只在首段写一次。
     expect(convT02.filter((r) => r.kind === "system").length).toBe(1);
     const resumeNotes = convT02.filter(
       (r) => r.kind === "user" && String(r.content ?? "").includes("继续解题"),
     );
-    expect(resumeNotes.length).toBeGreaterThan(0);
+    expect(resumeNotes.length).toBe(2); // 两次原地拉回，第 3 次达到 giveup_max 后 abandon
+    expect(resumeNotes.every((r) => String(r.content).includes("10.9.9.9:80"))).toBe(true);
+    const continues = evs.filter((e) => e.type === "giveup_continue" && e.code === "t-02");
+    expect(continues.length).toBe(2);
 
     // 续跑时上下文从记录重建：断言重建结果自洽
     const rebuilt = records.rebuildMessages(
@@ -360,9 +363,9 @@ describe("端到端：控制器 + 单题独立上下文 + 分段解题 + 记录"
       }
     }
 
-    // tasks.jsonl：t-02 至少有一次 resume=True 的 task_start（续跑重新 start）
+    // tasks.jsonl：t-02 无人等名额时原地续段 → 只 start 一次，不 close/重启
     const t02Starts = taskRecs.filter((r) => r.phase === "task_start" && r.code === "t-02");
-    expect(t02Starts.length).toBeGreaterThanOrEqual(3);
-    expect(t02Starts.some((r) => r.resume)).toBe(true);
+    expect(t02Starts.length).toBe(1);
+    expect(t02Starts.some((r) => r.resume)).toBe(false);
   }, 300_000);
 });

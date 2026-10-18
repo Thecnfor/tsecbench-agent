@@ -13,7 +13,9 @@ import {
   COMPACTION_PROMPT,
   COMPLETION_DESYNC_NOTE,
   fill,
+  GIVEUP_NOTE,
   systemPromptWithExtras,
+  TARGET_NOTE,
 } from "../src/prompt.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
 import { dispatchShell } from "../src/shell_tool.js";
@@ -291,6 +293,23 @@ describe("通关平台复核（延迟 + 轮询 is_completed）", () => {
     });
     expect(r.items).toBeNull();
     expect(r.state).toBeNull();
+  });
+
+  it("拉回/目标提醒都带当前 target，旧地址明确作废", () => {
+    const vars = {
+      new_target: "10.9.9.9:80",
+      old_target: "10.0.0.2:80",
+      workdir: "/work/tasks/t",
+    };
+    const giveup = fill(GIVEUP_NOTE, vars);
+    const target = fill(TARGET_NOTE, vars);
+    for (const s of [giveup, target]) {
+      expect(s).not.toContain("{");
+      expect(s).toContain("10.9.9.9:80");
+      expect(s).toContain("10.0.0.2:80");
+    }
+    expect(target).toContain("旧地址");
+    expect(target).toContain("当前 target 之外的实例");
   });
 
   it("计数未同步续跑通知：占位符填充 + 明确不重做", () => {

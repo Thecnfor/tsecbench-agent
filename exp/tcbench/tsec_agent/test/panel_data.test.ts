@@ -220,6 +220,8 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
       [0, null, 0, "active"],
       [1, 0, 1, "pruned"],
     ]);
+    expect(v.attempts[0].messages).toBe(3); // system + card + branch0 assistant
+    expect(v.attempts[1].messages).toBe(1);
     expect(v.log_tail.some((s) => s.includes("发现注入点"))).toBe(true);
     // 无 fork 的题：空名册不炸
     fs.mkdirSync(path.join(runs, "tasks", "t-02"), { recursive: true });

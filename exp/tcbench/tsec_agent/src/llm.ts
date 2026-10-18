@@ -266,8 +266,8 @@ export function setStopCheck(fn: () => boolean): void {
 
 /** chat completion 调用，按 AGENT_LLM_RETRY_MODE 重试。
  *
- * - forever（默认）：连接/超时/限流/5xx 无限指数退避（封顶 llm_retry_max_delay），
- *   直到成功或任务时限；每 10 次记一条日志避免刷屏。
+ * - forever（默认）：连接/超时/限流/5xx 以固定间隔轮询重试，直到成功或任务时限；
+ *   每 10 次记一条日志避免刷屏。
  * - finite：最多 api_max_retries 次后抛出。
  * - 4xx（认证/参数错误，非 429）：立即抛出，不重试。
  * - useTools=false：复盘总结轮/planner 轮用——不下发工具，模型只能输出文本。
@@ -287,7 +287,6 @@ export async function callLlm(
     effort?: string; // 思考档位（按题目分档：短题 low / 长题不发=模型默认）
   } = {},
 ): Promise<ChatResponse> {
-  let delayMs = 2000;
   let attempt = 0;
   let active = client;
   if (CURRENT_CLIENT) active = CURRENT_CLIENT; // 其他处已热切换过 key，本调用跟随
@@ -354,12 +353,12 @@ export async function callLlm(
       if (CFG.llm_retry_mode !== "forever" && attempt >= CFG.api_max_retries) throw e;
       // 任务时限到了就别再等
       const rem = _remainingSec();
-      if (rem !== null && rem <= CFG.llm_retry_max_delay) {
+      if (rem !== null && rem <= CFG.llm_retry_interval_sec) {
         throw new Error(
           `deadline approaching, abort retries: ${e instanceof Error ? e.message : e}`,
         );
       }
-      const wait = Math.min(delayMs / 1000, CFG.llm_retry_max_delay);
+      const wait = CFG.llm_retry_interval_sec;
       if (attempt === 1 || attempt % 10 === 0) {
         const name = e instanceof Error ? e.name : "Error";
         const msg = e instanceof Error ? e.message : String(e);
@@ -369,8 +368,7 @@ export async function callLlm(
         );
         rec().event("llm_retry", { attempt, error: `${name}: ${msg}`, next_delay_sec: wait });
       }
-      await new Promise((r) => setTimeout(r, delayMs));
-      delayMs = Math.min(delayMs * 2, CFG.llm_retry_max_delay * 1000);
+      await new Promise((r) => setTimeout(r, wait * 1000));
     }
   }
 }

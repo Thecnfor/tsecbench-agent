@@ -1,7 +1,7 @@
 # Fork 多 Attempt + Planner 设计（tsec_agent）
 
-状态：**已实现**（2026-10-16，`AGENT_FORK` 默认 on；`AGENT_BRANCH_CONCURRENCY` 默认 2；`AGENT_PLANNER` 在 fork 开启时默认 on；
-183 个 vitest 全绿，
+状态：**已实现**（2026-10-16，`AGENT_FORK` 默认 on；`AGENT_BRANCH_CONCURRENCY` 默认 4；`AGENT_PLANNER` 在 fork 开启时默认 on；
+193 个 vitest 全绿，
 `pnpm check` 通过）。实现映射：§1→branch_tools.ts/agent.ts 工具分发、§2→agent.ts `branchCwd`
 +prompt.ts FORK_PROMPT_EXTRA、§3→branch.ts `prune`、§4→branch.ts `reserveFork` 护栏、
 §5→stall.ts + planner.ts + agent.ts `maybePlannerStall`、§6→records.ts `rebuildBranches`/corelog.ts。
@@ -36,7 +36,7 @@
 - **`fork(direction: str)`**：**任意活跃分支可调**（含分支再分叉；护栏见 §4，树的深度
   自然有界）。controller 复制**调用方当前尾部** messages 为新分支 + 追加方向指令
   （含命名空间/广播规则/fork 源）。护栏命中时**返回拒绝原因**（不静默）：
-  活跃 >`AGENT_MAX_BRANCHES`(3) / 总数 ≥`AGENT_FORK_MAX`(5) / 冷却
+  活跃 >`AGENT_MAX_BRANCHES`(5) / 总数 ≥`AGENT_FORK_MAX`(8) / 冷却
   <`AGENT_FORK_COOLDOWN_SEC`(180s)。新分支记录 `parent`（面板树视图/审计）；
   首请求排队（并发首发护栏）
 - **`log(note: str)`**：落 `log.jsonl` `{ts, branch, seq, note}`。planner与面板的
@@ -92,8 +92,8 @@
 
 | 护栏 | 默认 | 说明 |
 |---|---|---|
-| `AGENT_MAX_BRANCHES` | 3 | 活跃 Attempt 上限（含初始 Attempt 0） |
-| `AGENT_FORK_MAX` | 5 | 每题 fork 总数硬上限（含分支再分叉；树大小有界） |
+| `AGENT_MAX_BRANCHES` | 5 | 活跃 Attempt 上限（含初始 Attempt 0） |
+| `AGENT_FORK_MAX` | 8 | 每题 fork 总数硬上限（含分支再分叉；树大小有界） |
 | `AGENT_FORK_COOLDOWN_SEC` | 180 | fork 冷却（对所有分支生效） |
 | 预算共享 | 固定 | **fork 不增预算**：全分支共享段墙钟与轮数，分支越多每线越薄 |
 | `AGENT_BRANCH_PRUNE_SEC` | 1200 | Attempt 黑板/flag 双停滞 → 回收 + 摘要写黑板（**B 方案 2026-10-16**：曾为 600=与长题停滞阈值同值，剪枝先执行令planner窗口为0；1200 使 900s 触发后仍有 300s 救治窗） |
@@ -114,6 +114,9 @@
   - 额度用完仍卡 → `retire` 该 Attempt（含初始 Attempt 0；timer prune 仍以 0 为兜底锚点）；
   - 提醒有每 Attempt 上限 `AGENT_PLANNER_NUDGE_MAX`(2) + 冷却
     `AGENT_PLANNER_NUDGE_COOLDOWN_SEC`(400)；冷却中不重复提醒也不因此关闭。
+- **覆盖检查**：多 flag / 长题每轮检查 active Attempt 与 scope 数；不足目标（按 flag 数，
+  最多 3 条）时 planner 发 `coverage` 事件并 `remind`：按 fork 分类（时间/空间/假设/
+  探索/产出与权限）检查覆盖是否完全，有独立方向就补 fork；同样受提醒额度/冷却限制。
 - **时钟跨段持久**：flag/停滞时钟锚在题起点 + 黑板最后事件，solveTask 启动时恢复。
 - **不再有独立 observer LLM**：提醒文本由程序模板生成；planner 只做决策，
   不读全量对话、不改 messages、不做跨题建议。
@@ -221,10 +224,12 @@ planner未触发 = 停滞阈值 600s 而 run 494s 即停，三信号均未成立
 
 ## 13. 并发 Attempt turn
 
-- `AGENT_BRANCH_CONCURRENCY`（默认 2，最大 4）控制同时 inflight 的 Attempt turn 数；
+- `AGENT_BRANCH_CONCURRENCY`（默认 4，最大 4）控制同时 inflight 的 Attempt turn 数；
   1 = 旧单飞轮转，>1 = 真正并发 LLM/tool turn。
 - scheduler 用 `pickExcept(inflight)` 选 runnable Attempt，`Promise.race` 收割完成的 turn；
   `pruneStalled`/`planner 卡塞` 跳过 inflight，避免把正在跑的分支回收。
+- 并发 fill 的同优先级 Attempt 按 `rr` 轮转（不是 id 顺序）：高 id 新 fork 不会被低 id
+  永久饿死；`ranked` 与 `noteScheduled` 共用轮转游标。
 - 每个 turn 在独立 `AsyncLocalStorage` 分支上下文里执行（shell job 归属不串味）。
 - **并发注入邮箱**：branch 正忙于 LLM/tool 时，广播/结果卡/重建任务先入 `inbox`，
   下一轮开始再并入 messages；conv 注入也排队到本回合 tool 结果落盘后写，
@@ -242,3 +247,19 @@ planner未触发 = 停滞阈值 600s 而 run 494s 即停，三信号均未成立
   重启后可直接查看“树 + 知识 + 待恢复”，面板/审计也可读。
 - `log.jsonl` 仍是原始事实流；`planner.json` 是 planner 的结构化视图，
   二者不互相替代。
+
+## 15. 上下文压缩（按 Attempt / 共享 fork 前缀）
+
+- **触发**：每个 Attempt 独立看 `usage.prompt_tokens`，达到 `AGENT_COMPACT_TOKENS`
+  （默认 400k）时在下一次 turn 开头压缩；找到 flag（多 flag 未全齐）仍可回合末强制压缩。
+  压缩是元调用，不占 turn；失败退避 3 轮。
+- **范围**：候选边界 = 各 Attempt 的 `checkpointMessages` 长度（fork 断点）+ 当前完整上下文。
+  按**共享该前缀的存活 Attempt 数**优先，同覆盖取更长前缀；没有可共享前缀时退化为整段压缩。
+- **只改触发 Attempt**：替换其共享前缀为交接文档，保留 fork 后的 tail；其他 Attempt
+  不立即替换，等各自到阈值时复用同前缀的摘要（同一 solveTask 内 `sharedCompacts`；
+  续跑按同样逻辑重算）。
+- **持久化**：conv 写 `context_compact` 锚，随后把保留 tail 重放为 `compact_tail` 记录；
+  重建时锚之后只保留这些 tail。分支含压缩锚时重建 = system/任务卡头 + 摘要 + tail，
+  不再拼接完整父前缀，避免与摘要重复。
+- **黑板**：压缩文档同步写 `【压缩交接】` 卡；事件 `context_compacted` 记录
+  `prefix_len` / `coverage` / `reused` / before-after 字符数。

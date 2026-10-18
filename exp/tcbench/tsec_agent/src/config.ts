@@ -154,13 +154,15 @@ export interface Config {
   platform_capacity: number;
   pause_max: number;
   giveup_max: number;
+  /** 无其他题等待槽位时允许的连续 giveup 次数；0=不限（最后几题不主动放弃）。 */
+  no_waiter_giveup_max: number;
   max_failures: number;
   tasks: string;
   deadline_sec: number;
   request_timeout: number;
   api_max_retries: number;
   llm_retry_mode: string;
-  llm_retry_max_delay: number;
+  llm_retry_interval_sec: number;
   shell_default_wait_ms: number;
   shell_max_output: number;
   shell_hard_sec: number;
@@ -218,20 +220,21 @@ export const CFG: Config = {
   summary_timeout_sec: num("AGENT_SUMMARY_TIMEOUT_SEC", "300"),
   flag_verify_delay_sec: num("AGENT_FLAG_VERIFY_DELAY_SEC", "5"),
   flag_verify_timeout_sec: num("AGENT_FLAG_VERIFY_TIMEOUT_SEC", "20"),
-  compact_tokens: num("AGENT_COMPACT_TOKENS", "500000"), // 500k tok 才兜底压缩（主触发器=找到 flag）
+  compact_tokens: num("AGENT_COMPACT_TOKENS", "400000"), // per-Attempt 400k tok 触发；找到 flag 仍可强制压缩
   resume_aging_sec: num("AGENT_RESUME_AGING_SEC", "600"),
   platform_capacity: num("AGENT_PLATFORM_CAPACITY", "3"),
   pause_max: num("AGENT_PAUSE_MAX", "0"), // 每题最多暂停续跑次数，0=不限
-  giveup_max: num("AGENT_GIVEUP_MAX", "3"), // 连续"未通关就收尾"上限，0=不限
+  giveup_max: num("AGENT_GIVEUP_MAX", "3"), // 有题等槽时连续"未通关就收尾"上限，0=不限
+  no_waiter_giveup_max: num("AGENT_NO_WAITER_GIVEUP_MAX", "0"), // 无题等槽时 Giveup 上限；0=不限
   max_failures: num("AGENT_MAX_FAILURES", "2"), // 真失败放弃上限（≥1，0 按 1）
   // 只解部分题目（测试用）：逗号/空白分隔，支持 * ? 通配；空=全部。
   tasks: env("AGENT_TASKS", ""),
   deadline_sec: num("AGENT_DEADLINE_SEC", "0"),
-  request_timeout: num("AGENT_REQUEST_TIMEOUT", "300"),
+  request_timeout: num("AGENT_REQUEST_TIMEOUT", "90"), // 单次 LLM 请求超时；网络挂起时尽快进入固定轮询
   api_max_retries: num("AGENT_API_RETRIES", "5"),
-  // LLM 重试模式：forever=网络类错误无限退避重试直到任务时限；finite=按次数后放弃。
+  // LLM 重试模式：forever=网络类错误固定间隔重试直到任务时限；finite=按次数后放弃。
   llm_retry_mode: env("AGENT_LLM_RETRY_MODE", "forever").toLowerCase(),
-  llm_retry_max_delay: num("AGENT_LLM_RETRY_MAX_DELAY", "60"),
+  llm_retry_interval_sec: Math.max(1, num("AGENT_LLM_RETRY_INTERVAL_SEC", "2")),
 
   // shell 工具
   shell_default_wait_ms: num("AGENT_SHELL_WAIT_MS", "1500"),
@@ -257,9 +260,9 @@ export const CFG: Config = {
   // Planner 是统筹者（不是 Attempt）：fork 开启时默认启用；heuristic 先行，之后可换 LLM。
   planner_enabled: ["1", "on", "true"].includes(env("AGENT_PLANNER", "1").toLowerCase()),
   // 同时推进的 Attempt turn 数（1=旧单飞；>1 才有真正并发 LLM/turn）
-  branch_concurrency: Math.max(1, Math.min(4, num("AGENT_BRANCH_CONCURRENCY", "2"))),
-  max_branches: num("AGENT_MAX_BRANCHES", "3"), // 存活 Attempt 上限（含初始 Attempt 0）
-  fork_max: num("AGENT_FORK_MAX", "5"), // 每题 fork/spawn 总数硬上限
+  branch_concurrency: Math.max(1, Math.min(4, num("AGENT_BRANCH_CONCURRENCY", "4"))),
+  max_branches: num("AGENT_MAX_BRANCHES", "5"), // 存活 Attempt 上限（含初始 Attempt 0）
+  fork_max: num("AGENT_FORK_MAX", "8"), // 每题 fork/spawn 总数硬上限
   fork_cooldown_sec: num("AGENT_FORK_COOLDOWN_SEC", "180"),
   // 1200（B 方案）：长题停滞 600s+二信号 900s 触发 planner 后仍留 300s 救治窗，
   // 救不活才剪——两阈值曾同为 600（剪枝先执行=planner 介入窗口为 0，靠巧合而非设计）
