@@ -11,27 +11,42 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { type BranchCfg, type BranchLite, BranchManager, type BranchState } from "./branch.js";
+import { collectNewArtifacts, looksLikeFileCommand, looksLikeSharedWrite } from "./artifacts.js";
+import {
+  type BranchCfg,
+  type BranchLite,
+  BranchManager,
+  type BranchState,
+  type ScopeStatus,
+} from "./branch.js";
 import {
   afterForkMaterialized,
   BRANCH_TOOL_NAMES,
-  BROADCAST_TOOL_SCHEMA,
   CORE_LOG_TOOL_SCHEMA,
   dispatchBranchTool,
   FORK_TOOL_SCHEMA,
   type PendingFork,
+  REPORT_TOOL_SCHEMA,
+  STATE_CHANGE_TOOL_SCHEMA,
 } from "./branch_tools.js";
-import {
-  BYSTANDER_SYSTEM,
-  buildBystanderInput,
-  bystanderMessage,
-  bystanderShouldFire,
-  evaluateStall,
-  isOverreachingAdvice,
-  recentDigest,
-} from "./bystander.js";
 import { CFG, env, resolveAsync } from "./config.js";
-import { extractFlagIndex, FlagLedger, readCorelog } from "./corelog.js";
+import {
+  extractFlagIndex,
+  FlagLedger,
+  type MutationRecord,
+  pendingMutations,
+  readCorelog,
+} from "./corelog.js";
+import {
+  heuristicPlan,
+  type LogEvent,
+  type PlannerAction,
+  type PlannerEvent,
+  type ReportEvent,
+  type StallEvent,
+  selectRecoveryOwner,
+} from "./planner.js";
+import { type PlannerSnapshot, writePlannerState } from "./planner_state.js";
 import {
   CLOSING_SUMMARY_PROMPT,
   COMPACT_NOTE,
@@ -40,11 +55,14 @@ import {
   fill,
   formatTaskCard,
   GIVEUP_NOTE,
+  RECOVERY_ASSIGNMENT,
+  RECOVERY_NOTICE,
   RESUME_NOTE,
   systemPromptWithExtras,
 } from "./prompt.js";
-import { getTaskCwd, setTaskCwd } from "./shell.js";
+import { getTaskCwd, runWithTaskBranch, ShellManager, setTaskCwd, setTaskShell } from "./shell.js";
 import { dispatchShell, parseToolArguments, SHELL_TOOL_SCHEMA } from "./shell_tool.js";
+import { evaluateStall, recentDigest, shouldIntervene } from "./stall.js";
 import {
   FLAG_SUMMARY_HINT_SINGLE,
   integrateSubmit,
@@ -451,7 +469,7 @@ export interface SolveResult {
   flagsComplete: boolean; // submit 响应/账本已确认全部 flag（平台 is_completed 仍需延迟复核）
 }
 
-/** fork/旁观者配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
+/** fork/planner 配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
 function branchCfgFromConfig(): BranchCfg {
   return {
     enabled: CFG.fork_enabled,
@@ -459,9 +477,8 @@ function branchCfgFromConfig(): BranchCfg {
     maxForks: CFG.fork_max,
     forkCooldownSec: CFG.fork_cooldown_sec,
     pruneSec: CFG.branch_prune_sec,
-    broadcastMax: CFG.broadcast_max,
-    bystanderMax: CFG.bystander_max,
-    bystanderCooldownSec: CFG.bystander_cooldown_sec,
+    plannerNudgeMax: CFG.planner_nudge_max,
+    plannerNudgeCooldownSec: CFG.planner_nudge_cooldown_sec,
   };
 }
 
@@ -478,8 +495,8 @@ function branchCfgFromConfig(): BranchCfg {
  * 对话全量、忠实落盘（conversation.jsonl，带 branch 字段）。
  *
  * fork 多分支（AGENT_FORK=1，默认关）：单飞轮转交错推进（a1 b1 a2 b2，缓存零代价
- * 已实测）；护栏与调度见 branch.ts；旁观者（AGENT_BYSTANDER=1）见 bystander.ts。
- * 分支/旁观者开关关闭时行为与旧单分支版逐语义一致。
+ * 已实测）；护栏与调度见 branch.ts；卡塞由程序检测后交给 planner（src/planner.ts）。
+ * 分支/planner 开关关闭时行为与旧单分支版逐语义一致。
  */
 export async function solveTask(
   client: LlmClient,
@@ -492,17 +509,17 @@ export async function solveTask(
     startTurn?: number;
     completionCheck?: () => boolean;
     branches?: BranchLite[]; // 续段恢复的分支状态
-    taskClass?: "long" | "short"; // 旁观者停滞阈值分档
+    taskClass?: "long" | "short"; // 卡塞阈值分档
     flagTotal?: number; // flag 索引账本总数
     taskStartTs?: number; // 题起始 epoch（跨段持久的时钟锚）
   } = {},
 ): Promise<SolveResult> {
   const forkOn = CFG.fork_enabled;
-  const multiOn = forkOn || CFG.bystander_enabled;
+  const multiOn = forkOn;
   let messages: ChatMessage[];
   if (!opts.messages) {
     messages = [
-      { role: "system", content: systemPromptWithExtras(forkOn, CFG.bystander_enabled) },
+      { role: "system", content: systemPromptWithExtras(forkOn) },
       { role: "user", content: taskCard },
     ];
     // 忠实记录本题输入（system + 任务卡）
@@ -521,8 +538,9 @@ export async function solveTask(
   let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
   const nowSec = () => Date.now() / 1000;
 
-  // --- fork/旁观者基础设施（默认关：单 trunk、无额外工具、无额外调用） ---
+  // --- fork/planner 基础设施（默认关：单初始 Attempt、无额外工具、无额外调用） ---
   const workdir = getTaskCwd() || "";
+  const plannerFile = path.join(workdir || taskWorkdir(code), "planner.json");
   const branchCwd = (id: number): string => {
     const d = `${workdir}/branches/${id}`;
     try {
@@ -532,7 +550,7 @@ export async function solveTask(
     }
     return d;
   };
-  const bm = new BranchManager(branchCfgFromConfig(), messages, nowSec(), workdir);
+  const bm = new BranchManager(branchCfgFromConfig(), messages, nowSec(), workdir, 2);
   if (opts.branches?.length) bm.restore(opts.branches, nowSec());
   // 跨段时钟恢复（关键修复）：flag/停滞时钟锚在「题起点+corelog 最后事件」，不随段重建归零——
   // arena 实测段被 rem/6 压到 192s 时，段级时钟使 900s flag 主时钟/600s 停滞永不可达。
@@ -555,6 +573,17 @@ export async function solveTask(
     }
   }
   const corelog = multiOn ? rec().corelog(code) : null;
+  if (corelog && forkOn) {
+    // 续段恢复产物索引：跨段也能提示“这个文件别的 Attempt 已经处理过”。
+    const oldArtifacts = readCorelog(corelog.path)
+      .filter((e) => e.kind === "artifact" && e.artifact_hash && e.artifact_path)
+      .map((e) => ({
+        branch: Number(e.branch ?? 0),
+        hash: String(e.artifact_hash),
+        path: String(e.artifact_path),
+      }));
+    bm.restoreArtifacts(oldArtifacts);
+  }
   const ledger = new FlagLedger();
   const flagTotal = opts.flagTotal ?? 0;
   if (flagTotal) ledger.setTotal(flagTotal);
@@ -573,25 +602,83 @@ export async function solveTask(
     taskClass === "long" ? CFG.reasoning_effort_long : CFG.reasoning_effort_short
   ).trim();
 
-  // 工具集：shell 恒在；fork/broadcast 仅 fork 开；log 两者任一开
+  // 工具集：shell 恒在；fork/report/state_change 仅 fork 开；log 随 workflow 开（无 broadcast 工具）
   const tools: unknown[] = [SHELL_TOOL_SCHEMA, SUBMIT_FLAG_TOOL_SCHEMA]; // submit 常驻（唯一提交通道）
-  if (forkOn) tools.push(FORK_TOOL_SCHEMA, BROADCAST_TOOL_SCHEMA);
+  if (forkOn) tools.push(FORK_TOOL_SCHEMA, REPORT_TOOL_SCHEMA, STATE_CHANGE_TOOL_SCHEMA);
   if (multiOn) tools.push(CORE_LOG_TOOL_SCHEMA);
+  const plannerOn = CFG.planner_enabled && forkOn;
+  const plannerEvents: PlannerEvent[] = [];
+  const recoveryNotices: Array<{ scopeId: number; content: string }> = [];
+  // busy branch 的注入消息要等本回合 tool 结果落盘后再写 conv，保证重建配对顺序。
+  const convQueue = new Map<number, Array<Record<string, unknown>>>();
+  const writeBranchUser = (branch: number, fields: Record<string, unknown>): void => {
+    if (bm.get(branch)?.busy) {
+      const list = convQueue.get(branch) ?? [];
+      list.push(fields);
+      convQueue.set(branch, list);
+    } else {
+      conv.write("user", { branch, ...fields });
+    }
+  };
+  const flushBranchConv = (branch: number): void => {
+    const list = convQueue.get(branch);
+    if (!list?.length) return;
+    for (const fields of list) conv.write("user", { branch, ...fields });
+    convQueue.delete(branch);
+  };
   const toolDeps = {
     bm,
     corelog,
     ledger,
     now: nowSec,
     log,
-    // broadcast 送达 → 目标分支的注入消息忠实落盘（对话忠实不变量）
-    onBroadcast: (fromId: number, toIds: number[], note: string) => {
+    // report 结果卡已由 bm 追加到目标 messages；这里只负责落 conv + 事件。
+    onReport: (
+      fromId: number,
+      toIds: number[],
+      card: string,
+      status: "done" | "deadend" | "blocked",
+      scopeStatus: ScopeStatus,
+    ) => {
       for (const tid of toIds) {
-        conv.write("user", {
-          branch: tid,
-          kind_note: "broadcast",
-          content: `[分支 ${fromId} 广播] ${note}`,
+        writeBranchUser(tid, {
+          kind_note: "attempt_result",
+          from_branch: fromId,
+          report_status: status,
+          scope_status: scopeStatus,
+          content: card,
         });
       }
+      rec().event("attempt_reported", {
+        code,
+        branch: fromId,
+        status,
+        scope_status: scopeStatus,
+        delivered: toIds,
+      });
+      const b = bm.get(fromId);
+      if (plannerOn && b?.result) {
+        plannerEvents.push({
+          type: "report",
+          attempt: fromId,
+          status: b.result.status,
+          summary: b.result.summary,
+          next: b.result.next,
+          scopeId: b.scopeId,
+          scopeStatus,
+        });
+      }
+    },
+    // 重建完成：只广播给相关 scope（含后代）的 Attempt。
+    onMutationRecovered: (id: string, scopeId: number, action: string) => {
+      // 不能在这里直接 push：当前 tool 结果还没回填，会破坏 tool_call/result 配对。
+      // 先排队，回合末 flushRecovery 再尾部追加。
+      recoveryNotices.push({
+        scopeId,
+        content: `[重建完成] mutation ${id}: ${action}（recovery owner 已恢复）`,
+      });
+      rec().event("mutation_recovered", { code, mutation_id: id, scope_id: scopeId });
+      log(`[${code}] mutation recovered: ${id} scope=${scopeId}: ${action.slice(0, 80)}`);
     },
   };
 
@@ -602,27 +689,208 @@ export async function solveTask(
       .map((b) => ({
         id: b.id,
         parent: b.parent,
+        scopeId: b.scopeId,
         label: b.label,
         cwd: b.cwd,
         forkSeq: b.forkSeq,
         messages: b.messages,
+        inbox: b.inbox,
+        checkpointMessages: b.checkpointMessages,
+        status: b.status,
+        active: b.active,
+        result: b.result,
       }));
-  const finish = (status: SolveStatus): SolveResult => ({
-    status,
-    lastContent,
-    turnsUsed,
-    // 取 trunk 当前引用：压缩重写会把 br.messages 换成新数组，旧引用会丢压缩态
-    messages: bm.get(0)?.messages ?? messages,
-    branches: branchLite(),
-    flagSummaryDone,
-    flagsComplete,
-  });
+  /** 结构化持久化 planner 树/知识/恢复队列；log.jsonl 仍保留原始事件流。 */
+  const savePlanner = (): void => {
+    try {
+      const entries = corelog ? readCorelog(corelog.path) : [];
+      const pending = pendingMutations(entries);
+      const owner =
+        pending.length > 0
+          ? selectRecoveryOwner(
+              pending,
+              bm.all().map((b) => ({
+                id: b.id,
+                scopeId: b.scopeId,
+                status: b.pruned ? "deadend" : b.status,
+              })),
+              0,
+            )
+          : null;
+      const snapshot: PlannerSnapshot = {
+        version: 1,
+        updated_at: new Date().toISOString(),
+        task: code,
+        scopes: [...bm.scopes.values()],
+        attempts: bm.all().map((b) => ({
+          id: b.id,
+          parent: b.parent,
+          scopeId: b.scopeId,
+          label: b.label,
+          status: b.status,
+          active: b.active,
+          pruned: b.pruned,
+          lastCoreTs: b.lastCoreTs,
+          result: b.result,
+        })),
+        findings: entries.slice(-200),
+        mutations: pending,
+        recovery: {
+          owner,
+          pending: pending.map((m) => m.id),
+          updated_at: new Date().toISOString(),
+        },
+      };
+      writePlannerState(plannerFile, snapshot);
+    } catch (e) {
+      log(`[${code}] planner state save failed: ${e instanceof Error ? e.message : e}`);
+    }
+  };
 
-  // 剪枝：corelog/flag 双停滞 → 回收分支 + 摘要注入 trunk（尾部追加保缓存）
-  const pruneStalled = (): void => {
+  const finish = (status: SolveStatus): SolveResult => {
+    // 收段前把尚未消费的注入邮箱并入 messages，避免暂停后丢通知。
+    for (const b of bm.all()) {
+      if (b.inbox.length) {
+        b.messages.push(...b.inbox);
+        b.inbox.length = 0;
+      }
+    }
+    for (const id of convQueue.keys()) flushBranchConv(id);
+    savePlanner();
+    return {
+      status,
+      lastContent,
+      turnsUsed,
+      // 取初始 Attempt 当前引用：压缩重写会把 br.messages 换成新数组，旧引用会丢压缩态
+      messages: bm.get(0)?.messages ?? messages,
+      branches: branchLite(),
+      flagSummaryDone,
+      flagsComplete,
+    };
+  };
+
+  /** Planner 是唯一统筹者：消费 report/stall 事件，执行提醒/retire/spawn 等结构化动作。
+   *  P1 用启发式；LLM planner 只需替换 heuristicPlan，动作校验/落盘保持一致。 */
+  const applyPlanner = (): void => {
+    if (!plannerOn) return;
+    while (plannerEvents.length) {
+      const ev = plannerEvents.shift()!;
+      const actions: PlannerAction[] = heuristicPlan(ev, {
+        enabled: true,
+        canSpawn: (source) => bm.canSpawnFrom(source),
+        nudgeAvailable: (attempt) => bm.plannerNudgeAvailable(attempt, nowSec()),
+        nudgeExhausted: (attempt) => bm.plannerNudgeExhausted(attempt),
+      });
+      for (const action of actions) {
+        if (action.type === "retire") {
+          const retired = bm.retire(action.attempt);
+          if (retired) {
+            log(`[${code}] planner retire attempt ${action.attempt}: ${action.reason}`);
+          }
+        } else if (action.type === "spawn") {
+          const made = bm.spawnFromCheckpoint(
+            action.source,
+            action.direction,
+            nowSec(),
+            branchCwd,
+            action.scopeId,
+          );
+          if (!made) {
+            log(`[${code}] planner spawn refused (source ${action.source})`);
+            continue;
+          }
+          conv.write("user", {
+            branch: made.branch.id,
+            kind_note: "fork_directive",
+            parent_branch: made.branch.parent ?? 0,
+            fork_seq: made.branch.forkSeq,
+            scope_id: made.branch.scopeId,
+            fork_label: action.direction.slice(0, 200),
+            spawned_by: "planner",
+            source_branch: action.source,
+            content: made.directive,
+            turn: `${code}:${turn}`,
+          });
+          afterForkMaterialized(corelog, action.source, made.branch.id, action.direction);
+          log(
+            `[${code}] planner spawn attempt ${made.branch.id} from checkpoint of ` +
+              `${action.source}: ${action.direction.slice(0, 80)}`,
+          );
+        } else if (action.type === "remind") {
+          const target = bm.get(action.attempt);
+          if (!target || target.status !== "active") continue;
+          bm.enqueueMessage(action.attempt, action.text);
+          target.active = true;
+          bm.notePlannerNudge(action.attempt, nowSec());
+          writeBranchUser(action.attempt, {
+            kind_note: "planner_nudge",
+            content: action.text,
+            turn: `${code}:${turn}`,
+          });
+          corelog?.write({
+            branch: action.attempt,
+            kind: "planner",
+            note: action.text.slice(0, 800),
+          });
+          log(
+            `[${code}] planner nudge attempt ${action.attempt}: ${action.reason} ` +
+              `(${action.text.slice(0, 80)})`,
+          );
+        } else if (action.type === "close_scope") {
+          log(`[${code}] planner close scope ${action.scopeId}: ${action.reason}`);
+        }
+      }
+    }
+  };
+
+  /** 回合末统一追加重建消息：先广播完成结果，再给 planner 选出的 owner 下发下一项。
+   *  必须在 tool 结果回填之后调用，避免 user 消息插进 tool_call/result 配对中间。 */
+  const flushRecovery = (): void => {
+    if (!recoveryNotices.length) return;
+    for (const notice of recoveryNotices) {
+      for (const t of bm.attemptsInScope(notice.scopeId)) {
+        bm.enqueueMessage(t.id, notice.content);
+        if (t.status === "active") t.active = true;
+        writeBranchUser(t.id, {
+          kind_note: "mutation_recovered",
+          content: notice.content,
+        });
+      }
+    }
+    recoveryNotices.length = 0;
+    if (!corelog) return;
+    const remaining = pendingMutations(readCorelog(corelog.path));
+    if (!remaining.length) return;
+    const owner = selectRecoveryOwner(
+      remaining,
+      bm.all().map((b) => ({
+        id: b.id,
+        scopeId: b.scopeId,
+        status: b.pruned ? "deadend" : b.status,
+      })),
+      0,
+    );
+    const assignment = recoveryAssignment(remaining);
+    const target = bm.get(owner);
+    if (!target) return;
+    bm.enqueueMessage(owner, assignment);
+    target.active = true;
+    writeBranchUser(owner, {
+      kind_note: "recovery_assignment",
+      content: assignment,
+    });
+    log(
+      `[${code}] recovery next: mutation ${remaining[0].id} assigned to attempt ${owner} ` +
+        `(${remaining.length} remaining)`,
+    );
+  };
+
+  // 剪枝：corelog/flag 双停滞 → 回收 Attempt + 摘要写黑板（增量按 scope 拉取）
+  const pruneStalled = (skip: Set<number> = new Set()): void => {
     if (!forkOn) return;
     const t = nowSec();
     for (const b of bm.alive()) {
+      if (skip.has(b.id)) continue;
       if (b.id === 0) continue;
       if (t - b.lastCoreTs < CFG.branch_prune_sec) continue;
       const pruned = bm.prune(b.id);
@@ -636,147 +904,62 @@ export async function solveTask(
       const summary =
         `[分支 ${b.id} 已回收] 方向：${b.label}；停滞 ${Math.round(t - b.lastCoreTs)}s 无核心事件。\n` +
         `核心日志摘要：\n${tail.map((s) => `- ${s}`).join("\n") || "-（无）"}\n` +
-        `（该分支的工作目录 ${b.cwd} 与产物仍在，可读取）`;
-      bm.get(0)?.messages.push({ role: "user", content: summary });
-      conv.write("user", { branch: 0, kind_note: "branch_pruned", content: summary });
+        `（该 Attempt 的工作目录 ${b.cwd} 与产物仍在，可读取）`;
+      // 不向“父 Attempt”投递：剪枝摘要写黑板，由同 scope/后代的 [黑板增量] 拉取。
       corelog?.write({
         branch: b.id,
         kind: "prune",
         note: `stalled ${Math.round(t - b.lastCoreTs)}s`,
       });
-      log(`[${code}] branch ${b.id} pruned (stalled); summary injected into trunk`);
+      log(`[${code}] attempt ${b.id} pruned (stalled); summary posted to blackboard`);
     }
   };
 
-  // 旁观者：组合信号任二成立 → 独立短上下文调用 → 尾部插嘴（限频在 bm）
-  let flagStallArmedLogged = false;
-  let bystanderSkipLogged = false;
-  const maybeBystander = async (): Promise<void> => {
-    if (!CFG.bystander_enabled) return;
+  // 卡塞检测：程序算信号，planner 决定提醒/回收；不再有独立 observer LLM。
+  let flagStallLogged = false;
+  const maybePlannerStall = (skip: Set<number> = new Set()): void => {
+    if (!plannerOn) return;
     const t = nowSec();
-    const active = bm.active();
+    const active = bm.active().filter((b) => !skip.has(b.id));
     if (!active.length) return;
     const flagStallSec = taskClass === "long" ? CFG.flag_stall_long_sec : CFG.flag_stall_short_sec;
-    const flagSince = t - bm.lastFlagTs; // 题级 flag 主时钟（以 flag 为核心的介入锚）
-    // 每个活跃分支算一次信号；flag 主时钟一票或分支级任二 → 需介入
-    const sigs = active.map((b) => {
-      const sig = evaluateStall({
-        sinceCoreSec: t - b.lastCoreTs,
-        stallSec,
-        flagSinceSec: flagSince,
-        flagStallSec,
-        recentCmds: b.recentCmds,
-        recentHardFails: b.recentHardFails,
-        wrongSubmits: b.wrongSubmits,
-      });
-      return { b, sig };
-    });
-    if (!flagStallArmedLogged && sigs.some((x) => x.sig.flagStall)) {
-      flagStallArmedLogged = true;
+    const flagSince = t - bm.lastFlagTs;
+    const candidates = active
+      .map((b) => ({
+        b,
+        sig: evaluateStall({
+          sinceCoreSec: t - b.lastCoreTs,
+          stallSec,
+          flagSinceSec: flagSince,
+          flagStallSec,
+          recentCmds: b.recentCmds,
+          recentHardFails: b.recentHardFails,
+          wrongSubmits: b.wrongSubmits,
+        }),
+      }))
+      .filter((x) => shouldIntervene(x.sig));
+    if (!candidates.length) return;
+    if (!flagStallLogged && candidates.some((x) => x.sig.flagStall)) {
+      flagStallLogged = true;
       log(
-        `[${code}] flag-stall ARMED (since ${Math.round(flagSince)}s >= ${flagStallSec}s, taskClass=${taskClass})`,
+        `[${code}] flag-stall ARMED (since ${Math.round(flagSince)}s >= ${flagStallSec}s, ` +
+          `taskClass=${taskClass})`,
       );
     }
-    const need = sigs.filter((x) => bystanderShouldFire(x.sig));
-    if (!need.length) return;
-    // 目标选择（可介入任何分支）：有停滞分支 → 救卡最死的（lastCoreTs 最老）；
-    // 否则（flag 停滞但各分支在干活，如记卡型空转）→ 盯最新鲜推进线（lastCoreTs 最新）。
-    const stalledNow = need.filter((x) => t - x.b.lastCoreTs >= stallSec);
-    const pickFrom =
-      stalledNow.length > 0
-        ? stalledNow
-        : need.map((x) => ({
-            b: active.reduce((a, c) => (a.lastCoreTs >= c.lastCoreTs ? a : c)),
-            sig: x.sig,
-          }));
-    const chosen = pickFrom.reduce((a, c) =>
-      stalledNow.length > 0
-        ? a.b.lastCoreTs <= c.b.lastCoreTs
-          ? a
-          : c
-        : a.b.lastCoreTs >= c.b.lastCoreTs
-          ? a
-          : c,
-    );
-    const target = chosen.b;
-    const sig = chosen.sig;
-    if (!target) return;
-    if (!bm.bystanderAvailable(target.id, t)) {
-      if (!bystanderSkipLogged) {
-        bystanderSkipLogged = true;
-        log(`[${code}] bystander SKIPPED (branch ${target.id}: quota/cooldown)`);
-      }
-      return;
-    }
-    const entries = corelog ? readCorelog(corelog.path) : [];
-    const input = buildBystanderInput({
-      taskCard,
-      entries,
-      branchId: target.id,
-      branchLabel: target.label,
-      branchNames: bm.names(),
-      ledger: multiOn ? ledger : null,
-      recentDigest: recentDigest(target.messages),
-      recentCmds: target.recentCmds,
-      segElapsedSec: t - segStartTs,
-      signals: sig,
-    });
-    // 单次调用（越权重写复用同入口）
-    const ask = async (extraRule: string): Promise<string> => {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), 60_000);
-      try {
-        const resp = await callLlm(
-          client,
-          [
-            { role: "system", content: BYSTANDER_SYSTEM },
-            { role: "user", content: input + extraRule },
-          ],
-          false,
-          // 只要 ≤120 字建议：关思考省 completion（thinking 占成本大头，实测 37-69%）
-          { signal: ac.signal, thinking: { type: "disabled" } },
-        );
-        return (resp.choices[0].message.content ?? "").trim();
-      } catch (e) {
-        log(
-          `[${code}] bystander call failed: ${e instanceof Error ? `${e.name}: ${e.message}` : e}`,
-        );
-        return "";
-      } finally {
-        clearTimeout(timer);
-      }
+    // 先救最久无核心事件的 Attempt；planner 可提醒或回收。
+    const chosen = candidates.reduce((a, c) => (a.b.lastCoreTs <= c.b.lastCoreTs ? a : c));
+    const ev: StallEvent = {
+      type: "stall",
+      attempt: chosen.b.id,
+      signals: chosen.sig,
+      sinceCoreSec: t - chosen.b.lastCoreTs,
+      recentCmds: chosen.b.recentCmds,
+      digest: recentDigest(chosen.b.messages),
+      scopeId: chosen.b.scopeId,
+      scopeStatus: bm.scopeStatus(chosen.b.scopeId),
     };
-    let advice = await ask("");
-    if (!advice) return; // 失败不消耗限频额度
-    // 越权过滤（run5 实测 8/12 注入陷"转攻别的题"循环——执行者无换题能力）：
-    // 首稿越权 → 带硬约束重写一次；仍越权 → 丢弃（不注入不耗额度）
-    if (isOverreachingAdvice(advice)) {
-      log(`[${code}] bystander advice overreaching (换题类)，rewriting once`);
-      const retry = await ask(
-        "\n\n【重写约束】上一稿越权：只准给当前题目内的下一步（换方法/换层面/换子目标）；" +
-          "删除一切换题、做其他题、动平台接口的表述，否则整稿作废。",
-      );
-      if (!retry || isOverreachingAdvice(retry)) {
-        log(`[${code}] bystander advice still overreaching; DROPPED`);
-        rec().event("bystander_advice_rejected", { branch: target.id });
-        return;
-      }
-      advice = retry;
-    }
-    const content = bystanderMessage(advice);
-    target.messages.push({ role: "user", content });
-    target.active = true; // 插嘴 = 新方向，激活 parked 分支
-    bm.noteBystander(target.id, t);
-    conv.write("user", {
-      branch: target.id,
-      kind_note: "bystander",
-      content,
-    });
-    corelog?.write({ branch: target.id, kind: "bystander", note: advice.slice(0, 400) });
-    log(
-      `[${code}] bystander injected into ${target.id === 0 ? "trunk" : `branch ${target.id}`}: ` +
-        `${advice.slice(0, 100)}`,
-    );
+    plannerEvents.push(ev);
+    applyPlanner();
   };
 
   /** 通用上下文压缩（与 flag 无关，单/多 flag 同机制）：超 AGENT_COMPACT_CHARS 阈值时
@@ -841,27 +1024,511 @@ export async function solveTask(
     }
   };
 
+  type TurnOutcome =
+    | { kind: "ok" }
+    | { kind: "parked" }
+    | { kind: "done" }
+    | { kind: "flags_done" }
+    | { kind: "fatal"; status: SolveStatus };
+
+  /** 单 Attempt 的一轮：LLM → tool calls → 结果回填。共享副作用（planner/recovery）由 scheduler 串行收口。 */
+  const runTurn = async (br: BranchState): Promise<TurnOutcome> => {
+    br.busy = true;
+    try {
+      bm.drainInbox(br.id);
+      return await runWithTaskBranch(br.id, async () => {
+        await maybeCompact(br); // 超阈值先压缩交接再发本轮请求（失败退避不阻塞）
+
+        turn++;
+        const roundsAtTurnStart = br.roundsSinceCore; // log 轮计数基准（轮末比较用）
+        const tLlmStart = nowSec();
+        let resp: ChatResponse | null = null;
+        let err: unknown = null;
+        try {
+          resp = await callLlm(client, br.messages, true, { tools, effort: effort || undefined });
+        } catch (e) {
+          err = e;
+          // 多模态降级：网关拒收图片 → 剥掉 image part 改发纯文本，本会话后续不再附图
+          const dropped = CFG.vision_ok !== false ? stripImages(br.messages) : 0;
+          if (dropped) {
+            CFG.vision_ok = false;
+            log(
+              `[${code}] gateway rejected image input (${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}); ` +
+                `dropped ${dropped} image(s), retrying text-only`,
+            );
+            conv.write("note", {
+              branch: br.id,
+              turn: `${code}:${turn}`,
+              content: `网关拒图，降级为文本模式：${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`,
+            });
+            rec().event("vision_degraded", {
+              code,
+              dropped,
+              error: `${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`.slice(
+                0,
+                400,
+              ),
+            });
+            try {
+              resp = await callLlm(client, br.messages, true, {
+                tools,
+                effort: effort || undefined,
+              });
+            } catch (e2) {
+              err = e2;
+            }
+          }
+          if (!resp) {
+            const emsg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+            log(`[${code}] fatal LLM error: ${emsg}`);
+            conv.write("error", {
+              branch: br.id,
+              turn: `${code}:${turn}`,
+              error: emsg,
+              started_at: tLlmStart,
+            });
+            const status: SolveStatus = isContextOverflow(err) ? "context_overflow" : "llm_error";
+            return { kind: "fatal", status };
+          }
+        }
+        turnsUsed++;
+        const tLlmEnd = nowSec();
+
+        const msg = resp.choices[0].message;
+        const tlabel = `${code}:${startTurn + turn}`;
+        const toolCallsRaw = msg.tool_calls ?? [];
+        // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）。
+        // 多 flag 总结轮（submit 后要求的 flag 探索总结）→ kind_note 标记（rebuild 压缩锚之一）。
+        const isFlagSummaryTurn =
+          !toolCallsRaw.length && flagSummariesPending.has(br.id) && !!msg.content?.trim();
+        conv.write("assistant", {
+          branch: br.id,
+          turn: tlabel,
+          ...(isFlagSummaryTurn
+            ? { kind_note: "flag_summary", flag_index: flagSummariesPending.get(br.id)?.idx }
+            : {}),
+          thinking: msg.reasoning_content ?? null,
+          output: msg.content ?? null,
+          tool_calls: toolCallsRaw.map((tc) => ({
+            id: tc.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+          })),
+          usage: resp.usage ?? null,
+          started_at: tLlmStart,
+          ended_at: tLlmEnd,
+        });
+        if (msg.content) lastContent = msg.content;
+        {
+          const pt = Number(resp?.usage?.prompt_tokens ?? 0); // 实测输入 token（口径：上一次 LLM 调用）
+          if (pt > 0) lastPromptTokens.set(br.id, pt);
+        }
+        // 自动黑板：模型的进展叙述（content，不含 thinking/tool）直接落 corelog——
+        // 治"提示词暗示不可靠"（b-02 实测 123 次 shell 仅 1 张实质卡）；短应答(<8字)跳过防噪。
+        // 记卡即核心事件：停滞时钟随之刷新（黑板确实在长，不算隐形空转）
+        {
+          const narr = typeof msg.content === "string" ? msg.content.trim() : "";
+          if (narr.length >= 8) {
+            corelog?.write({ branch: br.id, kind: "core", note: narr.slice(0, 400) });
+            bm.recordCore(br.id, nowSec());
+          }
+        }
+
+        const clean: ChatMessage = { role: "assistant" as const };
+        if (msg.content) clean.content = msg.content;
+        if (toolCallsRaw.length) {
+          clean.tool_calls = toolCallsRaw.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.function.name, arguments: tc.function.arguments },
+          }));
+        }
+        br.messages.push(clean);
+
+        if (!toolCallsRaw.length) {
+          // 单 flag 收尾总结轮（submit 后系统要求的探索总结）：**不执行替换**（原文保留），
+          // 该总结即收尾 → flagSummaryDone，worker 跳过 closingSummary（精简版留作兜底）
+          const pendIdx = flagSummariesPending.get(br.id)?.idx;
+          if (pendIdx !== undefined && msg.content?.trim()) {
+            flagSummariesPending.delete(br.id);
+            flagSummaryDone = true;
+            log(`[${code}] single-flag closing summary recorded (context kept as-is)`);
+          } else {
+            flagSummariesPending.delete(br.id); // 未按指示输出总结 → 放弃（不纠缠）
+          }
+          if (!multiOn) return { kind: "done" }; // 单分支语义不变：无工具总结 = 本题上下文收束
+          // fork 模式：该分支 parked（无收尾权），其他分支继续；全 parked 时循环顶部收束
+          bm.park(br.id);
+          log(`[${code}] branch ${br.id} parked (no tool call)`);
+          return { kind: "parked" };
+        }
+        // 上轮遗留的 pending 且本轮发工具（继续干活而非总结）→ 放弃该 flag 的压缩；
+        // 本轮自己 submit 刚设的（turn 相同）不清——否则轮1 submit 后 pending 立即被删（实测 bug）
+        {
+          const p = flagSummariesPending.get(br.id);
+          if (p !== undefined && p.turn < turn) flagSummariesPending.delete(br.id);
+        }
+
+        const pendingForks: PendingFork[] = [];
+        // 阶段1：同轮多个 tool_call 并发派发——shell 的 wait 窗口、submit 的网络往返同时起跑，
+        // 不再互相排队；分支/未知工具是同步的，留到阶段2按原序执行。
+        // done 一律用 settled 包装（{value}|{error}），避免阶段2收割前触发 unhandledRejection。
+        type PreparedCall = {
+          tc: (typeof toolCallsRaw)[number];
+          args: Record<string, unknown>;
+          fix: string | null;
+          parseError: string | null;
+          submitFlag: string | null;
+          startedAt: number;
+          done?: Promise<{ value?: unknown; error?: unknown }>;
+        };
+        const prepared: PreparedCall[] = toolCallsRaw.map((tc) => {
+          const rawArgs = tc.function.arguments || "{}";
+          const base: PreparedCall = {
+            tc,
+            args: {},
+            fix: null,
+            parseError: null,
+            submitFlag: null,
+            startedAt: nowSec(),
+          };
+          if (tc.function.name === "shell") {
+            const [parsed, fix] = parseToolArguments(rawArgs);
+            if (parsed === null) {
+              return { ...base, parseError: fix || "invalid tool arguments" };
+            }
+            const args = { ...parsed };
+            // Attempt 命名空间：shell 默认 cwd = 本 Attempt 目录（显式传 cwd 优先；初始 Attempt 不改）
+            if (br.id !== 0 && !args.cwd) args.cwd = br.cwd;
+            if (fix) {
+              // 模型把参数序列化坏了：直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
+              log(`[${code}] tool args repaired: ${fix}`);
+              rec().event("tool_arg_repaired", {
+                code,
+                tool_call_id: tc.id,
+                fix,
+                raw: rawArgs.slice(0, 400),
+              });
+            }
+            return {
+              ...base,
+              args,
+              fix,
+              done: dispatchShell(args).then(
+                (value) => ({ value }),
+                (error) => ({ error }),
+              ),
+            };
+          }
+          if (tc.function.name === "submit_flag") {
+            let parsed: Record<string, unknown> = {};
+            try {
+              parsed = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+            } catch {
+              parsed = {};
+            }
+            const flagVal = String(parsed.flag ?? "").trim();
+            if (!flagVal) return { ...base, args: parsed, parseError: "`flag` is required" };
+            return {
+              ...base,
+              args: parsed,
+              submitFlag: flagVal,
+              done: bench.submitFlag(code, flagVal).then(
+                (value) => ({ value }),
+                (error) => ({ error }),
+              ),
+            };
+          }
+          if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
+            let parsedArgs: Record<string, unknown> = {};
+            try {
+              parsedArgs = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+            } catch {
+              parsedArgs = {};
+            }
+            return { ...base, args: parsedArgs };
+          }
+          return base;
+        });
+        // 阶段2：按 tool_calls 原序收割结果与副作用（消息配对/记录顺序与串行语义一致）
+        for (const p of prepared) {
+          const tc = p.tc;
+          const args = p.args;
+          const tToolStart = p.startedAt;
+          let result: unknown;
+          if (p.parseError !== null) {
+            result = `error: ${p.parseError}`;
+          } else if (tc.function.name === "shell") {
+            const settled = await p.done;
+            if (settled && "error" in settled) {
+              result = `error: shell dispatch failed: ${settled.error instanceof Error ? settled.error.message : settled.error}`;
+            } else {
+              result = p.fix ? withFixNote(settled?.value, p.fix) : settled?.value;
+              if (typeof args.command === "string") {
+                const dup = bm.commandSeenElsewhere(br.id, args.command);
+                if (dup !== null && typeof result === "string") {
+                  result +=
+                    `\n[去重提示] Attempt ${dup} 最近执行过同一条命令；` +
+                    `先看它的结果/换参数，避免重复劳动。`;
+                }
+                bm.pushCmd(br.id, args.command);
+                if (looksLikeFileCommand(args.command)) {
+                  const cwd =
+                    (typeof args.cwd === "string" && args.cwd) ||
+                    br.cwd ||
+                    workdir ||
+                    getTaskCwd() ||
+                    "";
+                  const arts = collectNewArtifacts(cwd, tToolStart);
+                  if (arts.length) {
+                    const dups = bm.recordArtifacts(br.id, arts);
+                    for (const a of arts) {
+                      corelog?.write({
+                        branch: br.id,
+                        kind: "artifact",
+                        artifact_hash: a.hash,
+                        artifact_path: a.path,
+                        artifact_size: a.size,
+                        note: a.path,
+                      });
+                    }
+                    if (dups.length && typeof result === "string") {
+                      const d = dups[0];
+                      result +=
+                        `\n[产物去重] 本 Attempt 的 ${d.path} 与 Attempt ${d.branch} 的 ` +
+                        `同名/同内容产物相同（sha256:${d.hash.slice(0, 12)}）；` +
+                        `先复用已有分析/询问 planner，避免重复处理。`;
+                    }
+                  }
+                }
+                if (forkOn && looksLikeSharedWrite(args.command) && typeof result === "string") {
+                  result +=
+                    `\n[共享写提醒] 这条命令可能修改共享靶机状态；` +
+                    `请调用 state_change(action, recovery, status:"done") 记录恢复方式，` +
+                    `重启后由 planner 选一个 recovery owner 恢复，其他 Attempt 不要并发写。`;
+                }
+              }
+              // 信号④/⑤数据源：硬失败（连接/解析/命令缺失——对幻觉目标空转）与连续错提交
+              {
+                const txt = firstText(result);
+                bm.recordShellOutcome(
+                  br.id,
+                  /Connection refused|Connection timed out|Could not resolve|Name or service not known|command not found|No route to host/i.test(
+                    txt,
+                  ),
+                );
+                if (/"correct"\s*:\s*false/.test(txt)) bm.recordSubmitResult(br.id, false);
+                else if (/"correct"\s*:\s*true/.test(txt)) bm.recordSubmitResult(br.id, true);
+              }
+              // flag 事件（权威之一）：submit 响应的 matched_flag_index 作稳定 ID 进账本
+              const idx = extractFlagIndex(firstText(result));
+              if (idx !== null && ledger.add(idx, br.id)) {
+                bm.recordFlag(nowSec()); // 新 flag → 刷新题级 flag 主时钟（planner 核心分母）
+                const cfc = /"correct_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
+                const tfc = /"total_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
+                if (tfc) ledger.setTotal(Number(tfc[1]));
+                corelog?.write({
+                  branch: br.id,
+                  kind: "flag",
+                  flag_index: idx,
+                  correct_flag_count: cfc ? Number(cfc[1]) : ledger.count(),
+                  total_flag_count: tfc ? Number(tfc[1]) : undefined,
+                });
+                bm.recordCore(br.id, nowSec());
+                log(`[${code}] branch ${br.id} flagged idx=${idx} (${ledger.progress()})`);
+              }
+            }
+          } else if (tc.function.name === "submit_flag") {
+            // 唯一提交通道：结构化响应直喂账本/flag 卡/时钟；多 flag 未完 → 总结轮触发器
+            const settled = await p.done;
+            if (settled && "error" in settled) {
+              const e = settled.error;
+              if (e instanceof TaskFinishedError) {
+                platformEnded("submit", e as Error); // 评测截止终态：全局收敛，不当工具错误
+                result = "评测已截止：平台返回终态，停止提交";
+              } else {
+                result = `error: submit failed: ${e instanceof Error ? e.message : e}`;
+              }
+            } else {
+              const resp = settled?.value as
+                | { correct?: boolean; matched_flag_index?: number | null }
+                | undefined;
+              const out = integrateSubmit(resp, ledger, br.id);
+              let extra = "";
+              // 平台确认（correct 或 duplicate 已正确提交）→ 进度以账本为准收束。
+              // 多 flag 全齐：响应计数或账本任一判满即回合末立即收束——不等 watcher 缓存
+              // （20s 刷新）与模型尾轮（衔接优化，槽位早释放）；平台计数并发丢更新时
+              // 账本仍是可靠下界，避免"实际全齐却继续解题"。
+              // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
+              const confirmed = resp?.correct === true || out.duplicateConfirmed;
+              const allConfirmed =
+                confirmed &&
+                out.totalCount > 0 &&
+                (out.correctCount >= out.totalCount || ledger.done());
+              if (allConfirmed) flagsComplete = true;
+              if (confirmed && out.totalCount > 1) {
+                if (allConfirmed) allFlagsSubmitted = true;
+                else if (resp?.correct === true) compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
+              }
+              if (resp?.correct === true) {
+                bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
+                corelog?.write({
+                  branch: br.id,
+                  kind: "flag",
+                  flag_index: out.flagIndex,
+                  correct_flag_count: out.correctCount,
+                  total_flag_count: out.totalCount || undefined,
+                });
+                bm.recordCore(br.id, nowSec());
+                log(
+                  `[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`,
+                );
+                // 单 flag：要求收尾总结（总结即收尾，跳过 closingSummary）；多 flag 不再
+                // 逐 flag 总结——上下文压缩是系统自动的（maybeCompact，交接文档形式）
+                if (out.totalCount === 1) {
+                  flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
+                  extra = FLAG_SUMMARY_HINT_SINGLE;
+                }
+              }
+              result = out.result + extra;
+            }
+          } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
+            const out = dispatchBranchTool(tc.function.name, args, toolDeps, br.id, tc.id);
+            if (!out) {
+              result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
+            } else {
+              result = out.result;
+              if (out.pendingFork) pendingForks.push(out.pendingFork);
+            }
+          } else {
+            result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
+          }
+          // log 轮级轻推（执行层兜底，零 LLM 调用）：本轮最后一个工具结果尾部附提醒。
+          // multiOn 闸 = log 工具在场（常规模式无此工具，提醒会诱导 unknown tool）。
+          // 实时判定（log 若发生在本分支本轮更早的 tc 上，rounds 已清零 → 不注入）。
+          if (
+            multiOn &&
+            tc === toolCallsRaw[toolCallsRaw.length - 1] &&
+            typeof result === "string" &&
+            br.roundsSinceCore >= CFG.core_log_nudge_rounds &&
+            br.nudgesUsed < CFG.core_log_nudge_max
+          ) {
+            const n =
+              result +
+              `\n[系统提醒·黑板] 已连续 ${br.roundsSinceCore} 轮无 log：` +
+              `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）、已证伪的路径、` +
+              `或新开/切换的探索方向（方向卡），` +
+              `请立即调用 log 记一张证据卡再继续——黑板空白会被判定停滞（分支回收、planner无从插手）。`;
+            result = n;
+            br.nudgesUsed++;
+            br.roundsSinceCore = 0; // 给模型 3 轮响应期
+            log(
+              `[${code}] log nudge injected for branch ${br.id} (${br.nudgesUsed}/${CFG.core_log_nudge_max})`,
+            );
+          }
+          const tToolEnd = nowSec();
+          // 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联；起止 = 工具执行）
+          conv.write("tool", {
+            branch: br.id,
+            turn: tlabel,
+            tool_call_id: tc.id,
+            tool: tc.function.name,
+            arguments: args,
+            result,
+            started_at: tToolStart,
+            ended_at: tToolEnd,
+          });
+          const first = firstText(result);
+          log(
+            `tool#${tc.id.slice(-6)} ${tc.function.name}[b${br.id}] -> ` +
+              `${first ? (first.split("\n")[0] || "").slice(0, 160) : ""}`,
+          );
+          br.messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
+        }
+
+        // 轮末 log 轮计数：本轮发生过 core/flag（rounds 被 recordCore 清零）或刚被
+        // 轻推归零时保持；否则累计（连续 N 轮触发下一轮的轻推判定）。
+        if (br.roundsSinceCore === roundsAtTurnStart) br.roundsSinceCore++;
+
+        // 轮末 materialize fork（此时 fork 源上下文 tool 配对完整，拷贝协议安全）
+        for (const pf of pendingForks) {
+          const t = nowSec();
+          const forkSeq = conv.currentSeq;
+          const made = bm.materializeFork(
+            pf.reservation.id,
+            pf.parentId,
+            pf.direction,
+            forkSeq,
+            t,
+            branchCwd,
+          );
+          if (!made) continue;
+          conv.write("user", {
+            branch: made.branch.id,
+            kind_note: "fork_directive",
+            parent_branch: pf.parentId,
+            fork_seq: forkSeq,
+            fork_label: pf.direction.slice(0, 200),
+            content: made.directive,
+            turn: tlabel,
+          });
+          afterForkMaterialized(corelog, pf.parentId, made.branch.id, pf.direction);
+          log(
+            `[${code}] fork materialized: branch ${made.branch.id} from ${pf.parentId}: ${pf.direction.slice(0, 80)}`,
+          );
+        }
+
+        // 全部 flag 已由 submit 响应权威确认：目标达成，本回合（工具配对完整后）立即收束——
+        // 跳过下一轮 LLM（模型可能继续摸已无意义的目标）与下轮开头的 watcher 缓存确认，
+        // 槽位即刻归还调度器（worker 出口仍以真实快照复核 completed）
+        if (allFlagsSubmitted) {
+          log(`[${code}] all flags confirmed by submit response; closing segment now`);
+          return { kind: "flags_done" };
+        }
+        // 找到 flag 是信息密度最高的压缩时机（主触发器）：回合末强制交接压缩
+        if (compactAfterFlag.delete(br.id)) {
+          await maybeCompact(br, true);
+        }
+        return { kind: "ok" };
+      });
+    } finally {
+      br.busy = false;
+      flushBranchConv(br.id);
+    }
+  };
+
+  const branchConcurrency = Math.max(1, Math.min(4, CFG.branch_concurrency));
+  const inflight = new Map<number, Promise<{ br: BranchState; outcome: TurnOutcome }>>();
+  // 缓存红线：新分支首个请求串行，避免共享前缀双冷启动。
+  const warmed = new Set<number>([0]);
+  const settleInflight = async (): Promise<void> => {
+    if (!inflight.size) return;
+    await Promise.allSettled([...inflight.values()]);
+    inflight.clear();
+  };
+
   while (true) {
-    if (STOP) return finish("stopped");
-    // A 策略：每轮开头查通关（watcher 缓存）——平台已确认满 flag 就立刻收束，
-    // 不再等模型自己输出总结（它可能根本想不起来，b-02 白挂 22 分钟的教训）。
+    if (STOP) {
+      await settleInflight();
+      return finish("stopped");
+    }
     if (opts.completionCheck?.()) {
+      await settleInflight();
       log(`[${code}] platform confirmed completion mid-segment — closing segment early`);
       return finish("done");
     }
-    // C 策略：段墙钟预算到点即收段（转 paused 让调度处置：原地续或关题让位）。
-    // 安全网：轮数超上限也收段（0=关闭轮数闸），防模型纯说话空转烧 token。
     if (nowSec() - segStartTs >= budgetSec) {
+      await settleInflight();
       log(`[${code}] segment wall-clock budget ${budgetSec}s reached (turn ${turn})`);
       return finish("paused");
     }
     if (CFG.task_max_turns > 0 && turn >= CFG.task_max_turns) {
+      await settleInflight();
       log(`[${code}] turn safety-net ${CFG.task_max_turns} reached`);
       return finish("paused");
     }
-    // VPN 守卫：VPN 挂起 → 本题挂起等待恢复（不烧轮次预算），恢复后原地继续。
-    // 等待超过 AGENT_VPN_WAIT_MAX（默认 600s）仍未恢复才放弃本题。
     if (VPN_DOWN) {
+      await settleInflight();
       const waitMax = Number(env("AGENT_VPN_WAIT_MAX", "600"));
       const t0 = nowSec();
       conv.write("note", {
@@ -889,422 +1556,54 @@ export async function solveTask(
         content: `VPN recovered after ${waited.toFixed(0)}s; resuming`,
       });
       log(`[${code}] VPN recovered after ${waited.toFixed(0)}s; resuming task`);
-      // VPN 挂起等待不计入段墙钟预算（保持"等待不烧预算"语义）
       segStartTs += waited;
-      continue; // 恢复后从当前 turn 继续（不烧预算）
+      continue;
     }
     const rem = remainingSec();
-    if (rem !== null && rem <= 0) return finish("deadline");
+    if (rem !== null && rem <= 0) {
+      await settleInflight();
+      return finish("deadline");
+    }
 
-    pruneStalled();
-    await maybeBystander();
+    const busy = new Set(inflight.keys());
+    pruneStalled(busy);
+    maybePlannerStall(busy);
 
-    const br = bm.pick();
-    if (!br) {
-      // 全部分支 parked（输出无工具总结）→ 本段收束（是否通关由控制器查平台）
+    while (inflight.size < branchConcurrency) {
+      const exclude = new Set(inflight.keys());
+      const coldBusy = [...exclude].some((id) => !warmed.has(id));
+      const br =
+        branchConcurrency === 1
+          ? bm.pickExcept(exclude)
+          : bm.ranked(exclude).find((b) => warmed.has(b.id) || !coldBusy);
+      if (!br) break;
+      if (branchConcurrency > 1) bm.consumePriority(br.id);
+      inflight.set(
+        br.id,
+        runTurn(br).then((outcome) => {
+          warmed.add(br.id);
+          return { br, outcome };
+        }),
+      );
+    }
+    if (!inflight.size) {
       log(`[${code}] all branches parked (turn ${turn}); closing segment`);
       return finish("done");
     }
-    await maybeCompact(br); // 超阈值先压缩交接再发本轮请求（失败退避不阻塞）
 
-    turn++;
-    const roundsAtTurnStart = br.roundsSinceCore; // log 轮计数基准（轮末比较用）
-    const tLlmStart = nowSec();
-    let resp: ChatResponse | null = null;
-    let err: unknown = null;
-    try {
-      resp = await callLlm(client, br.messages, true, { tools, effort: effort || undefined });
-    } catch (e) {
-      err = e;
-      // 多模态降级：网关拒收图片 → 剥掉 image part 改发纯文本，本会话后续不再附图
-      const dropped = CFG.vision_ok !== false ? stripImages(br.messages) : 0;
-      if (dropped) {
-        CFG.vision_ok = false;
-        log(
-          `[${code}] gateway rejected image input (${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}); ` +
-            `dropped ${dropped} image(s), retrying text-only`,
-        );
-        conv.write("note", {
-          branch: br.id,
-          turn: `${code}:${turn}`,
-          content: `网关拒图，降级为文本模式：${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`,
-        });
-        rec().event("vision_degraded", {
-          code,
-          dropped,
-          error: `${e instanceof Error ? e.name : "Error"}: ${(e as Error).message}`.slice(0, 400),
-        });
-        try {
-          resp = await callLlm(client, br.messages, true, { tools, effort: effort || undefined });
-        } catch (e2) {
-          err = e2;
-        }
-      }
-      if (!resp) {
-        const emsg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-        log(`[${code}] fatal LLM error: ${emsg}`);
-        conv.write("error", {
-          branch: br.id,
-          turn: `${code}:${turn}`,
-          error: emsg,
-          started_at: tLlmStart,
-        });
-        const status: SolveStatus = isContextOverflow(err) ? "context_overflow" : "llm_error";
-        return finish(status);
-      }
+    const done = await Promise.race(inflight.values());
+    inflight.delete(done.br.id);
+    // 共享副作用在 turn 完成后串行处理；不会和仍在 inflight 的 tool 结果打架。
+    flushRecovery();
+    applyPlanner();
+    savePlanner();
+    if (done.outcome.kind === "fatal") {
+      await settleInflight();
+      return finish(done.outcome.status);
     }
-    turnsUsed++;
-    const tLlmEnd = nowSec();
-
-    const msg = resp.choices[0].message;
-    const tlabel = `${code}:${startTurn + turn}`;
-    const toolCallsRaw = msg.tool_calls ?? [];
-    // AI 输出全量落盘：thinking / output / tool_calls 原文（started_at/ended_at = LLM 调用起止）。
-    // 多 flag 总结轮（submit 后要求的 flag 探索总结）→ kind_note 标记（rebuild 压缩锚之一）。
-    const isFlagSummaryTurn =
-      !toolCallsRaw.length && flagSummariesPending.has(br.id) && !!msg.content?.trim();
-    conv.write("assistant", {
-      branch: br.id,
-      turn: tlabel,
-      ...(isFlagSummaryTurn
-        ? { kind_note: "flag_summary", flag_index: flagSummariesPending.get(br.id)?.idx }
-        : {}),
-      thinking: msg.reasoning_content ?? null,
-      output: msg.content ?? null,
-      tool_calls: toolCallsRaw.map((tc) => ({
-        id: tc.id,
-        name: tc.function.name,
-        arguments: tc.function.arguments,
-      })),
-      usage: resp.usage ?? null,
-      started_at: tLlmStart,
-      ended_at: tLlmEnd,
-    });
-    if (msg.content) lastContent = msg.content;
-    {
-      const pt = Number(resp?.usage?.prompt_tokens ?? 0); // 实测输入 token（口径：上一次 LLM 调用）
-      if (pt > 0) lastPromptTokens.set(br.id, pt);
-    }
-    // 自动黑板：模型的进展叙述（content，不含 thinking/tool）直接落 corelog——
-    // 治"提示词暗示不可靠"（b-02 实测 123 次 shell 仅 1 张实质卡）；短应答(<8字)跳过防噪。
-    // 记卡即核心事件：停滞时钟随之刷新（黑板确实在长，不算隐形空转）
-    {
-      const narr = typeof msg.content === "string" ? msg.content.trim() : "";
-      if (narr.length >= 8) {
-        corelog?.write({ branch: br.id, kind: "core", note: narr.slice(0, 400) });
-        bm.recordCore(br.id, nowSec());
-      }
-    }
-
-    const clean: ChatMessage = { role: "assistant" as const };
-    if (msg.content) clean.content = msg.content;
-    if (toolCallsRaw.length) {
-      clean.tool_calls = toolCallsRaw.map((tc) => ({
-        id: tc.id,
-        type: "function" as const,
-        function: { name: tc.function.name, arguments: tc.function.arguments },
-      }));
-    }
-    br.messages.push(clean);
-
-    if (!toolCallsRaw.length) {
-      // 单 flag 收尾总结轮（submit 后系统要求的探索总结）：**不执行替换**（原文保留），
-      // 该总结即收尾 → flagSummaryDone，worker 跳过 closingSummary（精简版留作兜底）
-      const pendIdx = flagSummariesPending.get(br.id)?.idx;
-      if (pendIdx !== undefined && msg.content?.trim()) {
-        flagSummariesPending.delete(br.id);
-        flagSummaryDone = true;
-        log(`[${code}] single-flag closing summary recorded (context kept as-is)`);
-      } else {
-        flagSummariesPending.delete(br.id); // 未按指示输出总结 → 放弃（不纠缠）
-      }
-      if (!multiOn) return finish("done"); // 单分支语义不变：无工具总结 = 本题上下文收束
-      // fork 模式：该分支 parked（无收尾权），其他分支继续；全 parked 时循环顶部收束
-      bm.park(br.id);
-      log(`[${code}] branch ${br.id} parked (no tool call)`);
-      continue;
-    }
-    // 上轮遗留的 pending 且本轮发工具（继续干活而非总结）→ 放弃该 flag 的压缩；
-    // 本轮自己 submit 刚设的（turn 相同）不清——否则轮1 submit 后 pending 立即被删（实测 bug）
-    {
-      const p = flagSummariesPending.get(br.id);
-      if (p !== undefined && p.turn < turn) flagSummariesPending.delete(br.id);
-    }
-
-    const pendingForks: PendingFork[] = [];
-    // 阶段1：同轮多个 tool_call 并发派发——shell 的 wait 窗口、submit 的网络往返同时起跑，
-    // 不再互相排队；分支/未知工具是同步的，留到阶段2按原序执行。
-    // done 一律用 settled 包装（{value}|{error}），避免阶段2收割前触发 unhandledRejection。
-    type PreparedCall = {
-      tc: (typeof toolCallsRaw)[number];
-      args: Record<string, unknown>;
-      fix: string | null;
-      parseError: string | null;
-      submitFlag: string | null;
-      startedAt: number;
-      done?: Promise<{ value?: unknown; error?: unknown }>;
-    };
-    const prepared: PreparedCall[] = toolCallsRaw.map((tc) => {
-      const rawArgs = tc.function.arguments || "{}";
-      const base: PreparedCall = {
-        tc,
-        args: {},
-        fix: null,
-        parseError: null,
-        submitFlag: null,
-        startedAt: nowSec(),
-      };
-      if (tc.function.name === "shell") {
-        const [parsed, fix] = parseToolArguments(rawArgs);
-        if (parsed === null) {
-          return { ...base, parseError: fix || "invalid tool arguments" };
-        }
-        const args = { ...parsed };
-        // 分支命名空间：shell 默认 cwd = 本分支目录（显式传 cwd 优先；trunk 不改）
-        if (br.id !== 0 && !args.cwd) args.cwd = br.cwd;
-        if (fix) {
-          // 模型把参数序列化坏了：直接修复执行，避免整轮作废；原样记录在 assistant.tool_calls 里
-          log(`[${code}] tool args repaired: ${fix}`);
-          rec().event("tool_arg_repaired", {
-            code,
-            tool_call_id: tc.id,
-            fix,
-            raw: rawArgs.slice(0, 400),
-          });
-        }
-        return {
-          ...base,
-          args,
-          fix,
-          done: dispatchShell(args).then(
-            (value) => ({ value }),
-            (error) => ({ error }),
-          ),
-        };
-      }
-      if (tc.function.name === "submit_flag") {
-        let parsed: Record<string, unknown> = {};
-        try {
-          parsed = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
-        } catch {
-          parsed = {};
-        }
-        const flagVal = String(parsed.flag ?? "").trim();
-        if (!flagVal) return { ...base, args: parsed, parseError: "`flag` is required" };
-        return {
-          ...base,
-          args: parsed,
-          submitFlag: flagVal,
-          done: bench.submitFlag(code, flagVal).then(
-            (value) => ({ value }),
-            (error) => ({ error }),
-          ),
-        };
-      }
-      if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
-        let parsedArgs: Record<string, unknown> = {};
-        try {
-          parsedArgs = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
-        } catch {
-          parsedArgs = {};
-        }
-        return { ...base, args: parsedArgs };
-      }
-      return base;
-    });
-    // 阶段2：按 tool_calls 原序收割结果与副作用（消息配对/记录顺序与串行语义一致）
-    for (const p of prepared) {
-      const tc = p.tc;
-      const args = p.args;
-      const tToolStart = p.startedAt;
-      let result: unknown;
-      if (p.parseError !== null) {
-        result = `error: ${p.parseError}`;
-      } else if (tc.function.name === "shell") {
-        const settled = await p.done;
-        if (settled && "error" in settled) {
-          result = `error: shell dispatch failed: ${settled.error instanceof Error ? settled.error.message : settled.error}`;
-        } else {
-          result = p.fix ? withFixNote(settled?.value, p.fix) : settled?.value;
-          if (typeof args.command === "string") bm.pushCmd(br.id, args.command);
-          // 信号④/⑤数据源：硬失败（连接/解析/命令缺失——对幻觉目标空转）与连续错提交
-          {
-            const txt = firstText(result);
-            bm.recordShellOutcome(
-              br.id,
-              /Connection refused|Connection timed out|Could not resolve|Name or service not known|command not found|No route to host/i.test(
-                txt,
-              ),
-            );
-            if (/"correct"\s*:\s*false/.test(txt)) bm.recordSubmitResult(br.id, false);
-            else if (/"correct"\s*:\s*true/.test(txt)) bm.recordSubmitResult(br.id, true);
-          }
-          // flag 事件（权威之一）：submit 响应的 matched_flag_index 作稳定 ID 进账本
-          const idx = extractFlagIndex(firstText(result));
-          if (idx !== null && ledger.add(idx, br.id)) {
-            bm.recordFlag(nowSec()); // 新 flag → 刷新题级 flag 主时钟（旁观者核心分母）
-            const cfc = /"correct_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
-            const tfc = /"total_flag_count"\s*:\s*(\d+)/.exec(firstText(result));
-            if (tfc) ledger.setTotal(Number(tfc[1]));
-            corelog?.write({
-              branch: br.id,
-              kind: "flag",
-              flag_index: idx,
-              correct_flag_count: cfc ? Number(cfc[1]) : ledger.count(),
-              total_flag_count: tfc ? Number(tfc[1]) : undefined,
-            });
-            bm.recordCore(br.id, nowSec());
-            log(`[${code}] branch ${br.id} flagged idx=${idx} (${ledger.progress()})`);
-          }
-        }
-      } else if (tc.function.name === "submit_flag") {
-        // 唯一提交通道：结构化响应直喂账本/flag 卡/时钟；多 flag 未完 → 总结轮触发器
-        const settled = await p.done;
-        if (settled && "error" in settled) {
-          const e = settled.error;
-          if (e instanceof TaskFinishedError) {
-            platformEnded("submit", e as Error); // 评测截止终态：全局收敛，不当工具错误
-            result = "评测已截止：平台返回终态，停止提交";
-          } else {
-            result = `error: submit failed: ${e instanceof Error ? e.message : e}`;
-          }
-        } else {
-          const resp = settled?.value as
-            | { correct?: boolean; matched_flag_index?: number | null }
-            | undefined;
-          const out = integrateSubmit(resp, ledger, br.id);
-          let extra = "";
-          // 平台确认（correct 或 duplicate 已正确提交）→ 进度以账本为准收束。
-          // 多 flag 全齐：响应计数或账本任一判满即回合末立即收束——不等 watcher 缓存
-          // （20s 刷新）与模型尾轮（衔接优化，槽位早释放）；平台计数并发丢更新时
-          // 账本仍是可靠下界，避免"实际全齐却继续解题"。
-          // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
-          const confirmed = resp?.correct === true || out.duplicateConfirmed;
-          const allConfirmed =
-            confirmed &&
-            out.totalCount > 0 &&
-            (out.correctCount >= out.totalCount || ledger.done());
-          if (allConfirmed) flagsComplete = true;
-          if (confirmed && out.totalCount > 1) {
-            if (allConfirmed) allFlagsSubmitted = true;
-            else if (resp?.correct === true) compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
-          }
-          if (resp?.correct === true) {
-            bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
-            corelog?.write({
-              branch: br.id,
-              kind: "flag",
-              flag_index: out.flagIndex,
-              correct_flag_count: out.correctCount,
-              total_flag_count: out.totalCount || undefined,
-            });
-            bm.recordCore(br.id, nowSec());
-            log(`[${code}] branch ${br.id} flagged idx=${out.flagIndex} (${ledger.progress()})`);
-            // 单 flag：要求收尾总结（总结即收尾，跳过 closingSummary）；多 flag 不再
-            // 逐 flag 总结——上下文压缩是系统自动的（maybeCompact，交接文档形式）
-            if (out.totalCount === 1) {
-              flagSummariesPending.set(br.id, { idx: out.flagIndex ?? -1, turn });
-              extra = FLAG_SUMMARY_HINT_SINGLE;
-            }
-          }
-          result = out.result + extra;
-        }
-      } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
-        const out = dispatchBranchTool(tc.function.name, args, toolDeps, br.id, tc.id);
-        if (!out) {
-          result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
-        } else {
-          result = out.result;
-          if (out.pendingFork) pendingForks.push(out.pendingFork);
-        }
-      } else {
-        result = `error: unknown tool ${JSON.stringify(tc.function.name)}`;
-      }
-      // log 轮级轻推（执行层兜底，零 LLM 调用）：本轮最后一个工具结果尾部附提醒。
-      // multiOn 闸 = log 工具在场（常规模式无此工具，提醒会诱导 unknown tool）。
-      // 实时判定（log 若发生在本分支本轮更早的 tc 上，rounds 已清零 → 不注入）。
-      if (
-        multiOn &&
-        tc === toolCallsRaw[toolCallsRaw.length - 1] &&
-        typeof result === "string" &&
-        br.roundsSinceCore >= CFG.core_log_nudge_rounds &&
-        br.nudgesUsed < CFG.core_log_nudge_max
-      ) {
-        const n =
-          result +
-          `\n[系统提醒·黑板] 已连续 ${br.roundsSinceCore} 轮无 log：` +
-          `刚获得的证据（凭据/密钥/响应泄露/2xx 路径）、已证伪的路径、` +
-          `或新开/切换的探索方向（方向卡），` +
-          `请立即调用 log 记一张证据卡再继续——黑板空白会被判定停滞（分支回收、旁观者无从插手）。`;
-        result = n;
-        br.nudgesUsed++;
-        br.roundsSinceCore = 0; // 给模型 3 轮响应期
-        log(
-          `[${code}] log nudge injected for branch ${br.id} (${br.nudgesUsed}/${CFG.core_log_nudge_max})`,
-        );
-      }
-      const tToolEnd = nowSec();
-      // 工具结果全量落盘（与 assistant 条目通过 tool_call_id 关联；起止 = 工具执行）
-      conv.write("tool", {
-        branch: br.id,
-        turn: tlabel,
-        tool_call_id: tc.id,
-        tool: tc.function.name,
-        arguments: args,
-        result,
-        started_at: tToolStart,
-        ended_at: tToolEnd,
-      });
-      const first = firstText(result);
-      log(
-        `tool#${tc.id.slice(-6)} ${tc.function.name}[b${br.id}] -> ` +
-          `${first ? (first.split("\n")[0] || "").slice(0, 160) : ""}`,
-      );
-      br.messages.push({ role: "tool", tool_call_id: tc.id, content: result as string });
-    }
-
-    // 轮末 log 轮计数：本轮发生过 core/flag（rounds 被 recordCore 清零）或刚被
-    // 轻推归零时保持；否则累计（连续 N 轮触发下一轮的轻推判定）。
-    if (br.roundsSinceCore === roundsAtTurnStart) br.roundsSinceCore++;
-
-    // 轮末 materialize fork（此时父分支上下文 tool 配对完整，拷贝协议安全）
-    for (const pf of pendingForks) {
-      const t = nowSec();
-      const forkSeq = conv.currentSeq;
-      const made = bm.materializeFork(
-        pf.reservation.id,
-        pf.parentId,
-        pf.direction,
-        forkSeq,
-        t,
-        branchCwd,
-      );
-      if (!made) continue;
-      conv.write("user", {
-        branch: made.branch.id,
-        kind_note: "fork_directive",
-        parent_branch: pf.parentId,
-        fork_seq: forkSeq,
-        fork_label: pf.direction.slice(0, 200),
-        content: made.directive,
-        turn: tlabel,
-      });
-      afterForkMaterialized(corelog, pf.parentId, made.branch.id, pf.direction);
-      log(
-        `[${code}] fork materialized: branch ${made.branch.id} from ${pf.parentId}: ${pf.direction.slice(0, 80)}`,
-      );
-    }
-
-    // 全部 flag 已由 submit 响应权威确认：目标达成，本回合（工具配对完整后）立即收束——
-    // 跳过下一轮 LLM（模型可能继续摸已无意义的目标）与下轮开头的 watcher 缓存确认，
-    // 槽位即刻归还调度器（worker 出口仍以真实快照复核 completed）
-    if (allFlagsSubmitted) {
-      log(`[${code}] all flags confirmed by submit response; closing segment now`);
+    if (done.outcome.kind === "done" || done.outcome.kind === "flags_done") {
+      await settleInflight();
       return finish("done");
-    }
-    // 找到 flag 是信息密度最高的压缩时机（主触发器）：回合末强制交接压缩
-    if (compactAfterFlag.delete(br.id)) {
-      await maybeCompact(br, true);
     }
   }
 }
@@ -1548,6 +1847,15 @@ function estMsgChars(msgs: ChatMessage[]): number {
   return n;
 }
 
+/** 重建任务文本：一次只下发 pending 队列里的下一项，完成后 controller 再选 owner 下发下一项。 */
+function recoveryAssignment(items: MutationRecord[]): string {
+  const lines = items
+    .slice(0, 1)
+    .map((m) => `- ${m.id} | ${m.action} | 恢复：${m.recovery}`)
+    .join("\n");
+  return fill(RECOVERY_ASSIGNMENT, { items: lines });
+}
+
 /** 并行调度器：并发解多题，自动扩容直到平台拒绝（max active）。 */
 async function runParallel(
   client: LlmClient,
@@ -1636,6 +1944,8 @@ async function runParallel(
     isResume: boolean,
   ): Promise<void> => {
     const code = task.unique_code;
+    // 每题独立 shell job 表：跨题不可见、不可 wait/kill，配额也隔离。
+    setTaskShell(new ShellManager());
     setTaskCwd(taskWorkdir(code));
     let last = "";
     let state: Challenge | null = null;
@@ -1712,6 +2022,59 @@ async function runParallel(
               conv.write("user", { branch: b.id, turn: `${code}:${startTurn}`, content: note });
             }
           }
+
+          // 重建：所有 Attempt 收到“重新下载/只读确认”告知；共享写只交给选定的一个 owner。
+          const pending = pendingMutations(readCorelog(rec().corelog(code).path));
+          const owner = selectRecoveryOwner(
+            pending,
+            [
+              { id: 0, scopeId: 0, status: "active" },
+              ...branches.map((b) => ({
+                id: b.id,
+                scopeId: b.scopeId ?? b.id,
+                status: b.status ?? "active",
+              })),
+            ],
+            0,
+          );
+          const recoveryNotice = fill(RECOVERY_NOTICE, {
+            count: pending.length,
+            owner,
+          });
+          messages.push({ role: "user", content: recoveryNotice });
+          conv.write("user", { branch: 0, turn: `${code}:${startTurn}`, content: recoveryNotice });
+          for (const b of branches) {
+            b.messages.push({ role: "user", content: recoveryNotice });
+            conv.write("user", {
+              branch: b.id,
+              turn: `${code}:${startTurn}`,
+              content: recoveryNotice,
+            });
+          }
+          if (pending.length) {
+            const assignment = recoveryAssignment(pending);
+            const ownerBranch = branches.find((b) => b.id === owner);
+            if (ownerBranch) {
+              ownerBranch.messages.push({ role: "user", content: assignment });
+              conv.write("user", {
+                branch: owner,
+                turn: `${code}:${startTurn}`,
+                content: assignment,
+              });
+            } else {
+              messages.push({ role: "user", content: assignment });
+              conv.write("user", { branch: 0, turn: `${code}:${startTurn}`, content: assignment });
+            }
+          }
+          rec().event("recovery_planned", {
+            code,
+            count: pending.length,
+            owner,
+            mutations: pending.map((m) => m.id),
+          });
+          log(
+            `[${code}] recovery plan: ${pending.length} pending shared mutation(s), owner=Attempt ${owner}`,
+          );
           log(
             `[${code}] resume segment: ${startTurn} prior turns restored` +
               `${branches.length ? `, ${branches.length} branch(es)` : ""}, ` +

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { withFixNote } from "../src/agent.js";
 import { CFG } from "../src/config.js";
 import { rebuildMessages } from "../src/records.js";
-import { imageSize, setTaskCwd } from "../src/shell.js";
+import { imageSize, ShellManager, setTaskBranch, setTaskCwd, setTaskShell } from "../src/shell.js";
 import { dispatchShell, SHELL } from "../src/shell_tool.js";
 
 function jobIdOf(payload: string): string {
@@ -21,6 +21,8 @@ describe("shell：边沿等待 / 分页 / 落盘 / job 上限", () => {
   });
   afterEach(() => {
     setTaskCwd("");
+    setTaskBranch(0);
+    setTaskShell(new ShellManager());
   });
 
   it("run 带 wait_sec 边沿返回，status 分页带 next_offset，kill 生效", async () => {
@@ -98,6 +100,40 @@ describe("shell：边沿等待 / 分页 / 落盘 / job 上限", () => {
     await SHELL.kill(d1);
     await SHELL.kill(d2);
   }, 30_000);
+
+  it("每道题独立 ShellManager：job 表/寻址完全隔离", async () => {
+    setTaskCwd(w);
+    const a = new ShellManager();
+    const b = new ShellManager();
+    setTaskShell(a);
+    const p = await dispatchShell({ action: "run", command: "sleep 5", wait_ms: 0 });
+    const jid = jobIdOf(String(p));
+    expect(String(await dispatchShell({ action: "list" }))).toContain(jid);
+    setTaskShell(b);
+    expect(String(await dispatchShell({ action: "list" }))).not.toContain(jid);
+    expect(String(await dispatchShell({ action: "status", job_id: jid }))).toContain("unknown");
+    setTaskShell(a);
+    expect(String(await dispatchShell({ action: "status", job_id: jid }))).toContain(
+      `[job ${jid}]`,
+    );
+    await a.kill(jid);
+  }, 30_000);
+
+  it("job 归属 Attempt：list/status/kill 只看本 Attempt", async () => {
+    setTaskCwd(w);
+    setTaskBranch(1);
+    const p = await SHELL.run({ command: "sleep 5", wait_ms: 0 });
+    const jid = jobIdOf(p);
+    expect(String(await dispatchShell({ action: "list" }))).toContain(jid);
+    setTaskBranch(2);
+    expect(String(await dispatchShell({ action: "list" }))).not.toContain(jid);
+    expect(String(await dispatchShell({ action: "status", job_id: jid }))).toContain("unknown");
+    setTaskBranch(1);
+    expect(String(await dispatchShell({ action: "status", job_id: jid }))).toContain(
+      `[job ${jid}]`,
+    );
+    await SHELL.kill(jid);
+  }, 30_000);
 });
 
 describe("多模态 action=view", () => {
@@ -110,6 +146,8 @@ describe("多模态 action=view", () => {
   });
   afterEach(() => {
     setTaskCwd("");
+    setTaskBranch(0);
+    setTaskShell(new ShellManager());
   });
 
   it("返回 [text, image_url] 两段，尺寸 1x1，data URL", async () => {

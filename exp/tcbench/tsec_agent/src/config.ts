@@ -165,20 +165,21 @@ export interface Config {
   shell_max_output: number;
   shell_hard_sec: number;
   shell_max_jobs: number;
+  shell_max_jobs_per_branch: number;
   vision: string;
   vision_max_kb: number;
   vision_ok: boolean | null;
-  // fork 多分支（默认关）
+  // fork 多 Attempt（默认关）
   fork_enabled: boolean;
+  planner_enabled: boolean;
+  branch_concurrency: number;
   max_branches: number;
   fork_max: number;
   fork_cooldown_sec: number;
   branch_prune_sec: number;
-  broadcast_max: number;
-  // 旁观者（默认关）
-  bystander_enabled: boolean;
-  bystander_max: number;
-  bystander_cooldown_sec: number;
+  // planner 卡塞提醒（不调用额外 LLM；程序检测信号后提醒/回收）
+  planner_nudge_max: number;
+  planner_nudge_cooldown_sec: number;
   stall_short_sec: number;
   stall_long_sec: number;
   flag_stall_short_sec: number;
@@ -243,6 +244,7 @@ export const CFG: Config = {
   shell_hard_sec: num("AGENT_SHELL_HARD_SEC", "1800"),
   // 同时在跑的后台 job 上限（满了拒绝新 run）
   shell_max_jobs: num("AGENT_SHELL_MAX_JOBS", "8"),
+  shell_max_jobs_per_branch: num("AGENT_SHELL_MAX_JOBS_PER_BRANCH", "4"),
 
   // --- 多模态（shell action=view 读图）---
   // auto=先按图片发，网关 400 拒图时本会话降级为文本（只有元数据；验证码可 shell 跑 tesseract）
@@ -250,28 +252,30 @@ export const CFG: Config = {
   vision_max_kb: num("AGENT_VISION_MAX_KB", "4096"),
   vision_ok: null,
 
-  // --- fork 多分支（../docs/fork-bystander-design.md §7，默认全关） ---
-  fork_enabled: ["1", "on", "true"].includes(env("AGENT_FORK", "0").toLowerCase()),
-  max_branches: num("AGENT_MAX_BRANCHES", "3"), // 存活分支上限（含 trunk）
-  fork_max: num("AGENT_FORK_MAX", "5"), // 每题 fork 总数硬上限
+  // --- fork 多 Attempt（../docs/fork-planner-design.md §7，默认关） ---
+  fork_enabled: ["1", "on", "true"].includes(env("AGENT_FORK", "1").toLowerCase()),
+  // Planner 是统筹者（不是 Attempt）：fork 开启时默认启用；heuristic 先行，之后可换 LLM。
+  planner_enabled: ["1", "on", "true"].includes(env("AGENT_PLANNER", "1").toLowerCase()),
+  // 同时推进的 Attempt turn 数（1=旧单飞；>1 才有真正并发 LLM/turn）
+  branch_concurrency: Math.max(1, Math.min(4, num("AGENT_BRANCH_CONCURRENCY", "2"))),
+  max_branches: num("AGENT_MAX_BRANCHES", "3"), // 存活 Attempt 上限（含初始 Attempt 0）
+  fork_max: num("AGENT_FORK_MAX", "5"), // 每题 fork/spawn 总数硬上限
   fork_cooldown_sec: num("AGENT_FORK_COOLDOWN_SEC", "180"),
-  // 1200（B 方案）：长题停滞 600s+二信号 900s 触发旁观者后仍留 300s 救治窗，
-  // 救不活才剪——两阈值曾同为 600（剪枝先执行=分支旁观者窗口为 0，靠巧合而非设计）
+  // 1200（B 方案）：长题停滞 600s+二信号 900s 触发 planner 后仍留 300s 救治窗，
+  // 救不活才剪——两阈值曾同为 600（剪枝先执行=planner 介入窗口为 0，靠巧合而非设计）
   branch_prune_sec: num("AGENT_BRANCH_PRUNE_SEC", "1200"), // corelog/flag 双停滞剪枝
-  broadcast_max: num("AGENT_BROADCAST_MAX", "8"), // 每段每分支广播上限
 
-  // --- 旁观者（默认关；依赖 log 工具，可单独于 fork 打开） ---
-  bystander_enabled: ["1", "on", "true"].includes(env("AGENT_BYSTANDER", "0").toLowerCase()),
-  bystander_max: num("AGENT_BYSTANDER_MAX", "2"), // 每段每分支旁观者上限
-  bystander_cooldown_sec: num("AGENT_BYSTANDER_COOLDOWN_SEC", "400"),
+  // --- planner 卡塞提醒（程序检测 + 模板提醒，不调用额外 LLM） ---
+  planner_nudge_max: num("AGENT_PLANNER_NUDGE_MAX", "2"), // 每段每 Attempt 提醒上限
+  planner_nudge_cooldown_sec: num("AGENT_PLANNER_NUDGE_COOLDOWN_SEC", "400"),
   // 组合信号（任二成立触发）的分档阈值：停滞时长按题目分类取值
   stall_short_sec: num("AGENT_STALL_SHORT_SEC", "300"),
   stall_long_sec: num("AGENT_STALL_LONG_SEC", "600"),
-  // flag 主时钟（题级，旁观者核心信号）：长时间没 flag 就介入
+  // flag 主时钟（题级，planner 核心信号）：长时间没 flag 就介入
   flag_stall_short_sec: num("AGENT_FLAG_STALL_SHORT_SEC", "400"),
   flag_stall_long_sec: num("AGENT_FLAG_STALL_LONG_SEC", "900"),
   // log 执行层兜底（轮级轻推，零 LLM 调用）：连续 N 轮无 log →
-  // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给旁观者。
+  // 在该轮最后一个工具结果尾部附提醒；每段每分支最多 MAX 次，之后交给planner。
   core_log_nudge_rounds: num("AGENT_CORE_LOG_NUDGE_ROUNDS", "3"),
   core_log_nudge_max: num("AGENT_CORE_LOG_NUDGE_MAX", "2"),
 

@@ -20,6 +20,14 @@ interface TaskRow {
     running_cmds: string[];
     last_cmd: string;
     branches?: string[];
+    attempts?: Array<{
+      id: number;
+      parent: number | null;
+      scopeId: number;
+      label: string;
+      status: string;
+      depth: number;
+    }>;
     log_tail?: string[];
   };
 }
@@ -324,9 +332,18 @@ export function App() {
                     {t.live.running_cmds.slice(1).join(" | ")}
                   </div>
                 )}
-                {(t.live.branches?.length ?? 0) > 0 && (
+                {(t.live.attempts?.length ?? 0) > 0 ? (
+                  <div className="muted" style={{ display: "grid", gap: 2 }}>
+                    {t.live.attempts!.map((a) => (
+                      <div key={a.id} style={{ paddingLeft: `${a.depth * 12}px` }}>
+                        {a.id === 0 ? "●" : "└"} Attempt {a.id} · {a.label || "(initial)"}{" "}
+                        <span style={{ opacity: 0.7 }}>[{a.status}]</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (t.live.branches?.length ?? 0) > 0 ? (
                   <div className="muted">⑂ {t.live.branches?.join(" ｜ ")}</div>
-                )}
+                ) : null}
                 {(t.live.log_tail?.length ?? 0) > 0 && (
                   <div className="muted">log: {t.live.log_tail?.slice(0, 3).join(" ｜ ")}</div>
                 )}

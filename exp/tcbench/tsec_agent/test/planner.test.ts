@@ -1,0 +1,149 @@
+/** Planner 启发式单测：只做“deadend + next → checkpoint spawn”的最小决策，
+ * 与 BranchManager 的真实执行解耦。 */
+import { describe, expect, it } from "vitest";
+import { heuristicPlan, type ReportEvent, selectRecoveryOwner } from "../src/planner.js";
+
+const base: ReportEvent = {
+  type: "report",
+  attempt: 1,
+  status: "deadend",
+  summary: "HTTP 走死",
+  next: ["动态 trace"],
+  scopeId: 1,
+  scopeStatus: "refuted",
+};
+
+const ctx = {
+  enabled: true,
+  canSpawn: () => true,
+  nudgeAvailable: () => true,
+  nudgeExhausted: () => false,
+};
+
+describe("heuristic planner", () => {
+  it("recovery owner：优先共享写最多的 scope，其次 id 最小，只选一个", () => {
+    const attempts = [
+      { id: 0, scopeId: 0, status: "active" },
+      { id: 1, scopeId: 1, status: "active" },
+      { id: 2, scopeId: 2, status: "active" },
+      { id: 3, scopeId: 1, status: "active" },
+    ];
+    const mutations = [
+      {
+        id: "a",
+        action: "x",
+        recovery: "r",
+        scopeId: 1,
+        branch: 1,
+        shared: true,
+        status: "pending" as const,
+      },
+      {
+        id: "b",
+        action: "y",
+        recovery: "r",
+        scopeId: 1,
+        branch: 3,
+        shared: true,
+        status: "pending" as const,
+      },
+      {
+        id: "c",
+        action: "z",
+        recovery: "r",
+        scopeId: 2,
+        branch: 2,
+        shared: true,
+        status: "pending" as const,
+      },
+    ];
+    expect(selectRecoveryOwner(mutations, attempts)).toBe(1);
+    expect(selectRecoveryOwner([], attempts)).toBe(0);
+    expect(selectRecoveryOwner(mutations, [{ id: 2, scopeId: 2, status: "deadend" }], 0)).toBe(0);
+  });
+
+  it("deadend + next：retire source + spawn from checkpoint", () => {
+    expect(heuristicPlan(base, ctx)).toEqual([
+      { type: "retire", attempt: 1, reason: "deadend; free slot for checkpoint backtrack" },
+      {
+        type: "spawn",
+        source: 1,
+        direction: "动态 trace",
+        scopeId: 1,
+        reason: "planner backtrack from checkpoint (no failed tail copied)",
+      },
+    ]);
+  });
+
+  it("done / blocked / 无 next / scope satisfied / 禁用 → 不动作", () => {
+    expect(heuristicPlan({ ...base, status: "done" }, ctx)).toEqual([]);
+    expect(heuristicPlan({ ...base, status: "blocked" }, ctx)).toEqual([]);
+    expect(heuristicPlan({ ...base, next: [] }, ctx)).toEqual([]);
+    expect(heuristicPlan({ ...base, scopeStatus: "satisfied" }, ctx)).toEqual([]);
+    expect(heuristicPlan(base, { ...ctx, enabled: false })).toEqual([]);
+  });
+
+  it("stall：有额度→remind；额度耗尽→retire（含初始 Attempt）", () => {
+    const stall = {
+      type: "stall" as const,
+      attempt: 1,
+      signals: {
+        flagStall: false,
+        stall: true,
+        repeat: true,
+        hardFail: false,
+        hallucSubmit: false,
+        count: 2,
+      },
+      sinceCoreSec: 300,
+      recentCmds: ["nmap x", "nmap x", "nmap x"],
+      digest: "- assistant: ...",
+      scopeId: 1,
+      scopeStatus: "open" as const,
+    };
+    const nudge = heuristicPlan(stall, ctx);
+    expect(nudge.length).toBe(1);
+    expect(nudge[0].type).toBe("remind");
+    expect(JSON.stringify(nudge)).toContain("[planner 提醒]");
+
+    const close = heuristicPlan(stall, {
+      ...ctx,
+      nudgeAvailable: () => false,
+      nudgeExhausted: () => true,
+    });
+    expect(close).toEqual([
+      { type: "retire", attempt: 1, reason: "stalled after planner nudge quota" },
+    ]);
+    expect(
+      heuristicPlan(
+        { ...stall, attempt: 0 },
+        {
+          ...ctx,
+          nudgeAvailable: () => false,
+          nudgeExhausted: () => true,
+        },
+      ),
+    ).toEqual([{ type: "retire", attempt: 0, reason: "stalled after planner nudge quota" }]);
+    // 额度未耗尽但冷却中 → 不提醒也不关闭
+    expect(
+      heuristicPlan(stall, {
+        ...ctx,
+        nudgeAvailable: () => false,
+        nudgeExhausted: () => false,
+      }),
+    ).toEqual([]);
+  });
+
+  it("预算/护栏拒绝 spawn → 不动作；Attempt 0 不 retire", () => {
+    expect(heuristicPlan(base, { ...ctx, canSpawn: () => false })).toEqual([]);
+    expect(heuristicPlan({ ...base, attempt: 0 }, ctx)).toEqual([
+      {
+        type: "spawn",
+        source: 0,
+        direction: "动态 trace",
+        scopeId: 1,
+        reason: "planner backtrack from checkpoint (no failed tail copied)",
+      },
+    ]);
+  });
+});

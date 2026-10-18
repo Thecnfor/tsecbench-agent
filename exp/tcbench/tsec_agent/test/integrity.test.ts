@@ -1,18 +1,16 @@
-/** 对话完整性套件：常规/fork/旁观者三模式下「无无用重复对话信息」。
+/** 对话完整性套件：常规/fork 两模式下「无无用重复对话信息」。
  *
  * 覆盖维度（arena 事故后补强）：
  * 1. 常规：首段恰一次 system+task card；续段（messages 传递）不重写；真失败重启
  *    的多 system 是有意设计（rebuild 从最后一次 system 起）且 rebuild 只取末段；
- * 2. fork：fork_directive/log/broadcast 注入/flag 各恰一条；续段（messages+branches
+ * 2. fork：fork_directive/log/flag 各恰一条；续段（messages+branches
  *    传递）不新增；rebuild（trunk+分支）与内存 messages 无双份；
- * 3. 旁观者：插嘴在 messages 与 conv 各恰一条；续段不重复；冷却限频不二次注入；
- * 4. 通用：conv 中 (kind, branch, content) 三元组无重复（note/error 语义性重复除外）。 */
+ * 3. 通用：conv 中 (kind, branch, content) 三元组无重复（note/error 语义性重复除外）。 */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { solveTask } from "../src/agent.js";
-import { BYSTANDER_SYSTEM } from "../src/bystander.js";
 import { CFG } from "../src/config.js";
 import { readCorelog } from "../src/corelog.js";
 import { initRecords, rec, resetRecords, setRecordsDir } from "../src/records.js";
@@ -46,7 +44,7 @@ function tc(id: string, name: string, args: Record<string, unknown>) {
 /** 按 (分支, 本分支已有工具轮数) 状态机派发的脚本 client。 */
 function makeClient(
   script: Array<{
-    when: (m: ChatMessage[], branch: string, ownTools: number, bySeen: boolean) => boolean;
+    when: (m: ChatMessage[], branch: string, ownTools: number) => boolean;
     respond: () => {
       content?: string | null;
       tool_calls?: Array<{
@@ -61,19 +59,12 @@ function makeClient(
   const client: LlmClient = {
     async create(opts) {
       const msgs = opts.messages;
-      const sys = String(msgs.find((m) => m.role === "system")?.content ?? "");
-      if (sys === BYSTANDER_SYSTEM) {
-        return {
-          choices: [{ message: { role: "assistant", content: "换抽象层审计 JS 源码。" } }],
-        };
-      }
       const dir = msgs.find((m) => String(m.content ?? "").startsWith("【分支"));
       const branch = dir ? `b${/【分支 (\d+)/.exec(String(dir.content))?.[1]}` : "trunk";
       const from = dir ? msgs.indexOf(dir) : 0;
       const ownTools = msgs.slice(from).filter((m) => m.role === "tool").length;
-      const bySeen = msgs.some((m) => String(m.content ?? "").startsWith("[旁观者提示]"));
       for (const s of script) {
-        if (s.when(msgs, branch, ownTools, bySeen)) {
+        if (s.when(msgs, branch, ownTools)) {
           const r = s.respond();
           return { choices: [{ message: { role: "assistant", ...r } }] };
         }
@@ -142,7 +133,7 @@ describe("常规模式完整性", () => {
     const recs = convOf("t-i1");
     expect(count(recs, (r) => r.kind === "system")).toBe(1);
     expect(count(recs, (r) => r.kind === "user" && r.content === "任务卡")).toBe(1);
-    // 无 fork/旁观者时不应出现任何 branch>0 或特殊注入记录
+    // 无 fork/planner时不应出现任何 branch>0 或特殊注入记录
     expect(count(recs, (r) => (r.branch ?? 0) !== 0)).toBe(0);
     expect(count(recs, (r) => r.kind_note !== undefined)).toBe(0);
     assertNoDuplicateContent(recs);
@@ -175,7 +166,7 @@ describe("常规模式完整性", () => {
 });
 
 describe("fork 模式完整性", () => {
-  it("fork/log/broadcast/flag 各恰一条；续段与 rebuild 无双份", async () => {
+  it("fork/log/flag 各恰一条；续段与 rebuild 无双份", async () => {
     CFG.fork_enabled = true;
     const conv = rec().conversation("t-i3");
     const client = makeClient([
@@ -198,12 +189,12 @@ describe("fork 模式完整性", () => {
           ],
         }),
       },
-      // trunk t2：broadcast 给 b1
+      // trunk t2：log 给 planner/黑板
       {
         when: (_m, br, own) => br === "trunk" && own === 1,
         respond: () => ({
           content: null,
-          tool_calls: [tc("b1c", "broadcast", { note: "redis 拿到 idx1", to: [1] })],
+          tool_calls: [tc("b1c", "log", { note: "redis 拿到 idx1" })],
         }),
       },
       // b1 t2 / trunk t3：park
@@ -219,18 +210,18 @@ describe("fork 模式完整性", () => {
     // 精确计数：每类恰一条
     expect(count(recs, (r) => r.kind_note === "fork_directive")).toBe(1);
     expect(count(recs, (r) => r.kind === "system")).toBe(1);
-    expect(count(recs, (r) => r.kind === "tool" && r.tool === "log")).toBe(1);
-    expect(count(recs, (r) => r.kind === "tool" && r.tool === "broadcast")).toBe(1);
-    expect(count(recs, (r) => r.kind_note === "broadcast")).toBe(1); // 注入 b1 恰一条
+    expect(count(recs, (r) => r.kind === "tool" && r.tool === "log")).toBe(2);
+    expect(count(recs, (r) => r.kind === "tool" && r.tool === "broadcast")).toBe(0);
+    expect(count(recs, (r) => r.kind_note === "broadcast")).toBe(0);
     expect(
       count(readCorelog(path.join(recdir, "tasks", "t-i3", "log.jsonl")), (e) => e.kind === "flag"),
     ).toBe(1);
     assertNoDuplicateContent(recs);
 
-    // 内存 messages 的注入消息也恰一条（conv 与 messages 一致，不双份）
+    // 内存 messages：分支 directive 恰一条，无 broadcast 注入
     const b1Msgs = r1.branches[0].messages;
-    expect(b1Msgs.filter((m) => String(m.content ?? "").includes("[分支 0 广播]")).length).toBe(1);
     expect(b1Msgs.filter((m) => String(m.content ?? "").startsWith("【分支 1")).length).toBe(1);
+    expect(b1Msgs.some((m) => String(m.content ?? "").includes("[分支 0 广播]"))).toBe(false);
 
     // 续段：messages+branches 传递再跑一轮 → conv 不新增 system/directive/广播
     CFG.task_max_turns = 3;
@@ -244,7 +235,7 @@ describe("fork 模式完整性", () => {
     recs = convOf("t-i3");
     expect(count(recs, (r) => r.kind === "system")).toBe(1);
     expect(count(recs, (r) => r.kind_note === "fork_directive")).toBe(1);
-    expect(count(recs, (r) => r.kind_note === "broadcast")).toBe(1);
+    expect(count(recs, (r) => r.kind_note === "broadcast")).toBe(0);
     void r2;
 
     // rebuild（续跑场景）与内存 messages 等价：trunk 无分支记录、分支 directive 恰一条
@@ -257,7 +248,7 @@ describe("fork 模式完整性", () => {
     ).toBe(1);
     expect(
       brs[0].messages.filter((m) => String(m.content ?? "").includes("[分支 0 广播]")).length,
-    ).toBe(1);
+    ).toBe(0);
     // 分支上下文里父分支快照的 system 仍恰一条
     expect(brs[0].messages.filter((m) => m.role === "system").length).toBe(1);
   });
@@ -268,9 +259,7 @@ describe("log 轮级轻推（执行层兜底）", () => {
   function shellOnlyClient() {
     let n = 0;
     const client: LlmClient = {
-      async create(opts) {
-        const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
-        if (sys === BYSTANDER_SYSTEM) throw new Error("旁观者不该被触发（stall 阈值已放大）");
+      async create() {
         n++;
         return {
           choices: [
@@ -289,7 +278,7 @@ describe("log 轮级轻推（执行层兜底）", () => {
   }
 
   it("连续 3 轮无 log → 第 4/8 轮注入提醒，每段恰 2 次", async () => {
-    CFG.bystander_enabled = true; // multiOn（log 工具在场）但旁观者不触发
+    CFG.fork_enabled = true; // log 工具在场；stall 阈值放大，planner 不触发
     CFG.stall_short_sec = 99999; // 放大全部时间信号，专注测轮级轻推
     const conv = rec().conversation("t-n1");
     const { client } = shellOnlyClient();
@@ -309,17 +298,12 @@ describe("log 轮级轻推（执行层兜底）", () => {
   });
 
   it("该轮 log 清零 → 重新累计；多模态外常规模式绝不注入", async () => {
-    CFG.bystander_enabled = true;
+    CFG.fork_enabled = true;
     CFG.stall_short_sec = 99999;
     const conv = rec().conversation("t-n2");
     let n = 0;
     const client: LlmClient = {
-      async create(opts) {
-        if (
-          String(opts.messages.find((m) => m.role === "system")?.content ?? "") === BYSTANDER_SYSTEM
-        ) {
-          throw new Error("旁观者不该触发");
-        }
+      async create() {
         n++;
         // 轮 2 调 log（应把轮计数清零 → 提醒从轮 2 后重新数 3 轮 → 第 5 轮注入）
         const tcs =
@@ -343,7 +327,6 @@ describe("log 轮级轻推（执行层兜底）", () => {
     // 常规模式（multiOn 关）：跑 8 轮绝不注入（无 log 工具，注入会诱导 unknown tool）
     Object.assign(CFG, SNAP);
     CFG.model = "deepseek-flash";
-    CFG.bystander_enabled = false;
     CFG.fork_enabled = false;
     CFG.task_max_turns = 8;
     const conv2 = rec().conversation("t-n3");
@@ -353,77 +336,5 @@ describe("log 轮级轻推（执行层兜底）", () => {
     expect(
       recs2.filter((r) => r.kind === "tool" && String(r.result ?? "").includes("[系统提醒")).length,
     ).toBe(0);
-  });
-});
-
-describe("旁观者模式完整性", () => {
-  it("插嘴 messages/conv 各恰一条；续段不重复；冷却内不二次注入", async () => {
-    CFG.bystander_enabled = true;
-    CFG.stall_short_sec = 0; // 停滞信号恒成立
-    const conv = rec().conversation("t-i4");
-    let n = 0;
-    const client: LlmClient = {
-      async create(opts) {
-        const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
-        if (sys === BYSTANDER_SYSTEM) {
-          // 轻调用关思考（省 completion：thinking 实测占成本大头）
-          expect((opts.thinking as { type: string } | undefined)?.type).toBe("disabled");
-          return {
-            choices: [{ message: { role: "assistant", content: "换抽象层审计 JS。" } }],
-          };
-        }
-        n++;
-        // 重复命令维持 repeat 信号（第 3 次后凑齐二信号触发旁观者）
-        return {
-          choices: [
-            {
-              message: {
-                role: "assistant",
-                content: null,
-                tool_calls: [tc(`s${n}`, "shell", { command: "echo looping" })],
-              },
-            },
-          ],
-        };
-      },
-    };
-    // 段1：max_turns=4（前 3 轮重复命令 → 第 4 轮前触发注入 → 第 4 轮仍重复）
-    CFG.task_max_turns = 4;
-    const r1 = await solveTask(client, "t-i4", "卡", 600, conv, { taskClass: "short" });
-    expect(
-      r1.messages.filter((m) => String(m.content ?? "").startsWith("[旁观者提示]")).length,
-    ).toBe(1);
-    let recs = convOf("t-i4");
-    expect(count(recs, (r) => r.kind_note === "bystander")).toBe(1);
-    expect(
-      count(
-        readCorelog(path.join(recdir, "tasks", "t-i4", "log.jsonl")),
-        (e) => e.kind === "bystander",
-      ),
-    ).toBe(1);
-    assertNoDuplicateContent(recs);
-
-    // 续段：messages 传递再跑 3 轮——冷却（400s）远超测试时长 → 不得二次注入
-    const nBefore = n;
-    CFG.task_max_turns = 3;
-    const r2 = await solveTask(client, "t-i4", "卡", 600, conv, {
-      messages: r1.messages,
-      startTurn: r1.turnsUsed,
-      taskClass: "short",
-    });
-    expect(n).toBe(nBefore + 3); // 恰 3 次主对话调用，无额外旁观者调用
-    expect(
-      r2.messages.filter((m) => String(m.content ?? "").startsWith("[旁观者提示]")).length,
-    ).toBe(1);
-    recs = convOf("t-i4");
-    expect(count(recs, (r) => r.kind_note === "bystander")).toBe(1); // conv 不新增
-    expect(count(recs, (r) => r.kind === "system")).toBe(1);
-    assertNoDuplicateContent(recs);
-
-    // rebuild 后插嘴也恰一条（续跑不双份）
-    const rebuilt = rec().loadMessages("t-i4");
-    expect(rebuilt.filter((m) => String(m.content ?? "").startsWith("[旁观者提示]")).length).toBe(
-      1,
-    );
   });
 });

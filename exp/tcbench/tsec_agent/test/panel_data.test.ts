@@ -198,6 +198,8 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
         kind: "user",
         branch: 1,
         kind_note: "fork_directive",
+        parent_branch: 0,
+        scope_id: 1,
         fork_label: "redis 方向",
         content: "【分支 1】",
       },
@@ -214,6 +216,10 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
     ]);
     const v = taskLiveView(runs, "t-01");
     expect(v.branches).toEqual(["1: redis 方向（已回收）"]);
+    expect(v.attempts.map((a) => [a.id, a.parent, a.depth, a.status])).toEqual([
+      [0, null, 0, "active"],
+      [1, 0, 1, "pruned"],
+    ]);
     expect(v.log_tail.some((s) => s.includes("发现注入点"))).toBe(true);
     // 无 fork 的题：空名册不炸
     fs.mkdirSync(path.join(runs, "tasks", "t-02"), { recursive: true });
@@ -222,6 +228,7 @@ describe("taskLiveView（fork 分支名册 + corelog 尾部）", () => {
     ]);
     const v2 = taskLiveView(runs, "t-02");
     expect(v2.branches).toEqual([]);
+    expect(v2.attempts).toEqual([]);
     expect(v2.log_tail).toEqual([]);
   });
 });

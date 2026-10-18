@@ -32,7 +32,7 @@ docker/work/                  # 遗留目录，当前 run.sh 已不用
 ```bash
 pnpm install          # 首次
 pnpm build            # 构建 agent（dist/agent.js、dist/panel-server.js）+ 面板（dist/panel/）
-pnpm test             # 离线自测（50 个用例，不依赖 VPN/网关/平台）
+pnpm test             # 离线自测（183 个用例，不依赖 VPN/网关/平台）
 pnpm check            # 提交前自查：tsc --noEmit + biome check + pnpm test
 pnpm typecheck        # 仅类型检查
 pnpm lint             # biome 检查（配置 biome.jsonc）
@@ -72,12 +72,18 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | 文件 | 职责 |
 | --- | --- |
 | `agent.ts` | 控制器主循环：选题 → start → 单题独立上下文解题 → 校验 → close；并行调度、分段解题、VPN 守卫、平台终态收敛、`--smoke` |
-| `shell.ts` | 异步 shell：Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（PIL 压图；网关拒图降级为元数据文本） |
+| `shell.ts` | 异步 shell：每题独立 `ShellManager`（跨题 job 隔离）、Job 生命周期、进程组 kill、输出截断与分页、`wait_sec` 边沿等待、`out_file` 落盘、job 上限、`view` 多模态读图（PIL 压图；网关拒图降级为元数据文本） |
 | `shell_tool.ts` | shell 工具 schema、参数容错修复（`parseToolArguments`）、动作路由；出口拦截 `curl …challenges/submit`（提交只走 `submit_flag`） |
 | `submit_flag.ts` | `submit_flag` toolcall（唯一提交通道，unique_code 由 controller 填防跨题）：平台响应→账本/flag 时钟/黑板 卡（duplicate 的 index 也补账，响应计数滞后时以账本为下界）；单 flag 收尾总结指示（多 flag 压缩是系统自动的，与 flag 无关） |
 | `llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换（匿名优先，标签只带尾 4 位掩码） |
 | `bench.ts` | 平台 API 客户端（fetch/start/close/选题策略/名额释放），错误码分类（含 `TaskFinishedError` 终态）；submit 按 unique_code 串行（平台计数非并发安全） |
 | `records.ts` | bench 级持久化：`meta.json`/`events.jsonl`/`tasks.jsonl`/`tasks/<code>/conversation.jsonl`；`rebuildMessages` 续跑重建（压缩锚：头 ∪ 最后一条 `context_compact` 交接文档 ∪ 锚后过程） |
+| `branch.ts` | Attempt/Scope 执行面：状态/护栏/轮转/广播（对等、无特权主分支）/report 结果卡/`spawnFromCheckpoint` 回溯 |
+| `branch_tools.ts` | fork/report/log/state_change 四工具 schema 与分发；fork 两阶段（reserve→轮末 materialize），report 收尾 + 结果卡，log 同时送 planner |
+| `stall.ts` | 卡塞信号（flag 主时钟 + 四信号任二）+ planner 提醒模板；controller 事件化后交给 planner |
+| `artifacts.ts` | shell 后新文件的有界扫描 + sha256；跨 Attempt/跨段产物去重提示；共享写命令启发式提醒 |
+| `planner.ts` | 唯一统筹者：消费 report/stall/log 事件，启发式决定提醒/回收/checkpoint spawn；不跑 shell、不改 messages |
+| `planner_state.ts` | `tasks/<code>/planner.json`：scopes/attempts/findings/mutations/recovery 结构化快照 |
 | `config.ts` | 全部配置与默认值（环境变量 + 项目根 `.env`）、local/hosted 模式检测、转写规则 `toGatewayUrl` |
 | `prompt.ts` | 单题 system prompt、任务卡模板、续跑/拉回/复盘通知 |
 | `panel/` | `data.ts` 记录读取与统计（含历史归档基线预测）；`server.ts` Node 面板服务；`web/` React 面板 |
@@ -105,6 +111,12 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `AGENT_COMPACT_TOKENS` | 上下文压缩兜底阈值（**token 实测**：上一次 LLM 调用 usage.prompt_tokens；主触发器是「找到 flag」回合末强制压缩；交接文档：凭据原值/产物与在途/死路/进度；0=只留 flag 触发） | 500000 |
 | `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
+| `AGENT_FORK` | fork 多 Attempt 与协作工具（fork/report/log/state_change） | 1 |
+| `AGENT_PLANNER` | planner 统筹（fork 开启时生效；0=关闭自动提醒/spawn） | 1 |
+| `AGENT_BRANCH_CONCURRENCY` | 同时推进的 Attempt turn 数（1=旧单飞；2–4=真并发） | 2 |
+| `AGENT_SHELL_MAX_JOBS_PER_BRANCH` | 每个 Attempt 的后台 job 上限（每题 `AGENT_SHELL_MAX_JOBS` 仍为 8） | 4 |
+| `AGENT_PLANNER_NUDGE_MAX` | 每段每 Attempt 的 planner 提醒上限 | 2 |
+| `AGENT_PLANNER_NUDGE_COOLDOWN_SEC` | planner 提醒冷却（秒） | 400 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |
 | `VPN_GUARD` | VPN 运行时守卫：`auto`（hosted 开/local 关）/1/0 | `auto` |
 | `PANEL_PORT` | 面板端口 | 8791 |
@@ -113,6 +125,6 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 
 ## 不变量（改代码前必读 `../AGENTS.md`）
 
-- 单工具设计（只有 `shell`）、shell 异步边沿等待、每题独立上下文 + 分段解题、
+- 单工具设计（基础工具只有 `shell`；fork 模式增加 `fork/report/log/state_change`）、shell 异步边沿等待、每题独立上下文 + 分段解题、
   对话忠实落盘不裁剪、平台终态立即停止、VPN 只在容器内跑、预检是硬门槛。
 - `--smoke` 与 `pnpm test` 是每次改动后的必跑检查。

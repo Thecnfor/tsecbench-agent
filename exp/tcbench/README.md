@@ -237,16 +237,16 @@ newgrp docker -c "docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
 | `AGENT_SHELL_WAIT_MS` | shell 快速同步窗口 | `1500` |
 | `AGENT_SHELL_HARD_SEC` | 后台命令硬上限秒（到点整组 kill，输出已落盘；0=永不杀） | `1800` |
 | `AGENT_SHELL_MAX_OUTPUT` | 单条工具结果进上下文字符上限（截头留尾+日志路径指针；历史实测 tool.result 是膨胀与 thinking 成本第二大源头） | `8192` |
-| `AGENT_SHELL_MAX_JOBS` | 同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
-| `AGENT_FORK` | fork 多分支（`1`/`on` 开：分支工具 fork/log/broadcast + 交错轮转；缓存实测交错零代价） | `0` |
-| `AGENT_BYSTANDER` | 旁观者（`1`/`on` 开：卡塞组合信号触发独立短上下文插嘴；可单独于 fork 开） | `0` |
-| `AGENT_MAX_BRANCHES` | 活跃分支上限（含 trunk） | `3` |
-| `AGENT_FORK_MAX` | 每题 fork 总数硬上限（含分支再分叉） | `5` |
+| `AGENT_SHELL_MAX_JOBS` | 每题同时在跑的后台 job 上限（满了拒绝新 `run`） | `8` |
+| `AGENT_FORK` | fork 多 Attempt（`1`/`on` 开：fork/report/log/state_change + planner 统筹/并发 turn；0=单线） | `1` |
+| `AGENT_MAX_BRANCHES` | 活跃 Attempt 上限（含初始 Attempt 0） | `3` |
+| `AGENT_FORK_MAX` | 每题 fork/spawn 总数硬上限 | `5` |
 | `AGENT_FORK_COOLDOWN_SEC` | fork 冷却秒 | `180` |
-| `AGENT_BRANCH_PRUNE_SEC` | 分支 黑板/flag 双停滞剪枝阈值秒（B 方案：给长题分支留旁观者 900s 触发后的救治窗，救不活 1200s 才剪） | `1200` |
-| `AGENT_BROADCAST_MAX` | 每段每分支广播上限 | `8` |
-| `AGENT_BYSTANDER_MAX` | 每段每分支旁观者注入上限 | `2` |
-| `AGENT_BYSTANDER_COOLDOWN_SEC` | 旁观者冷却秒 | `400` |
+| `AGENT_BRANCH_PRUNE_SEC` | Attempt 黑板/flag 双停滞回收阈值秒（planner 提醒窗口后） | `1200` |
+| `AGENT_PLANNER` | planner 统筹（默认开；0=关闭自动提醒/spawn） | `1` |
+| `AGENT_BRANCH_CONCURRENCY` | 同时推进的 Attempt turn 数（1=单飞；2–4=真并发） | `2` |
+| `AGENT_PLANNER_NUDGE_MAX` / `AGENT_PLANNER_NUDGE_COOLDOWN_SEC` | planner 卡塞提醒每段每 Attempt 上限 / 冷却秒 | `2` / `400` |
+| `AGENT_SHELL_MAX_JOBS_PER_BRANCH` | 每 Attempt 后台 job 上限（每题仍 8） | `4` |
 | `AGENT_REASONING_EFFORT_SHORT` | 短题思考档位（`low`/`medium`/`high`；空=不发=模型默认档，空即关特性） | `low` |
 | `AGENT_REASONING_EFFORT_LONG` | 长题思考档位（空=不发=模型默认档，不降质） | ``（空） |
 | `AGENT_CORE_LOG_NUDGE_ROUNDS` / `AGENT_CORE_LOG_NUDGE_MAX` | log 轮级轻推：连续 N 轮无记录提醒 / 每段每分支上限 | `3` / `2` |
@@ -281,11 +281,12 @@ docker/runs/<TOKEN>/                  # 唯一键 = token（无时间戳；同 t
      │    trunk / `rebuildBranches` 分支——分支按 fork_seq 截断父快照）
      │    **通关后同上下文追加复盘总结**
      │    （思路/工具困难/优化建议，assistant 条目带 kind_note:"closing_summary"）
-     ├── log.jsonl                # fork/旁观者核心日志（AGENT_FORK/AGENT_BYSTANDER 开时）：
-     │    {ts,seq,branch,kind,note?}，kind ∈ core|broadcast|bystander|flag|prune|fork；
+     ├── log.jsonl                # 共享黑板/事件流：
+     │    {ts,seq,branch,kind,note?}，kind ∈ core|planner|flag|prune|fork|result|mutation|artifact；
      │    **flag 事件以 matched_flag_index 为稳定 ID**（flag 内容随靶机重启变、索引不变，
-     │    续跑按 index 对账「还差 idx 2,4」）；旁观者输入按分支分组读此文件
-     ├── branches/<N>/                # fork 分支命名空间（分支专属 cwd，shell 默认写这里；
+     │    续跑按 index 对账「还差 idx 2,4」）；planner 读 result/mutation/prune/log 事件
+     ├── planner.json             # planner 结构化快照：scopes/attempts/findings/mutations/recovery
+     ├── branches/<N>/                # Attempt 命名空间（专属 cwd，shell 默认写这里；
      │                                #  读任意路径允许，写只写自己目录——提示词约定）
      └── <AI 解题产物>
 ```

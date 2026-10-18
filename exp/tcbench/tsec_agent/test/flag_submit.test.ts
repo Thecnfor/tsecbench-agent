@@ -353,6 +353,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
     "④进度：后台已登录待枚举 ⑤flag 进度 0/2";
 
   it("多 flag：找到 flag 即压缩交接（主触发，阈值不参与）+ 最后 flag 响应即收束", async () => {
+    CFG.fork_enabled = true; // 压缩/黑板记录挂在 fork 基础设施上
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact_"));
     setRecordsDir(recdir);
     resetRecords();
@@ -482,6 +483,7 @@ describe("上下文压缩：通用交接文档（solveTask 集成）", () => {
   });
 
   it("阈值兜底：无 flag 也压（长 shell 越线）；自动黑板把进展叙述落卡", async () => {
+    CFG.fork_enabled = true;
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "compact3_"));
     setRecordsDir(recdir);
     resetRecords();

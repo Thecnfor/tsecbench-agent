@@ -1,13 +1,13 @@
 /** 黑板日志 log.jsonl（曾用名 corelog.jsonl，2026-10-17 更名减负）：
- *  分支抽象层——旁观者、面板与剪枝摘要的唯一读取源。
+ *  分支抽象层——planner、面板与剪枝摘要的唯一读取源。
  *
- * 设计契约见 ../docs/fork-bystander-design.md §1（flag 事件）/§5（旁观者读取）/§6（记录）。
- * - 写入方：log 工具（kind=core）、broadcast 工具（kind=broadcast）、旁观者注入
- *   （kind=bystander）、flag 事件（kind=flag，controller 以 matched_flag_index / watcher
+ * 设计契约见 ../docs/fork-planner-design.md §1（flag 事件）/§5（planner/卡塞读取）/§6（记录）。
+ * - 写入方：log 工具（kind=core）、planner 注入
+ *   （kind=planner）、flag 事件（kind=flag，controller 以 matched_flag_index / watcher
  *   快照为权威自动记，不依赖模型自述）。
  * - flag 稳定 ID = matched_flag_index：flag 内容随靶机重启变，索引（1..total_flag_count）不变，
  *   重启续跑按 index 对账「还差哪几个」。
- * - 读取方：旁观者输入按分支分组（交错写入没问题，读取侧分组解决可读性）。
+ * - 读取方：planner 按分支分组（交错写入没问题，读取侧分组解决可读性）。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -22,7 +22,16 @@ export function blackboardPath(tasksDir: string, code: string): string {
   return fs.existsSync(legacy) ? legacy : fresh;
 }
 
-export type CorelogKind = "core" | "broadcast" | "bystander" | "flag" | "prune" | "fork";
+export type CorelogKind =
+  | "core"
+  | "broadcast"
+  | "planner"
+  | "flag"
+  | "prune"
+  | "fork"
+  | "result"
+  | "mutation"
+  | "artifact";
 
 export interface CorelogEntry {
   ts: string;
@@ -34,7 +43,17 @@ export interface CorelogEntry {
   flag_index?: number | null; // flag 稳定 ID（matched_flag_index；未知记 null）
   correct_flag_count?: number;
   total_flag_count?: number;
-  to?: number[]; // broadcast 目标分支
+  to?: number[]; // 旧 broadcast 记录兼容
+  status?: string; // result 卡状态（done/deadend/blocked）
+  mutation_id?: string;
+  action?: string;
+  recovery?: string;
+  scope_id?: number;
+  mutation_status?: "pending" | "recovered";
+  artifact_hash?: string;
+  artifact_path?: string;
+  artifact_size?: number;
+  shared?: boolean;
   [k: string]: unknown;
 }
 
@@ -89,9 +108,9 @@ export function readCorelog(file: string): CorelogEntry[] {
   return out;
 }
 
-/** 旁观者输入：按分支分组（各分支内保持时序），交错写入在这里被还原成可读结构。
+/** 黑板视图：按 Attempt 分组（各 Attempt 内保持时序），交错写入在这里被还原成可读结构。
  * 返回 markdown 片段。flag 进度用索引账本 `2/5 (idx:1,3)` 表示。 */
-export function buildBystanderLogView(
+export function buildAttemptLogView(
   entries: CorelogEntry[],
   opts: { branches?: Map<number, string>; flagLedger?: FlagLedger; maxPerBranch?: number } = {},
 ): string {
@@ -106,7 +125,7 @@ export function buildBystanderLogView(
   const ids = [...byBranch.keys()].sort((a, b) => a - b);
   for (const id of ids) {
     const label = opts.branches?.get(id);
-    const head = id === 0 ? "主分支" : `分支 ${id}`;
+    const head = id === 0 ? "Attempt 0（初始）" : `Attempt ${id}`;
     lines.push(`### ${head}${label ? `（${label}）` : ""}`);
     for (const e of byBranch.get(id)!.slice(-maxPer)) {
       lines.push(formatEntry(e));
@@ -125,9 +144,13 @@ function formatEntry(e: CorelogEntry): string {
   if (e.kind === "broadcast") {
     return `- ${t} [广播→${(e.to ?? []).join(",") || "?"}] ${e.note ?? ""}`;
   }
-  if (e.kind === "bystander") return `- ${t} [旁观者] ${e.note ?? ""}`;
+  if (e.kind === "planner") return `- ${t} [planner] ${e.note ?? ""}`;
   if (e.kind === "prune") return `- ${t} [已回收] ${e.note ?? ""}`;
   if (e.kind === "fork") return `- ${t} [fork] ${e.note ?? ""}`;
+  if (e.kind === "result") return `- ${t} [结果卡·${e.status ?? "?"}] ${e.note ?? ""}`;
+  if (e.kind === "mutation")
+    return `- ${t} [共享写·${e.mutation_status ?? "?"}] ${e.action ?? e.note ?? ""}`;
+  if (e.kind === "artifact") return `- ${t} [产物] ${e.artifact_path ?? e.note ?? ""}`;
   return `- ${t} ${e.note ?? ""}`;
 }
 
@@ -171,4 +194,34 @@ export class FlagLedger {
 export function extractFlagIndex(text: string): number | null {
   const m = /"matched_flag_index"\s*:\s*(\d+)/.exec(text);
   return m ? Number(m[1]) : null;
+}
+
+export interface MutationRecord {
+  id: string;
+  action: string;
+  recovery: string;
+  scopeId: number;
+  branch: number;
+  shared: boolean;
+  status: "pending" | "recovered";
+}
+
+/** 从 log.jsonl 提取每个 mutation_id 的最新状态；pending = 重启后待恢复的共享写。 */
+export function pendingMutations(entries: CorelogEntry[]): MutationRecord[] {
+  const latest = new Map<string, MutationRecord>();
+  for (const e of entries) {
+    if (e.kind !== "mutation") continue;
+    const id = String(e.mutation_id ?? "");
+    if (!id) continue;
+    latest.set(id, {
+      id,
+      action: String(e.action ?? e.note ?? ""),
+      recovery: String(e.recovery ?? ""),
+      scopeId: Number(e.scope_id ?? 0),
+      branch: Number(e.branch ?? 0),
+      shared: e.shared !== false,
+      status: e.mutation_status === "recovered" ? "recovered" : "pending",
+    });
+  }
+  return [...latest.values()].filter((m) => m.shared && m.status === "pending");
 }

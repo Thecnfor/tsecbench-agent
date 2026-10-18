@@ -277,25 +277,37 @@ export function loadRecentEvents(runsDir: string, n = 6): any[] {
   return readJsonlTail(path.join(runsDir, "events.jsonl"), n).reverse();
 }
 
+export interface LiveAttempt {
+  id: number;
+  parent: number | null;
+  scopeId: number;
+  label: string;
+  status: string;
+  depth: number;
+}
+
 export interface LiveView {
   last_output: string;
   last_thinking: string;
   running_cmds: string[];
   last_cmd: string;
-  branches: string[]; // fork 分支名册（"1: 方向…"；含已回收标记）
-  log_tail: string[]; // 核心日志尾部（旁观者视角缩略）
+  branches: string[]; // 兼容旧字段：扁平名册
+  attempts: LiveAttempt[]; // 有 parent/scope 的 Attempt 树
+  log_tail: string[]; // 核心日志尾部（planner视角缩略）
 }
 
 /** 单题对话的实时视角：最近模型输出 + 进行中/最近的 shell 调用 + fork 分支名册。 */
 export function taskLiveView(runsDir: string, code: string): LiveView {
   const convPath = path.join(runsDir, "tasks", code, "conversation.jsonl");
   const msgs = readJsonlTail(convPath, 60) as ConvRecord[];
+  const allMsgs = readJsonlTail(convPath, 2000) as ConvRecord[];
   const view: LiveView = {
     last_output: "",
     last_thinking: "",
     running_cmds: [],
     last_cmd: "",
     branches: [],
+    attempts: [],
     log_tail: [],
   };
   const pending: string[] = []; // 已发出、未回结果的 tool_call
@@ -344,21 +356,64 @@ export function taskLiveView(runsDir: string, code: string): LiveView {
   }
   view.running_cmds = pending.slice(0, 4);
   view.last_cmd = finished.length ? finished[finished.length - 1] : "";
-  // fork 分支名册（conversation 的 fork_directive + corelog 的 prune）+ 核心日志尾部
+  // Attempt 树：fork_directive + corelog result/prune 状态
   try {
+    const logEntries = readJsonlTail(
+      blackboardPath(path.join(runsDir, "tasks"), code),
+      300,
+    ) as any[];
     const pruned = new Set<number>();
-    for (const r of readJsonlTail(blackboardPath(path.join(runsDir, "tasks"), code), 200)) {
-      if ((r as any).kind === "prune") pruned.add(Number((r as any).branch));
+    const statusById = new Map<number, string>();
+    for (const e of logEntries) {
+      const id = Number(e.branch);
+      if (e.kind === "prune") pruned.add(id);
+      if (e.kind === "result" && e.status) statusById.set(id, String(e.status));
     }
-    for (const r of msgs) {
+    const byId = new Map<number, LiveAttempt>();
+    byId.set(0, {
+      id: 0,
+      parent: null,
+      scopeId: 0,
+      label: "initial",
+      status: "active",
+      depth: 0,
+    });
+    for (const r of allMsgs) {
       if (r.kind === "user" && r.kind_note === "fork_directive") {
         const id = Number(r.branch ?? 0);
-        view.branches.push(
-          `${id}: ${String(r.fork_label ?? "").slice(0, 40)}${pruned.has(id) ? "（已回收）" : ""}`,
-        );
+        if (id <= 0) continue;
+        byId.set(id, {
+          id,
+          parent: typeof r.parent_branch === "number" ? r.parent_branch : null,
+          scopeId: typeof r.scope_id === "number" ? r.scope_id : id,
+          label: String(r.fork_label ?? "").slice(0, 60),
+          status: pruned.has(id) ? "pruned" : (statusById.get(id) ?? "active"),
+          depth: 0,
+        });
       }
     }
-    const corelog = readJsonlTail(blackboardPath(path.join(runsDir, "tasks"), code), 6) as any[];
+    // 深度：沿 parent 链最多 8 层，防环
+    for (const a of byId.values()) {
+      let depth = 0;
+      let p = a.parent;
+      const seen = new Set<number>([a.id]);
+      while (p !== null && depth < 8 && !seen.has(p)) {
+        seen.add(p);
+        depth++;
+        p = byId.get(p)?.parent ?? null;
+      }
+      a.depth = depth;
+    }
+    const attempts = [...byId.values()].sort((a, b) => a.id - b.id);
+    // 只有发生过 fork 才展示树；单 Attempt 不占面板
+    view.attempts = attempts.length > 1 ? attempts : [];
+    for (const a of attempts) {
+      if (a.id === 0) continue;
+      const suffix =
+        a.status === "pruned" ? "（已回收）" : a.status === "active" ? "" : `（${a.status}）`;
+      view.branches.push(`${a.id}: ${a.label}${suffix}`);
+    }
+    const corelog = logEntries.slice(-6) as any[];
     view.log_tail = corelog
       .reverse()
       .map((e) => `b${e.branch} ${e.kind}${e.note ? `: ${String(e.note).slice(0, 60)}` : ""}`);

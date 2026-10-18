@@ -1,7 +1,7 @@
 /** shell 工具的 schema、参数容错与路由（dispatch）。 */
 
 import { attachPyLint } from "./py_lint.js";
-import { IMAGE_EXT, ShellManager } from "./shell.js";
+import { getTaskShell, IMAGE_EXT, ShellManager } from "./shell.js";
 import { isSubmitCurl } from "./submit_flag.js";
 import type { ContentPart } from "./types.js";
 
@@ -291,6 +291,7 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
   }
   // 与 Python tool_args.get("action","run") 一致：键存在且值为 null 时保持 null（由下面报 unknown action）
   const action = "action" in args ? (args.action as string) : "run";
+  const shell = getTaskShell() ?? SHELL;
   try {
     if (action === "run") {
       const command = args.command;
@@ -303,7 +304,7 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
           '防止脚本化批量提交）。调用 submit_flag({flag: "<从目标读出的原文>"})。'
         );
       }
-      const out = await SHELL.run({
+      const out = await shell.run({
         command: String(command),
         label: (args.label as string) ?? null,
         cwd: (args.cwd as string) ?? null,
@@ -318,7 +319,7 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
     if (action === "wait") {
       const jobId = args.job_id;
       if (!jobId) return "error: `job_id` is required for action=wait";
-      return await SHELL.wait(
+      return await shell.wait(
         String(jobId),
         toFloat(args.timeout_sec, 30.0) as number,
         toInt(args.offset),
@@ -327,24 +328,24 @@ export async function dispatchShell(toolArgs: Record<string, unknown>): Promise<
     }
     if (action === "wait_any") {
       const ids = args.job_ids ?? args.job_id;
-      return await SHELL.waitAny(ids, toFloat(args.timeout_sec, 60.0) as number, toInt(args.lines));
+      return await shell.waitAny(ids, toFloat(args.timeout_sec, 60.0) as number, toInt(args.lines));
     }
     if (action === "status") {
       const jobId = args.job_id;
       if (!jobId) return "error: `job_id` is required for action=status";
-      return SHELL.status(String(jobId), toInt(args.offset), toInt(args.lines));
+      return shell.status(String(jobId), toInt(args.offset), toInt(args.lines));
     }
     if (action === "kill") {
       const jobId = args.job_id;
       if (!jobId) return "error: `job_id` is required for action=kill";
-      return await SHELL.kill(String(jobId), toInt(args.lines));
+      return await shell.kill(String(jobId), toInt(args.lines));
     }
     if (action === "view" || action === "image") {
       const target = args.path ?? args.file ?? args.command;
       if (!target) return "error: `path` is required for action=view";
-      return SHELL.view(String(target), (args.detail as string) ?? null);
+      return shell.view(String(target), (args.detail as string) ?? null);
     }
-    if (action === "list") return SHELL.list();
+    if (action === "list") return shell.list();
     return (
       `error: unknown action ${JSON.stringify(action)}; 请用 ` +
       `{"action":"run","command":"<命令>"} 或 ` +

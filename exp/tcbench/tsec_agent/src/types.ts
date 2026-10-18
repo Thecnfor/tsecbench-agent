@@ -42,7 +42,7 @@ export interface LlmClient {
     tool_choice?: string;
     temperature?: number;
     max_tokens?: number;
-    /** DeepSeek 思考控制：轻调用（旁观者/复盘/冒烟）传 {type:"disabled"} 省 completion */
+    /** DeepSeek 思考控制：轻调用（planner/复盘/冒烟）传 {type:"disabled"} 省 completion */
     thinking?: { type: "disabled" } | { type: "enabled"; [k: string]: unknown };
     /** 思考档位（顶层字段 low|medium|high）：按题目分档（短题 low / 长题默认档） */
     reasoning_effort?: string;
@@ -70,7 +70,7 @@ export interface ConvRecord {
   seq: number;
   code: string;
   kind: "system" | "user" | "assistant" | "tool" | "note" | "error";
-  branch?: number; // fork 多分支：0=trunk（缺省视为 0，兼容旧记录）
+  branch?: number; // 多 Attempt：0=初始 Attempt（缺省视为 0，兼容旧记录）
   started_at: number;
   ended_at: number;
   duration_ms: number;

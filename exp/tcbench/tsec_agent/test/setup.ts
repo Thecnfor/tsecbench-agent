@@ -11,5 +11,7 @@ process.env.AGENT_TASKS_FILE = "";
 process.env.AGENT_MODE = "local"; // 离线自测不真实连接
 process.env.AGENT_PLATFORM_WATCH = "0"; // 离线：不开平台轮询
 process.env.VPN_GUARD = "0"; // 离线：不探测预检地址
+process.env.AGENT_FORK = "0"; // 单测默认单线；fork 用例自行打开
+process.env.AGENT_BRANCH_CONCURRENCY = "1";
 // 防 .env 里的转写形态触发 hosted 结构信号（置空 → bench_looks_hosted 取默认 URL）
 process.env.BENCHMARK_BASE_URL = "https://tsecbench.zc.tencent.com";

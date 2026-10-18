@@ -116,7 +116,7 @@ export class ConversationWriter {
  * tool_calls 但结果不齐」的半截对话——OpenAI 协议要求每个 tool_call 后紧跟同 id 的
  * tool 结果，否则 400。返回 [] 表示没有可用上下文。
  *
- * fork 分支感知：opts.branch 缺省 = trunk（只取 branch 0/缺省记录，与其他分支隔离）；
+ * fork 分支感知：opts.branch 缺省 = 初始 Attempt（只取 branch 0/缺省记录，与其他 Attempt 隔离）；
  * 分支重建用 rebuildBranches（递归复用本函数 + fork_seq 截断）。
  */
 export function rebuildMessages(
@@ -147,7 +147,7 @@ export function rebuildMessages(
   recs.forEach((r, i) => {
     if (r.kind === "system") startAt = i;
   });
-  // 分支记录只取自己的（branch 缺省视为 0/trunk）
+  // 记录只取自己的（branch 缺省视为 0/初始 Attempt）
   const filtered = recs.slice(startAt).filter((r) => (r.branch ?? 0) === branchId);
   // 多 flag 压缩锚（无压缩记录时原样）——与运行时压缩重写等价
   return recordsToMessages(applyCompactFilter(filtered, true));
@@ -227,7 +227,7 @@ function recordsToMessages(recs: ConvRecord[]): ChatMessage[] {
 /** fork 分支重建：分支 B 的上下文 = 父分支**截至 B.forkSeq 的快照** + B 自己的记录。
  *（fork 后父分支继续跑的轮次不得进入 B——seq 截断精确还原 materializeFork 的复制点；
  * 嵌套 fork 时 seqLimit 沿父链向上传递取更小者。）
- * 返回全部可恢复分支（trunk 用 rebuildMessages）。父分支无法重建 → 该分支直接丢弃
+ * 返回全部可恢复 Attempt（初始 Attempt 用 rebuildMessages）。父分支无法重建 → 该分支直接丢弃
  * （宁丢不发残缺上下文）。 */
 export function rebuildBranches(file: string): Array<{
   id: number;
@@ -235,6 +235,7 @@ export function rebuildBranches(file: string): Array<{
   forkSeq: number;
   label: string;
   messages: ChatMessage[];
+  checkpointMessages: ChatMessage[];
 }> {
   let lines: string[];
   try {
@@ -251,7 +252,10 @@ export function rebuildBranches(file: string): Array<{
     }
   }
   // fork 标记：directive user 记录（branch=新分支，kind_note=fork_directive）
-  const forks = new Map<number, { parent: number; forkSeq: number; label: string }>();
+  const forks = new Map<
+    number,
+    { parent: number; forkSeq: number; label: string; scopeId?: number }
+  >();
   for (const r of recs) {
     if (r.kind === "user" && r.kind_note === "fork_directive") {
       const id = r.branch ?? 0;
@@ -260,6 +264,7 @@ export function rebuildBranches(file: string): Array<{
           parent: r.parent_branch,
           forkSeq: r.fork_seq,
           label: String(r.fork_label ?? ""),
+          scopeId: typeof r.scope_id === "number" ? r.scope_id : undefined,
         });
       }
     }
@@ -296,12 +301,23 @@ export function rebuildBranches(file: string): Array<{
     parent: number | null;
     forkSeq: number;
     label: string;
+    scopeId?: number;
     messages: ChatMessage[];
+    checkpointMessages: ChatMessage[];
   }> = [];
   for (const [id, f] of forks) {
     const messages = build(id, Number.MAX_SAFE_INTEGER);
-    if (messages.length)
-      out.push({ id, parent: f.parent, forkSeq: f.forkSeq, label: f.label, messages });
+    if (messages.length) {
+      out.push({
+        id,
+        parent: f.parent,
+        forkSeq: f.forkSeq,
+        label: f.label,
+        scopeId: f.scopeId,
+        messages,
+        checkpointMessages: build(f.parent, f.forkSeq),
+      });
+    }
   }
   return out.sort((a, b) => a.id - b.id);
 }
@@ -435,7 +451,7 @@ export class RunRecords {
     return new ConversationWriter(file, code);
   }
 
-  /** 黑板 writer（fork/log/旁观者/flag 事件；见 corelog.ts） */
+  /** 黑板 writer（fork/log/planner/flag 事件；见 corelog.ts） */
   corelog(code: string): CorelogWriter {
     const file = blackboardPath(path.join(this.dir, "tasks"), code); // 旧 run 回退 corelog.jsonl
     return new CorelogWriter(file, code);
@@ -448,13 +464,7 @@ export class RunRecords {
   }
 
   /** 重建全部 fork 分支（暂停→恢复续跑用），见 rebuildBranches。 */
-  loadBranches(code: string): Array<{
-    id: number;
-    parent: number | null;
-    forkSeq: number;
-    label: string;
-    messages: ChatMessage[];
-  }> {
+  loadBranches(code: string): ReturnType<typeof rebuildBranches> {
     const file = path.join(this.dir, "tasks", code, "conversation.jsonl");
     return rebuildBranches(file);
   }
@@ -475,13 +485,7 @@ class Noop {
   loadMessages(_code: string): ChatMessage[] {
     return [];
   }
-  loadBranches(_code: string): Array<{
-    id: number;
-    parent: number | null;
-    forkSeq: number;
-    label: string;
-    messages: ChatMessage[];
-  }> {
+  loadBranches(_code: string): ReturnType<typeof rebuildBranches> {
     return [];
   }
 }

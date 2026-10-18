@@ -20,6 +20,10 @@ import { CFG } from "./config.js";
 
 // async 上下文"当前任务工作目录"：并行解题时每个任务有专属 cwd，互不干扰
 const cwdStore = new AsyncLocalStorage<string>();
+// async 上下文"当前 Attempt"：shell job 归属 Attempt，list/wait/kill 按 Attempt 隔离
+const branchStore = new AsyncLocalStorage<number>();
+// async 上下文"当前题目"：每道题一个 ShellManager，job 表/配额/寻址完全隔离
+const shellStore = new AsyncLocalStorage<ShellManager>();
 
 export function setTaskCwd(p: string): void {
   cwdStore.enterWith(p || "");
@@ -28,9 +32,29 @@ export function getTaskCwd(): string | null {
   const v = cwdStore.getStore();
   return v ? v : null;
 }
+export function setTaskBranch(id: number): void {
+  branchStore.enterWith(Number.isFinite(id) ? id : 0);
+}
+export function getTaskBranch(): number {
+  return branchStore.getStore() ?? 0;
+}
+/** 在独立 AsyncLocalStorage 上下文里跑一个 Attempt turn，避免并发 branch 串味。 */
+export function runWithTaskBranch<T>(id: number, fn: () => T): T {
+  return branchStore.run(Number.isFinite(id) ? id : 0, fn);
+}
+
+/** 每道题独立 ShellManager；未设置时 shell_tool 回退全局 SHELL（测试/smoke）。 */
+export function setTaskShell(shell: ShellManager): void {
+  shellStore.enterWith(shell);
+}
+export function getTaskShell(): ShellManager | undefined {
+  return shellStore.getStore();
+}
 
 export class Job {
   jobId: string;
+  /** 归属 Attempt：list/wait/status/kill 默认只看本 Attempt 的 job。 */
+  branch: number;
   /** 模型给 job 起的语义名（如 "oa-brute"）：list/status 显示，wait/status/kill 也可按名指认。 */
   label: string;
   command: string;
@@ -46,6 +70,7 @@ export class Job {
 
   constructor(init: {
     jobId: string;
+    branch: number;
     label?: string | null;
     command: string;
     cwd: string;
@@ -54,6 +79,7 @@ export class Job {
     timeout: number | null;
   }) {
     this.jobId = init.jobId;
+    this.branch = init.branch;
     this.label = init.label ?? "";
     this.command = init.command;
     this.cwd = init.cwd;
@@ -258,6 +284,7 @@ export class ShellManager {
     out_file?: string | null;
   }): Promise<string> {
     const { command } = opts;
+    const branch = getTaskBranch();
     // 语义名：单行、截 48 字符——只用于识别/显示，不参与寻址歧义之外的逻辑
     const label = String(opts.label ?? "")
       .replace(/[\r\n\t]+/g, " ")
@@ -284,6 +311,16 @@ export class ShellManager {
       return (
         `error: 后台 job 已满（${active.length}/${CFG.shell_max_jobs}）：${ids}\n` +
         `先 action=list 看进度，用 wait/wait_any 收结果，或 kill 掉不需要的 job，再启动新命令。`
+      );
+    }
+    const ownActive = active.filter((j) => j.branch === branch);
+    if (ownActive.length >= CFG.shell_max_jobs_per_branch) {
+      const ids = ownActive
+        .map((j) => `${j.jobId}(${Math.trunc(Date.now() / 1000 - j.startedAt)}s)`)
+        .join(", ");
+      return (
+        `error: 本 Attempt 的后台 job 已满（${ownActive.length}/${CFG.shell_max_jobs_per_branch}）：` +
+        `${ids}\n先收结果或 kill，避免一个 Attempt 占满全局 job 池。`
       );
     }
     // 硬上限：到点整组 kill（输出已落盘，杀掉不丢数据）；未传用配置默认 1800s；显式传 0/负数 = 永不杀
@@ -321,7 +358,7 @@ export class ShellManager {
       return `error: failed to start command: ${e instanceof Error ? e.message : e}`;
     }
 
-    const job = new Job({ jobId, label, command, cwd, child, outPath, timeout });
+    const job = new Job({ jobId, branch, label, command, cwd, child, outPath, timeout });
     this.jobs.set(jobId, job);
 
     // 小窗口同步等待：快速命令直接带完整输出返回，减少一轮交互
@@ -361,7 +398,7 @@ export class ShellManager {
     offset?: number | null,
     lines?: number | null,
   ): Promise<string> {
-    const job = this.get(jobId);
+    const job = this.getOwn(jobId);
     if (!job) return this.unknownJobMsg(jobId);
     const deadline = Date.now() + Math.max(0, Math.min(timeout, 300)) * 1000;
     const base = offset !== null && offset !== undefined ? Math.trunc(offset) : job.size();
@@ -381,7 +418,7 @@ export class ShellManager {
     const pairs: Array<[string, Job]> = [];
     const missing: string[] = [];
     for (const id of ids) {
-      const jb = this.get(id);
+      const jb = this.getOwn(id);
       if (jb) pairs.push([id, jb]);
       else missing.push(id);
     }
@@ -401,15 +438,16 @@ export class ShellManager {
 
   // ---- 动作：查看状态/输出（不阻塞，支持分页） ----
   status(jobId: string, offset?: number | null, lines?: number | null): string {
-    const job = this.get(jobId);
+    const job = this.getOwn(jobId);
     if (!job) return this.unknownJobMsg(jobId);
     return this.statusPayload(job, offset, lines);
   }
 
-  // ---- 动作：列出所有 job ----
+  // ---- 动作：列出本 Attempt 的 job ----
   list(): string {
-    const jobs = [...this.jobs.values()];
-    if (!jobs.length) return "no jobs";
+    const branch = getTaskBranch();
+    const jobs = [...this.jobs.values()].filter((j) => j.branch === branch);
+    if (!jobs.length) return `no jobs for attempt ${branch}`;
     const lines: string[] = [];
     for (const j of jobs.slice(-20)) {
       const state = j.finished
@@ -425,13 +463,14 @@ export class ShellManager {
     const nRun = jobs.filter((j) => !j.finished).length;
     return (
       lines.join("\n") +
-      `\n(* = 在跑，${nRun}/${CFG.shell_max_jobs}；wait/status 读输出（offset 分页），wait_any 同时等多个，kill 停止)`
+      `\n(* = 在跑，attempt ${branch}: ${nRun}/${CFG.shell_max_jobs_per_branch}（本题 ${CFG.shell_max_jobs}）；` +
+      `wait/status 读输出（offset 分页），wait_any 同时等多个，kill 停止)`
     );
   }
 
   // ---- 动作：杀掉 ----
   async kill(jobId: string, lines?: number | null): Promise<string> {
-    const job = this.get(jobId);
+    const job = this.getOwn(jobId);
     if (!job) return this.unknownJobMsg(jobId);
     job.kill("user");
     await sleep(200);
@@ -511,6 +550,11 @@ export class ShellManager {
       },
       { type: "image_url", image_url: { url, detail: d } },
     ];
+  }
+
+  private getOwn(key: string): Job | undefined {
+    const j = this.get(key);
+    return j && j.branch === getTaskBranch() ? j : undefined;
   }
 
   private get(key: string): Job | undefined {

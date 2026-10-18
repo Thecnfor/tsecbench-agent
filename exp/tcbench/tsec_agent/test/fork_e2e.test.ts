@@ -1,14 +1,13 @@
-/** solveTask 的 fork/旁观者集成自测（假 LLM client，全离线）。
+/** solveTask 的 fork/planner 集成自测（假 LLM client，全离线）。
  *
- * 覆盖：fork 生命周期（reserve→materialize→轮转→broadcast→park→收束）、
- * log/flag 账本落盘、旁观者触发注入、剪枝摘要注入、续段分支重建。
+ * 覆盖：fork 生命周期（reserve→materialize→轮转→log→park→收束）、
+ * log/flag 账本落盘、planner 卡塞提醒、剪枝摘要注入、续段分支重建。
  * 平台层不需要（直接调 solveTask，不走 run()）。 */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { solveTask } from "../src/agent.js";
-import { BYSTANDER_SYSTEM } from "../src/bystander.js";
 import { CFG } from "../src/config.js";
 import { readCorelog } from "../src/corelog.js";
 import { initRecords, type RunRecords, resetRecords, setRecordsDir } from "../src/records.js";
@@ -43,18 +42,16 @@ function makeScriptedClient(
     };
   }>,
 ) {
-  const calls: Array<{ branchHint: string; hasBystander: boolean; msgs: ChatMessage[] }> = [];
+  const calls: Array<{ branchHint: string; msgs: ChatMessage[] }> = [];
   const client: LlmClient = {
     async create(opts) {
       const msgs = opts.messages;
-      const sys = String(msgs.find((m) => m.role === "system")?.content ?? "");
-      const isBystander = sys === BYSTANDER_SYSTEM;
       const directive = msgs.find((m) => String(m.content ?? "").startsWith("【分支"));
       const branchId = directive ? /【分支 (\d+)/.exec(String(directive.content))?.[1] : null;
       const branchHint = branchId ? `b${branchId}` : "trunk";
-      calls.push({ branchHint, hasBystander: isBystander, msgs: [...msgs] });
-      // 旁观者轮（useTools=false）
-      if (isBystander || opts.tools === undefined) {
+      calls.push({ branchHint, msgs: [...msgs] });
+      // 无工具元调用（压缩等）不在本测试脚本范围
+      if (opts.tools === undefined) {
         return {
           choices: [
             {
@@ -78,10 +75,6 @@ function makeScriptedClient(
   return { client, calls };
 }
 
-const okResp = {
-  choices: [{ message: { role: "assistant", content: "ok" } }],
-};
-
 function tc(id: string, name: string, args: Record<string, unknown>) {
   return {
     id,
@@ -91,7 +84,7 @@ function tc(id: string, name: string, args: Record<string, unknown>) {
 }
 
 describe("solveTask fork 集成", () => {
-  it("fork→log/flag→broadcast→双分支 park→done（含记录与重建断言）", async () => {
+  it("fork→log/flag→双 Attempt park→done（含记录与重建断言）", async () => {
     CFG.fork_enabled = true;
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_e2e_"));
     setRecordsDir(recdir);
@@ -131,22 +124,19 @@ describe("solveTask fork 集成", () => {
           ],
         }),
       },
-      // trunk t2：broadcast 给分支 1
+      // trunk t2：log 给 planner/黑板（不再有 broadcast 工具）
       {
         when: (m) =>
           !m.some((x) => String(x.content ?? "").startsWith("【分支")) && ownTools(m) === 1,
         respond: () => ({
           content: null,
-          tool_calls: [tc("b1", "broadcast", { note: "redis 无认证，别重启服务", to: [1] })],
+          tool_calls: [tc("b1", "log", { note: "redis 无认证，别重启服务" })],
         }),
       },
-      // branch 1 t2：确认收到广播后 park（无工具调用）
+      // branch 1 t2：park（无工具调用）
       {
         when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 1")),
-        respond: (m) => {
-          expect(m.some((x) => String(x.content ?? "").includes("[分支 0 广播]"))).toBe(true);
-          return { content: "收到，继续深挖 redis。" };
-        },
+        respond: () => ({ content: "继续深挖 redis。" }),
       },
       // trunk t3：park
       {
@@ -179,32 +169,31 @@ describe("solveTask fork 集成", () => {
     const b1First = calls[1];
     expect(JSON.stringify(b1First.msgs)).toContain("branch 1 reserved");
 
-    // 记录：corelog 有 core/flag/broadcast/fork 四类
+    // 记录：corelog 有 core/flag/fork 三类
     const log = readCorelog(path.join(recdir, "tasks", "t-f1", "log.jsonl"));
     const kinds = log.map((e) => `${e.kind}:${e.branch}`);
     expect(kinds).toContain("core:1");
     expect(kinds).toContain("flag:1");
-    expect(kinds).toContain("broadcast:0");
+    expect(kinds).toContain("core:0");
     expect(kinds).toContain("fork:0");
     const flagEntry = log.find((e) => e.kind === "flag")!;
     expect(flagEntry.flag_index).toBe(1);
     expect(flagEntry.total_flag_count).toBe(2);
 
-    // 记录：conversation 分支字段齐全（fork_directive、broadcast 注入、flag 轮）
+    // 记录：conversation 分支字段齐全（fork_directive、flag 轮）
     const convLines = fs
       .readFileSync(path.join(recdir, "tasks", "t-f1", "conversation.jsonl"), "utf8")
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(convLines.some((r) => r.kind_note === "fork_directive" && r.branch === 1)).toBe(true);
-    expect(convLines.some((r) => r.kind_note === "broadcast" && r.branch === 1)).toBe(true);
     expect(convLines.some((r) => r.kind === "tool" && r.branch === 1 && r.tool === "shell")).toBe(
       true,
     );
-    // trunk 工具结果的 branch=0
-    expect(
-      convLines.some((r) => r.kind === "tool" && r.branch === 0 && r.tool === "broadcast"),
-    ).toBe(true);
+    // trunk log 工具结果的 branch=0
+    expect(convLines.some((r) => r.kind === "tool" && r.branch === 0 && r.tool === "log")).toBe(
+      true,
+    );
 
     // 分支返回给 worker（跨段）：branch 1 存活且上下文完整
     expect(r.branches.length).toBe(1);
@@ -265,22 +254,19 @@ describe("solveTask fork 集成", () => {
     expect(tail).toContain("fork refused");
   });
 
-  it("旁观者：停滞+重复信号触发 → 注入 [旁观者提示] 且限频生效", async () => {
-    CFG.fork_enabled = false;
-    CFG.bystander_enabled = true;
+  it("planner 卡塞提醒：停滞+重复信号 → 注入 [planner 提醒]", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = true;
     CFG.stall_short_sec = 0; // 停滞信号恒成立，靠重复信号凑齐任二
-    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "by_e2e_"));
+    CFG.planner_nudge_cooldown_sec = 0;
+    CFG.planner_nudge_max = 1;
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "plan_stall_"));
     setRecordsDir(recdir);
     const R = initRecords("local", "deepseek-flash");
-    const conv = R.conversation("t-by1");
-
+    const conv = R.conversation("t-ps1");
     let n = 0;
     const client: LlmClient = {
       async create(opts) {
-        const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
-        if (sys === BYSTANDER_SYSTEM) {
-          return okResp; // 旁观者回复（注入体在下方断言里核对）
-        }
         n++;
         if (n <= 3) {
           // 三次相同命令 → repeat 信号（echo 离线安全）
@@ -296,52 +282,43 @@ describe("solveTask fork 集成", () => {
             ],
           };
         }
-        // 第 4 轮：模型看到旁观者插嘴
-        const sawBystander = opts.messages.some((m) =>
-          String(m.content ?? "").startsWith("[旁观者提示]"),
+        const sawPlanner = opts.messages.some((m) =>
+          String(m.content ?? "").startsWith("[planner 提醒]"),
         );
-        expect(sawBystander, "bystander message injected").toBe(true);
-        return { choices: [{ message: { role: "assistant", content: "换方向审计 JS。" } }] };
+        expect(sawPlanner, "planner nudge injected").toBe(true);
+        return { choices: [{ message: { role: "assistant", content: "换方法继续。" } }] };
       },
     };
 
-    const r = await solveTask(client, "t-by1", "卡", 600, conv, { taskClass: "short" });
+    const r = await solveTask(client, "t-ps1", "卡", 600, conv, { taskClass: "short" });
     expect(r.status).toBe("done");
-
-    // 记录：bystander user 条目（kind_note）+ corelog bystander 事件
     const convLines = fs
-      .readFileSync(path.join(recdir, "tasks", "t-by1", "conversation.jsonl"), "utf8")
+      .readFileSync(path.join(recdir, "tasks", "t-ps1", "conversation.jsonl"), "utf8")
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as Record<string, unknown>);
-    const byRec = convLines.find((x) => x.kind_note === "bystander");
-    expect(byRec).toBeTruthy();
-    expect(String(byRec!.content)).toContain("[旁观者提示]");
-    const log = readCorelog(path.join(recdir, "tasks", "t-by1", "log.jsonl"));
-    expect(log.some((e) => e.kind === "bystander")).toBe(true);
+    const nudge = convLines.find((x) => x.kind_note === "planner_nudge");
+    expect(nudge).toBeTruthy();
+    expect(String(nudge!.content)).toContain("[planner 提醒]");
+    const log = readCorelog(path.join(recdir, "tasks", "t-ps1", "log.jsonl"));
+    expect(log.some((e) => e.kind === "planner")).toBe(true);
   });
 
-  it("旁观者：冷却期内不重复注入", async () => {
-    CFG.fork_enabled = false;
-    CFG.bystander_enabled = true;
+  it("planner 提醒冷却：一次之后不重复刷屏", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = true;
     CFG.stall_short_sec = 0;
-    CFG.bystander_cooldown_sec = 3600; // 冷却远超测试时长
+    CFG.planner_nudge_cooldown_sec = 3600; // 冷却远超测试时长
+    CFG.planner_nudge_max = 2;
     CFG.task_max_turns = 8; // 轮数安全网快速收段
-    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "by_cd_"));
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "plan_cd_"));
     setRecordsDir(recdir);
     const R = initRecords("local", "deepseek-flash");
-    const conv = R.conversation("t-by2");
-    let bystanderCalls = 0;
+    const conv = R.conversation("t-ps2");
     let n = 0;
     const client: LlmClient = {
-      async create(opts) {
-        const sys = String(opts.messages.find((m) => m.role === "system")?.content ?? "");
-        if (sys === BYSTANDER_SYSTEM) {
-          bystanderCalls++;
-          return okResp;
-        }
+      async create() {
         n++;
-        // 持续重复命令（repeat 信号保持成立）
         return {
           choices: [
             {
@@ -355,9 +332,155 @@ describe("solveTask fork 集成", () => {
         };
       },
     };
-    const r = await solveTask(client, "t-by2", "卡", 600, conv, { taskClass: "short" });
+    const r = await solveTask(client, "t-ps2", "卡", 600, conv, { taskClass: "short" });
     expect(r.status).toBe("paused"); // 轮数安全网收段
-    expect(bystanderCalls).toBe(1); // 第一次之后冷却期内不再注入
+    const convLines = fs
+      .readFileSync(path.join(recdir, "tasks", "t-ps2", "conversation.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(convLines.filter((x) => x.kind_note === "planner_nudge").length).toBe(1);
+  });
+
+  it("report：分支主动 deadend → park + 结果卡回传父级", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = false; // 本用例只验 report 本身；planner 另测
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_report_"));
+    setRecordsDir(recdir);
+    const R = initRecords("local", "deepseek-flash");
+    const conv = R.conversation("t-rp1");
+    const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_report_work_"));
+    setTaskCwd(workdir);
+    const { client, calls } = makeScriptedClient([
+      {
+        when: (m) =>
+          !m.some((x) => String(x.content ?? "").startsWith("【分支")) &&
+          m.filter((x) => x.role === "tool").length === 0,
+        respond: () => ({
+          content: null,
+          tool_calls: [tc("f1", "fork", { direction: "HTTP 隐藏路由" })],
+        }),
+      },
+      {
+        when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 1")),
+        respond: () => ({
+          content: null,
+          tool_calls: [
+            tc("r1", "report", {
+              status: "deadend",
+              summary: "HTTP 只有 / 和 /download，无隐藏路由",
+              evidence: ["ffuf 63k 字典 0 命中", "/. 归一化到 index"],
+              artifacts: [`${workdir}/branches/1/ffuf.json`],
+              next: ["把预算给 binary 方向"],
+            }),
+          ],
+        }),
+      },
+      {
+        when: () => true,
+        respond: () => ({ content: "收到结果卡，收束。" }),
+      },
+    ]);
+
+    const r = await solveTask(client, "t-rp1", "任务卡", 600, conv, { taskClass: "short" });
+    expect(r.status).toBe("done");
+    expect(calls.map((c) => c.branchHint)).toEqual(["trunk", "b1", "trunk"]);
+    const b1 = r.branches.find((b) => b.id === 1)!;
+    expect(b1.status).toBe("deadend");
+    expect(b1.active).toBe(false);
+    expect(b1.result?.summary).toContain("无隐藏路由");
+    // 结果卡只写黑板；planner 事件负责后续决策。
+    const log = readCorelog(path.join(recdir, "tasks", "t-rp1", "log.jsonl"));
+    expect(log.some((e) => e.kind === "result" && e.branch === 1)).toBe(true);
+    const convLines = fs
+      .readFileSync(path.join(recdir, "tasks", "t-rp1", "conversation.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(convLines.some((x) => x.kind_note === "attempt_result")).toBe(false);
+  });
+
+  it("planner：deadend + next → 从 checkpoint 开兄弟并回收 source", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = true;
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_plan_"));
+    setRecordsDir(recdir);
+    const R = initRecords("local", "deepseek-flash");
+    const conv = R.conversation("t-pl1");
+    const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "fork_plan_work_"));
+    setTaskCwd(workdir);
+    const { client, calls } = makeScriptedClient([
+      {
+        when: (m) =>
+          !m.some((x) => String(x.content ?? "").startsWith("【分支")) &&
+          m.filter((x) => x.role === "tool").length === 0,
+        respond: () => ({
+          content: null,
+          tool_calls: [tc("f1", "fork", { direction: "HTTP 隐藏路由" })],
+        }),
+      },
+      {
+        when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 1")),
+        respond: () => ({
+          content: null,
+          tool_calls: [
+            tc("r1", "report", {
+              status: "deadend",
+              summary: "HTTP 只有 / 和 /download",
+              next: ["动态 trace validator 的 VM 循环"],
+            }),
+          ],
+        }),
+      },
+      {
+        when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 2")),
+        respond: () => ({ content: "动态 trace 继续。" }),
+      },
+      {
+        when: () => true,
+        respond: () => ({ content: "收到 planner 的新 Attempt。" }),
+      },
+    ]);
+
+    const r = await solveTask(client, "t-pl1", "任务卡", 600, conv, { taskClass: "short" });
+    expect(r.status).toBe("done");
+    // source 1 被回收，只剩 planner spawn 的 attempt 2（与 0 共享 checkpoint 前缀）
+    expect(r.branches.length).toBe(1);
+    expect(r.branches[0].id).toBe(2);
+    expect(r.branches[0].messages.some((m) => String(m.content ?? "").includes("【分支 2"))).toBe(
+      true,
+    );
+    // 新 Attempt 不继承 source 的对话尾部，但带一句负知识
+    expect(
+      r.branches[0].messages.some((m) =>
+        String(m.content ?? "").includes("HTTP 只有 / 和 /download"),
+      ),
+    ).toBe(true);
+    expect(r.branches[0].messages.some((m) => String(m.content ?? "").startsWith("【分支 1"))).toBe(
+      false,
+    );
+    const raw = fs
+      .readFileSync(path.join(recdir, "tasks", "t-pl1", "conversation.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const spawned = raw.find(
+      (x) => x.kind_note === "fork_directive" && x.branch === 2 && x.spawned_by === "planner",
+    );
+    expect(spawned).toBeTruthy();
+    expect(spawned?.source_branch).toBe(1);
+    const log = readCorelog(path.join(recdir, "tasks", "t-pl1", "log.jsonl"));
+    expect(log.some((e) => e.kind === "fork" && String(e.note ?? "").includes("#2"))).toBe(true);
+    expect(log.some((e) => e.kind === "result" && e.branch === 1)).toBe(true);
+    // 调用序列：初始 → source → 初始(处理结果卡) → 新 Attempt
+    expect(calls.map((c) => c.branchHint)).toEqual(["trunk", "b1", "trunk", "b2"]);
+    // planner 结构化持久化
+    const planner = JSON.parse(fs.readFileSync(path.join(workdir, "planner.json"), "utf8")) as {
+      attempts: Array<{ id: number; scopeId: number }>;
+      recovery: { owner: number | null; pending: string[] };
+    };
+    expect(planner.attempts.some((a) => a.id === 2)).toBe(true);
+    expect(planner.recovery.pending).toEqual([]);
   });
 
   it("剪枝：分支零核心事件达阈值 → 回收 + 摘要注入 trunk", async () => {
@@ -387,9 +510,7 @@ describe("solveTask fork 集成", () => {
     const r = await solveTask(client, "t-pr1", "卡", 600, conv, {});
     expect(r.status).toBe("done");
     expect(r.branches.length).toBe(0); // 分支被剪掉
-    // trunk 收到回收摘要
-    expect(r.messages.some((m) => String(m.content ?? "").includes("[分支 1 已回收]"))).toBe(true);
-    expect(r.messages.some((m) => String(m.content ?? "").includes("注定被剪枝的方向"))).toBe(true);
+    // 回收事件只写黑板；planner/相关 scope 读取。
     // 记录：prune 事件
     const log = readCorelog(path.join(recdir, "tasks", "t-pr1", "log.jsonl"));
     expect(log.some((e) => e.kind === "prune" && e.branch === 1)).toBe(true);
@@ -398,12 +519,10 @@ describe("solveTask fork 集成", () => {
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(convLines.some((x) => x.kind_note === "branch_pruned" && x.branch === 0)).toBe(true);
   });
 
   it("开关全关时与旧单分支行为一致（无 branch 工具、无 corelog）", async () => {
     CFG.fork_enabled = false;
-    CFG.bystander_enabled = false;
     const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "off_e2e_"));
     setRecordsDir(recdir);
     const R = initRecords("local", "deepseek-flash");
@@ -411,7 +530,7 @@ describe("solveTask fork 集成", () => {
     const client: LlmClient = {
       async create(opts) {
         // 基础工具集 = shell + submit_flag（submit 常驻唯一提交通道）；
-        // branch 工具（fork/log/broadcast）与黑板在开关全关时不得出现
+        // 协作工具（fork/report/log/state_change）与黑板在开关全关时不得出现
         expect(opts.tools?.length).toBe(2);
         const toolNames = ((opts.tools ?? []) as Array<{ function?: { name?: string } }>).map(
           (t) => t?.function?.name,
@@ -419,8 +538,8 @@ describe("solveTask fork 集成", () => {
         expect(toolNames).toContain("shell");
         expect(toolNames).toContain("submit_flag");
         expect(toolNames).not.toContain("fork");
+        expect(toolNames).not.toContain("report");
         expect(toolNames).not.toContain("log");
-        expect(toolNames).not.toContain("broadcast");
         const toolMsgs = opts.messages.filter((m) => m.role === "tool").length;
         if (toolMsgs === 0) {
           return {

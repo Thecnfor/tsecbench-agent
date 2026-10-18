@@ -1,29 +1,22 @@
-/** branch.ts / corelog.ts / bystander.ts / records 分支重建 的离线单测。
+/** branch.ts / corelog.ts / stall.ts / records 分支重建 的离线单测。
  * 全部纯逻辑，无网络、无 LLM。 */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { type BranchCfg, BranchManager, normalizeNote } from "../src/branch.js";
+import { type BranchCfg, BranchManager } from "../src/branch.js";
 import { dispatchBranchTool } from "../src/branch_tools.js";
 import {
-  BYSTANDER_SYSTEM,
-  buildBystanderInput,
-  bystanderMessage,
-  bystanderShouldFire,
-  evaluateStall,
-  isOverreachingAdvice,
-  recentDigest,
-} from "../src/bystander.js";
-import {
-  buildBystanderLogView,
+  buildAttemptLogView,
   CorelogWriter,
   extractFlagIndex,
   FlagLedger,
+  pendingMutations,
   readCorelog,
 } from "../src/corelog.js";
-import { CORE_LOG_PROMPT_EXTRA, FORK_PROMPT_EXTRA, systemPromptWithExtras } from "../src/prompt.js";
+import { FORK_PROMPT_EXTRA, systemPromptWithExtras } from "../src/prompt.js";
 import { rebuildBranches, rebuildMessages } from "../src/records.js";
+import { evaluateStall, recentDigest, shouldIntervene } from "../src/stall.js";
 import type { ChatMessage } from "../src/types.js";
 
 const CFG: BranchCfg = {
@@ -32,9 +25,8 @@ const CFG: BranchCfg = {
   maxForks: 5,
   forkCooldownSec: 180,
   pruneSec: 600,
-  broadcastMax: 8,
-  bystanderMax: 2,
-  bystanderCooldownSec: 400,
+  plannerNudgeMax: 2,
+  plannerNudgeCooldownSec: 400,
 };
 
 function trunkMsgs(): ChatMessage[] {
@@ -85,6 +77,9 @@ describe("BranchManager 护栏", () => {
   it("轮转调度：park/unpark 与全 parked 收束", () => {
     const bm = mkBm();
     bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    // 本用例只测 RR；清掉 fork 的一次性 boost
+    bm.get(0)!.priority = 0;
+    bm.get(1)!.priority = 0;
     const seen: number[] = [];
     for (let i = 0; i < 4; i++) {
       const b = bm.pick();
@@ -115,6 +110,201 @@ describe("BranchManager 护栏", () => {
   });
 });
 
+describe("report / scope", () => {
+  it("report deadend：park attempt、结果卡投递父级、scope refuted", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "redis 未授权", 3, 1001, (id) => `/w/br/${id}`);
+    const scopeId = bm.get(1)!.scopeId;
+    const res = bm.report(
+      1,
+      "deadend",
+      "redis 无认证但不可写，拿不到 flag",
+      ["nmap 6379 open", "SET 返回 READONLY"],
+      ["/w/br/1/scan.log"],
+      ["试 6380"],
+      1002,
+    );
+    expect(res.ok).toBe(true);
+    expect(res.delivered).toEqual([]); // 不再自动回“父 Attempt”
+    expect(res.card).toContain("[Attempt 1 已结束 · deadend]");
+    const b1 = bm.get(1)!;
+    expect(b1.status).toBe("deadend");
+    expect(b1.active).toBe(false);
+    expect(b1.result?.summary).toContain("redis");
+    expect(bm.scopeStatus(scopeId)).toBe("refuted");
+    expect(
+      bm.get(0)!.messages.some((m) => String(m.content ?? "").includes("[Attempt 1 已结束")),
+    ).toBe(false);
+  });
+
+  it("同 scope 多 attempt：任一 done=satisfied；全 deadend=refuted；blocked=unresolved", () => {
+    const bm = mkBm();
+    const sid = bm.newScope(0, "HTTP 入口组");
+    bm.materializeFork(1, 0, "目录爆破", 3, 1001, (id) => `/w/br/${id}`, sid);
+    bm.materializeFork(2, 0, "认证绕过", 3, 1002, (id) => `/w/br/${id}`, sid);
+    expect(bm.scopeStatus(sid)).toBe("open");
+    bm.report(1, "deadend", "目录无隐藏路由", [], [], [], 1003);
+    expect(bm.scopeStatus(sid)).toBe("open"); // 2 还在跑
+    bm.report(2, "done", "认证绕过拿到后台", [], [], [], 1004);
+    expect(bm.scopeStatus(sid)).toBe("satisfied");
+
+    const bm2 = mkBm();
+    const sid2 = bm2.newScope(0, "端口组");
+    bm2.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`, sid2);
+    bm2.materializeFork(2, 0, "B", 3, 1002, (id) => `/w/br/${id}`, sid2);
+    bm2.report(1, "deadend", "A 死", [], [], [], 1003);
+    bm2.report(2, "deadend", "B 死", [], [], [], 1004);
+    expect(bm2.scopeStatus(sid2)).toBe("refuted");
+
+    const bm3 = mkBm();
+    const sid3 = bm3.newScope(0, "依赖组");
+    bm3.materializeFork(1, 0, "C", 3, 1001, (id) => `/w/br/${id}`, sid3);
+    bm3.report(1, "blocked", "靶机不可达", [], [], [], 1002);
+    expect(bm3.scopeStatus(sid3)).toBe("unresolved");
+  });
+
+  it("report 幂等拒绝；restore 保留 status/result/active", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    bm.report(1, "done", "方向完成", ["ev"], ["a.log"], [], 1002);
+    const again = bm.report(1, "deadend", "重复", [], [], [], 1003);
+    expect(again.ok).toBe(false);
+    expect(again.message).toContain("已经以 done 结束");
+
+    const lite = bm
+      .alive()
+      .filter((b) => b.id !== 0)
+      .map((b) => ({
+        id: b.id,
+        parent: b.parent,
+        scopeId: b.scopeId,
+        label: b.label,
+        cwd: b.cwd,
+        forkSeq: b.forkSeq,
+        messages: b.messages,
+        status: b.status,
+        active: b.active,
+        result: b.result,
+      }));
+    const bm2 = new BranchManager(CFG, trunkMsgs(), 2000);
+    bm2.restore(lite, 2000);
+    const b2 = bm2.get(1)!;
+    expect(b2.status).toBe("done");
+    expect(b2.active).toBe(false);
+    expect(b2.result?.summary).toBe("方向完成");
+    expect(bm2.scopeStatus(b2.scopeId)).toBe("satisfied");
+  });
+
+  it("已 report 结束的 Attempt 不会被新消息重挂复活", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    bm.report(1, "deadend", "走死", [], [], [], 1002);
+    expect(bm.enqueueMessage(1, "有新信息")).toBe(true);
+    const b1 = bm.get(1)!;
+    expect(b1.status).toBe("deadend");
+    expect(b1.active).toBe(false);
+    expect(b1.messages.at(-1)?.content).toContain("有新信息");
+  });
+
+  it("spawnFromCheckpoint：从分裂前前缀开兄弟，不复制 source 失败尾部", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "HTTP", 3, 1001, (id) => `/w/br/${id}`);
+    const b1 = bm.get(1)!;
+    b1.messages.push({ role: "user", content: "HTTP 全走死的失败轨迹" });
+    bm.report(1, "deadend", "HTTP 走死", [], [], ["动态 trace"], 1002);
+    const made = bm.spawnFromCheckpoint(1, "动态 trace", 1003, (id) => `/w/br/${id}`);
+    expect(made).not.toBeNull();
+    const b2 = made!.branch;
+    expect(b2.id).toBe(2);
+    expect(b2.parent).toBe(0);
+    expect(b2.forkSeq).toBe(3);
+    expect(b2.checkpointMessages.length).toBe(trunkMsgs().length);
+    expect(b2.messages.some((m) => String(m.content ?? "").includes("HTTP 全走死"))).toBe(false);
+    expect(String(b2.messages.at(-1)?.content)).toContain("动态 trace");
+  });
+
+  it("跨 Attempt 命令去重：同一条命令只提示其他 Attempt", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    bm.materializeFork(2, 0, "B", 3, 1002, (id) => `/w/br/${id}`);
+    bm.pushCmd(1, "nmap   -sT 10.0.0.1");
+    expect(bm.commandSeenElsewhere(2, "nmap -sT 10.0.0.1")).toBe(1);
+    expect(bm.commandSeenElsewhere(1, "nmap -sT 10.0.0.1")).toBeNull();
+    expect(bm.commandSeenElsewhere(2, "ffuf -u http://x")).toBeNull();
+  });
+});
+
+describe("共享写 / 重建记录", () => {
+  it("state_change 记录 pending，recovered 后从待恢复列表移除", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mutation_"));
+    const w = new CorelogWriter(path.join(dir, "log.jsonl"), "t-mu");
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "redis", 3, 1001, (id) => `/w/br/${id}`);
+    const deps = { bm, corelog: w, ledger: null, now: () => 1000, log: () => {} };
+    const done = dispatchBranchTool(
+      "state_change",
+      {
+        action: "启动 redis 并写入 /tmp/cache",
+        recovery: "redis-server --daemonize yes; 重新写 /tmp/cache",
+      },
+      deps,
+      1,
+      "m1",
+    )!;
+    expect(done.result).toContain("recorded mutation");
+    const id = /recorded mutation (\S+)/.exec(done.result)?.[1] ?? "";
+    expect(id).toContain("mu-");
+    let pending = pendingMutations(readCorelog(w.path));
+    expect(pending.length).toBe(1);
+    expect(pending[0].scopeId).toBe(bm.get(1)!.scopeId);
+    expect(pending[0].recovery).toContain("redis-server");
+
+    const recovered = dispatchBranchTool(
+      "state_change",
+      { status: "recovered", id, action: "启动 redis 并写入 /tmp/cache" },
+      deps,
+      1,
+      "m2",
+    )!;
+    expect(recovered.result).toContain("recovered mutation");
+    pending = pendingMutations(readCorelog(w.path));
+    expect(pending.length).toBe(0);
+  });
+});
+
+describe("fork 优先调度", () => {
+  it("fork 后新 Attempt 优先，其次父 Attempt", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    expect(bm.get(0)!.priority).toBe(1);
+    expect(bm.get(1)!.priority).toBe(2);
+    expect(bm.pickExcept()?.id).toBe(1);
+    expect(bm.pickExcept()?.id).toBe(0);
+    // boost 只消费一次，之后回到 RR
+    expect(bm.get(0)!.priority).toBe(0);
+    expect(bm.get(1)!.priority).toBe(1); // 新 fork 两票，剩一票
+  });
+});
+
+describe("并发注入邮箱", () => {
+  it("busy 时 enqueue 进 inbox，回合开始 drain 到 messages", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    const b = bm.get(1)!;
+    b.busy = true;
+    expect(bm.enqueueMessage(1, "忙碌时广播")).toBe(true);
+    expect(b.messages.some((m) => String(m.content).includes("忙碌时广播"))).toBe(false);
+    expect(b.inbox.length).toBe(1);
+    bm.drainInbox(1);
+    expect(b.messages.at(-1)?.content).toContain("忙碌时广播");
+    expect(b.inbox.length).toBe(0);
+    // 空闲时直投
+    b.busy = false;
+    bm.enqueueMessage(1, "空闲广播");
+    expect(b.messages.at(-1)?.content).toContain("空闲广播");
+  });
+});
+
 describe("materializeFork 协议安全", () => {
   it("复制父上下文 + 尾部 append 方向指令（不动 system）", () => {
     const bm = mkBm();
@@ -135,78 +325,6 @@ describe("materializeFork 协议安全", () => {
     const bm = mkBm();
     expect(bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`)).not.toBeNull();
     expect(bm.materializeFork(1, 0, "A", 3, 1002, (id) => `/w/br/${id}`)).toBeNull();
-  });
-});
-
-describe("broadcast", () => {
-  it("尾部追加到目标并激活 parked 分支", () => {
-    const bm = mkBm();
-    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
-    bm.park(1);
-    const res = bm.broadcast(0, "6379 有未授权访问", "all", 1100);
-    expect(res.ok).toBe(true);
-    expect(res.delivered).toEqual([1]);
-    const b1 = bm.get(1)!;
-    expect(b1.messages.at(-1)?.content).toContain("[分支 0 广播] 6379 有未授权访问");
-    expect(b1.active).toBe(true); // parked 分支被广播激活
-  });
-
-  it("to=trunk / 数组 / 无效目标", () => {
-    const bm = mkBm();
-    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
-    expect(bm.broadcast(1, "收到", "trunk", 1100).delivered).toEqual([0]);
-    expect(bm.broadcast(1, "hi", [0], 1101).delivered).toEqual([0]);
-    expect(bm.broadcast(1, "hi", [99], 1102).ok).toBe(false);
-  });
-
-  it("子分支广播只上行主分支（横向改投 0；主→任意不受限）", () => {
-    const bm = mkBm();
-    const f1 = bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
-    const f2 = bm.materializeFork(2, 0, "B", 3, 1002, (id) => `/w/br/${id}`);
-    expect(f1?.directive).toContain("只上行给主分支（分支 0）");
-    expect(f2).not.toBeNull();
-    // 子 → "all"：只落主分支，兄弟收不到（星型拓扑）
-    const all = bm.broadcast(1, "全局发现需要扩散", "all", 1100);
-    expect(all.ok).toBe(true);
-    expect(all.delivered).toEqual([0]);
-    expect(all.message).toContain("子分支仅可上行主分支");
-    expect(bm.get(2)!.messages.some((m) => String(m.content ?? "").includes("[分支 1 广播]"))).toBe(
-      false,
-    );
-    expect(bm.get(0)!.messages.at(-1)?.content).toContain("[分支 1 广播] 全局发现需要扩散");
-    // 子 → 具体兄弟 [2]：改投主分支，由它转发
-    const lat = bm.broadcast(1, "点对点给兄弟分支", [2], 1101);
-    expect(lat.ok).toBe(true);
-    expect(lat.delivered).toEqual([0]);
-    expect(lat.message).toContain("横向协同由主分支转发");
-    // 子 → "trunk"：原语义原文案
-    expect(bm.broadcast(1, "直接上行汇报", "trunk", 1102).message).toBe("已广播给分支 0（1 个）");
-    // 无效 id 照旧拒绝（不因夹取变通投）
-    expect(bm.broadcast(1, "无效目标", [99], 1103).ok).toBe(false);
-    // 主分支下行全连保留
-    const down = bm.broadcast(0, "统筹：先暂停副作用操作", "all", 1104);
-    expect(down.ok).toBe(true);
-    expect([...down.delivered].sort()).toEqual([1, 2]);
-  });
-
-  it("限频 + 近似重复去重", () => {
-    const bm = new BranchManager({ ...CFG, broadcastMax: 2 }, trunkMsgs(), 1000);
-    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
-    expect(bm.broadcast(0, "发现X", "all", 1100).ok).toBe(true);
-    // 近似重复（大小写/标点差异）被抑制且不占额度
-    const dup = bm.broadcast(0, "发现x！", "all", 1101);
-    expect(dup.ok).toBe(false);
-    expect(dup.message).toContain("重复");
-    expect(bm.broadcast(0, "发现Y", "all", 1102).ok).toBe(true); // 额度还剩
-    const capped = bm.broadcast(0, "发现Z", "all", 1103);
-    expect(capped.ok).toBe(false);
-    expect(capped.message).toContain("上限 2");
-  });
-});
-
-describe("normalizeNote", () => {
-  it("去标点去空白小写（去重口径更激进）", () => {
-    expect(normalizeNote("Hello，  World！")).toBe("helloworld");
   });
 });
 
@@ -246,7 +364,7 @@ describe("corelog", () => {
     expect(entries[1].kind).toBe("flag");
   });
 
-  it("buildBystanderLogView 按分支分组（交错写入 → 分组可读）", () => {
+  it("buildAttemptLogView 按分支分组（交错写入 → 分组可读）", () => {
     const entries = [
       {
         ts: "2026-10-16 10:00:01",
@@ -281,18 +399,18 @@ describe("corelog", () => {
         flag_index: 1,
       },
     ];
-    const view = buildBystanderLogView(entries, {
+    const view = buildAttemptLogView(entries, {
       branches: new Map([[1, "探测 redis"]]),
     });
     // 分支 0 的两条连续、分支 1 的两条连续，不按全局时间交错
     expect(view.indexOf("A1")).toBeLessThan(view.indexOf("A2"));
     expect(view.indexOf("B1")).toBeLessThan(view.indexOf("[flag] idx=1"));
     expect(view).toContain("探测 redis");
-    expect(view).toContain("主分支");
+    expect(view).toContain("Attempt 0（初始）");
   });
 });
 
-describe("旁观者信号与输入", () => {
+describe("卡塞信号与 planner 提醒", () => {
   it("evaluateStall 五信号：flag 主时钟一票 + 分支级任二", () => {
     const base = {
       sinceCoreSec: 0,
@@ -302,17 +420,17 @@ describe("旁观者信号与输入", () => {
       recentCmds: [] as string[],
     };
     expect(evaluateStall(base).count).toBe(0);
-    expect(bystanderShouldFire(evaluateStall(base))).toBe(false);
+    expect(shouldIntervene(evaluateStall(base))).toBe(false);
     // ⓪ flag 主时钟：长时间没 flag 一票触发（以 flag 为核心的介入锚；
     //    即使分支刚记过卡——run3 记卡型空转靠它抓）
     const fs0 = evaluateStall({ ...base, flagSinceSec: 901 });
     expect(fs0.flagStall).toBe(true);
-    expect(bystanderShouldFire(fs0)).toBe(true);
+    expect(shouldIntervene(fs0)).toBe(true);
     expect(evaluateStall({ ...base, flagSinceSec: 800 }).flagStall).toBe(false);
     // ① 只停滞 → 1（不触发）
     const s1 = evaluateStall({ ...base, sinceCoreSec: 301 });
     expect(s1.count).toBe(1);
-    expect(bystanderShouldFire(s1)).toBe(false);
+    expect(shouldIntervene(s1)).toBe(false);
     // ①+② 停滞+重复 → 触发
     const s12 = evaluateStall({
       ...base,
@@ -320,7 +438,7 @@ describe("旁观者信号与输入", () => {
       recentCmds: ["nmap -sT x", "nmap -sT x", "nmap -sT x"],
     });
     expect(s12.count).toBe(2);
-    expect(bystanderShouldFire(s12)).toBe(true);
+    expect(shouldIntervene(s12)).toBe(true);
     // ③ 近8次连接类硬失败≥3（幻觉目标空转）
     const hf = evaluateStall({ ...base, recentHardFails: [false, true, true, true] });
     expect(hf.hardFail).toBe(true);
@@ -331,53 +449,13 @@ describe("旁观者信号与输入", () => {
     expect(evaluateStall({ ...base, wrongSubmits: 1 }).hallucSubmit).toBe(false);
     // ③+④：错提交+连接空转（无任何时间信号也触发）
     expect(
-      bystanderShouldFire(
+      shouldIntervene(
         evaluateStall({ ...base, wrongSubmits: 2, recentHardFails: [true, true, true] }),
       ),
     ).toBe(true);
     // 新 flag 后主时钟由调用方刷新（flagSinceSec 归零 → 不再一票）
-    expect(bystanderShouldFire(evaluateStall({ ...base, flagSinceSec: 0 }))).toBe(false);
+    expect(shouldIntervene(evaluateStall({ ...base, flagSinceSec: 0 }))).toBe(false);
   });
-  it("buildBystanderInput 组装完整要素", () => {
-    const led = new FlagLedger();
-    led.setTotal(3);
-    led.add(1, 0);
-    const input = buildBystanderInput({
-      taskCard:
-        "请渗透以下题目并提交其全部 flag：\n- unique_code: t-99\n- 题目描述: 一个带登录的 CMS",
-      entries: [
-        {
-          ts: "2026-10-16 10:00:01",
-          seq: 1,
-          code: "t",
-          branch: 0,
-          kind: "core",
-          note: "SQLi 疑似",
-        },
-      ],
-      branchId: 0,
-      branchNames: new Map([[0, "主分支"]]),
-      ledger: led,
-      recentDigest: "- assistant: 继续注",
-      recentCmds: ["sqlmap -u http://x"],
-      segElapsedSec: 400,
-      signals: {
-        flagStall: true,
-        stall: true,
-        repeat: false,
-        hardFail: false,
-        hallucSubmit: false,
-        count: 1,
-      },
-    });
-    expect(input).toContain("t-99"); // 题面必须在（run5 缺题面致旁观者臆测换题）
-    expect(input).toContain("1/3 (idx:1)");
-    expect(input).toContain("SQLi 疑似");
-    expect(input).toContain("sqlmap");
-    expect(input).toContain("分支停滞✓");
-    expect(input).toContain("无flag✓");
-  });
-
   it("recentDigest 截断并标注 tool_calls", () => {
     const digest = recentDigest(
       [
@@ -392,10 +470,6 @@ describe("旁观者信号与输入", () => {
     );
     expect(digest).toContain("[tool_calls: shell]");
     expect(digest.length).toBeLessThan(600);
-  });
-
-  it("bystanderMessage 规整前缀", () => {
-    expect(bystanderMessage("  换抽象层想  ")).toBe("[旁观者提示] 换抽象层想");
   });
 });
 
@@ -485,6 +559,8 @@ describe("records 分支重建", () => {
     expect(b1.messages[0].role).toBe("system");
     expect(String(b1.messages[4].content)).toContain("分支 1 · 方向");
     expect(b1.messages.some((m) => String(m.content).includes("继续 web"))).toBe(false);
+    expect(b1.checkpointMessages.length).toBe(4); // 父前缀快照（无 directive/后续）
+    expect(b1.checkpointMessages.some((m) => String(m.content).includes("继续 web"))).toBe(false);
   });
 
   it("嵌套 fork：孙分支只拿祖父 fork_seq 内的快照", () => {
@@ -586,90 +662,6 @@ describe("records 分支重建", () => {
   });
 });
 
-describe("旁观者越权建议检测（run5 真实判例集）", () => {
-  it("题内合法建议放行", () => {
-    // run5 [1][2][3]：题内换层面/换方法/纠错
-    expect(
-      isOverreachingAdvice(
-        "别再换参数。关键在 VM：31 字节数据与 4 字节 key 的运算才是来源，动态 dump 中间值",
-      ),
-    ).toBe(false);
-    expect(isOverreachingAdvice("B 的偏移可能错了：先核对真实文件偏移与段映射，再试解压")).toBe(
-      false,
-    );
-    expect(isOverreachingAdvice("改攻 8080 端口的注入点")).toBe(false); // 题内换目标合法
-  });
-
-  it("换题类越权命中（run5 条4-12 形态）", () => {
-    expect(isOverreachingAdvice("平台确认还有 web_sqli_01 未动，应转向该 SQLi 分支")).toBe(true);
-    expect(isOverreachingAdvice("若 8899 无果，转 web_sqli_01。")).toBe(true);
-    expect(isOverreachingAdvice("立即止损，转攻未动的 web_sqli_01：从注入点直接取库内 flag")).toBe(
-      true,
-    );
-    expect(isOverreachingAdvice("停掉 f2-05 全部动作，转攻完全未动的题")).toBe(true);
-    expect(isOverreachingAdvice("主分支已明确拒绝换题——继续观察")).toBe(true); // 含"换题"字样即触发重写（保守）
-    expect(isOverreachingAdvice("直接调用平台 start 接口换题")).toBe(true);
-  });
-
-  it("输入尾锚定声明存在（buildBystanderInput 末尾）", () => {
-    const input = buildBystanderInput({
-      taskCard: "拿掉目标全部 flag",
-      entries: [],
-      branchId: 0,
-      branchNames: new Map([[0, "主分支"]]),
-      ledger: null,
-      recentDigest: "",
-      recentCmds: [],
-      segElapsedSec: 10,
-      signals: {
-        flagStall: false,
-        stall: false,
-        repeat: false,
-        hardFail: false,
-        hallucSubmit: false,
-        count: 0,
-      },
-    });
-    expect(input).toContain("只准是当前题目内");
-    expect(input).toContain("越权");
-  });
-
-  it("输入带「各分支分工」+ 硬约束禁止改派（界由 fork 划定）", () => {
-    const input = buildBystanderInput({
-      taskCard: "拿掉目标全部 flag",
-      entries: [],
-      branchId: 1,
-      branchNames: new Map([
-        [0, "主分支"],
-        [1, "穷举 31 字节 blob 的流密码/LFSR"],
-        [2, "服务端响应头与隐藏路径"],
-      ]),
-      ledger: null,
-      recentDigest: "",
-      recentCmds: [],
-      segElapsedSec: 10,
-      signals: {
-        flagStall: false,
-        stall: false,
-        repeat: false,
-        hardFail: false,
-        hallucSubmit: false,
-        count: 0,
-      },
-    });
-    expect(input).toContain("各分支分工");
-    expect(input).toContain("分支 0（主分支）：题面整体，无专属方向");
-    expect(input).toContain("分支 1：穷举 31 字节 blob 的流密码/LFSR");
-    expect(input).toContain("分支 2：服务端响应头与隐藏路径");
-    // 系统硬约束：不得让已分工分支弃用方向/转做他人工作（实测教训回锁）
-    expect(BYSTANDER_SYSTEM).toContain("不得重分配已分工的分支");
-    expect(BYSTANDER_SYSTEM).toContain("服务它的方向");
-    // 执行侧同样声明：界由 fork 划定、broadcast 只上行主分支
-    expect(FORK_PROMPT_EXTRA).toContain("不要轻易跨界");
-    expect(FORK_PROMPT_EXTRA).toContain("只上行给主分支");
-  });
-});
-
 describe("log 检查方向归 sys（不逐次塞工具结果）", () => {
   it("工具结果只回确认事实；六要素/置信要求/黑板路径在 sys extras", () => {
     const bm = mkBm();
@@ -686,14 +678,11 @@ describe("log 检查方向归 sys（不逐次塞工具结果）", () => {
     expect(out!.result).not.toContain("六要素自查");
     expect(out!.result).not.toContain("齐了吗");
     expect(out!.result).not.toContain("判断带置信");
-    // 信心要求 + 自动记黑板声明常驻 sys（fork / 旁观者两种模式都覆盖）
+    // 信心要求 + 自动记黑板声明常驻 sys（fork / planner两种模式都覆盖）
     expect(FORK_PROMPT_EXTRA).toContain("判断明确写信心");
     expect(FORK_PROMPT_EXTRA).toContain("自动记入黑板");
     expect(FORK_PROMPT_EXTRA).toContain("log.jsonl");
-    expect(CORE_LOG_PROMPT_EXTRA).toContain("不敢保证");
-    expect(CORE_LOG_PROMPT_EXTRA).toContain("自动记入黑板");
-    expect(CORE_LOG_PROMPT_EXTRA).toContain("log.jsonl");
     // 六要素一行在基础 sys（log 工具在场时）
-    expect(systemPromptWithExtras(true, false)).toContain("报告六要素");
+    expect(systemPromptWithExtras(true)).toContain("报告六要素");
   });
 });

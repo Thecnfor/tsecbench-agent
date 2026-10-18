@@ -56,10 +56,12 @@
 ## 架构不变量（不要轻易破坏）
 
 1. **单工具设计（2026-10-16 放宽）**：基础工具只有 `shell`（异步 background 模式），**无 MCP**。
-   fork 多分支与旁观者是**控制器层能力**（默认关，`AGENT_FORK=0`/`AGENT_BYSTANDER=0`），
-   打开后工具集扩展为 `shell + fork + log + broadcast`——这是与评测方对齐后的演进
-   （初赛镜像两开关默认 off，行为与旧版逐语义一致）。read/write/web 等文件类工具仍禁止
-   （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-bystander-design.md`，
+   fork 多 Attempt 与 planner 统筹是**默认开启的控制器层能力**（`AGENT_FORK` 默认 1；
+   `AGENT_PLANNER` 默认 1；`AGENT_BRANCH_CONCURRENCY` 默认 2），
+   打开后工具集扩展为 `shell + fork + report + log + state_change`——这是与评测方对齐后的演进
+   （单线调试可设 `AGENT_FORK=0`，行为回到旧单分支）。planner 是唯一统筹者，没有特权主分支；`AGENT_BRANCH_CONCURRENCY>1` 时多 Attempt turn 真并发（注入走 inbox）；
+   read/write/web 等文件类工具仍禁止
+   （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-planner-design.md`，
    缓存实测依据见 `../cache_exp/README.md`。
 2. **shell 是异步的**：`run` 立即返回 `job_id`，模型用 `wait/wait_any/status/kill/list` 收结果。
    - **同轮多个 tool_call 并发派发**（方案 A）：一轮里多条 shell 同时起跑，结果仍按
@@ -74,7 +76,7 @@
      **工具替模型决定何时返回**（命令结束 / 攒够 ≥2KB 新输出 / 到点，先到先返回）。
    - `wait` 同为**边沿触发**，不再干等；输出分页 `offset/lines`（每条带 `next_offset` 续读），
      `out_file` 直接落盘到 workdir（被杀不丢，可 `tail`）。
-   - 上限：同时在跑 `AGENT_SHELL_MAX_JOBS`（8，满了拒绝新 `run` 并提示先收）；
+   - 上限：每题同时在跑 `AGENT_SHELL_MAX_JOBS`（8，满了拒绝新 `run` 并提示先收）；
      硬上限 `AGENT_SHELL_HARD_SEC`（1800s，到点整组 kill，0=永不杀）——**不做 300s 软提醒**。
    - 进程必须独立进程组（Node：`spawn detached:true`；Python 版是 `start_new_session`），kill 时整组杀，超时由 watcher 兜底。
    - **多模态**：`action=view` 把图片以 `image_url` part 作为**工具结果**返回（tool 消息
@@ -176,12 +178,12 @@
      `duration_ms` 自动计算；assistant=LLM 调用起止、tool=工具执行起止，
      埋点在 `solve_task`/`closing_summary`）——直接可画甘特图（llm/tool 泳道）；
    - **fork 分支记录（2026-10-16 增）**：conversation.jsonl 单流追加 + `branch` 字段
-     （0=trunk，缺省视为 0 兼容旧记录）；分支创建写 `kind_note:"fork_directive"`
+     （0=初始 Attempt，缺省视为 0 兼容旧记录）；fork/spawn 写 `kind_note:"fork_directive"`
      （含 parent_branch/fork_seq/fork_label）；**`log.jsonl` 独立文件**记
-     core/broadcast/bystander/flag/prune/fork 六类核心事件，**flag 以
+     core/planner/flag/prune/fork/result/mutation/artifact 核心事件，**flag 以
      `matched_flag_index` 为稳定 ID**（内容随靶机重启变、索引不变）；
-     暂停续跑时 trunk 用 `rebuildMessages`（branch=0 过滤）、分支用 `rebuildBranches`
-     （父分支 **fork_seq 快照截断** + 分支自身记录；fork 后父分支的轮次不得进入分支）；
+     暂停续跑时初始 Attempt 用 `rebuildMessages`（branch=0 过滤）、后续 Attempt 用 `rebuildBranches`
+     （fork 源 **fork_seq 快照截断** + 分支自身记录；fork 后 fork 源的轮次不得进入子 Attempt）；
    - 题目生命周期：`tasks.jsonl` 成对记 `task_start{started_at,target,attempt,resume}` /
      `task_close{closed_at,duration_sec,outcome,flags}`（`outcome` ∈ `pass`/`fail`/`paused`）；
    - **通关复盘**：题目全部 flag 提交后，**同一上下文直接追加**一条复盘请求
@@ -209,16 +211,19 @@
 | --- | --- | --- |
 | `tsec_agent/src/agent.ts` | 控制器主循环：选题 → start → `solveTask` 单题上下文 → 校验 → close；LLM 重试、并行调度、`--smoke` | 加运行控制逻辑 |
 | `tsec_agent/src/bench.ts` | 平台 API 客户端（fetch/start/close/选题策略、名额释放） | 平台流程变化 |
-| `tsec_agent/src/shell.ts` + `shell_tool.ts` | 异步 shell：Job 生命周期、输出截断、进程组 kill；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parseToolArguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
+| `tsec_agent/src/shell.ts` + `shell_tool.ts` | 异步 shell：Job 生命周期、输出截断、进程组 kill；每题独立 ShellManager（job 表跨题完全隔离）+ job 归属 Attempt（list/wait/status/kill 隔离，每 Attempt 配额 `AGENT_SHELL_MAX_JOBS_PER_BRANCH`）；`wait_sec`/`wait_any` 边沿等待、`offset/lines` 分页、`out_file` 落盘、job 上限与 1800s 硬上限；`parseToolArguments` 工具参数容错（坏参数自动修复）；`view` 多模态读图 | 调工具行为、参数解析 |
 | `tsec_agent/src/llm.ts` | OpenAI 兼容 fetch client、重试策略、key 候选发现与 401 热切换 | 网关协议/鉴权变化 |
 | `tsec_agent/src/prompt.ts` | 单题解题 system prompt + 任务卡模板（渗透方法、提交协议、结束约定） | 平台规则变化、提示词调优 |
 | `tsec_agent/src/records.ts` | bench 级持久化：`runs/<TOKEN>/` 下 meta.json/events.jsonl/tasks.jsonl/tasks/<code>/conversation.jsonl（+log.jsonl）；`rebuildMessages`/`rebuildBranches` 从对话重建续跑上下文（分支按 fork_seq 截断） | 记录字段调整、续跑上下文 |
-| `tsec_agent/src/branch.ts` | fork 多分支执行面：分支状态/护栏（存活≤3、总数≤5、冷却 180s、剪枝 1200s）/轮转调度/广播（尾部追加+限频+去重；**星型拓扑**：非主分支只上行主分支，横向目标改投 0 由主转发） | 分支策略调整 |
-| `tsec_agent/src/branch_tools.ts` | fork/log/broadcast 三工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize 保证 tool 配对完整） | 工具契约变化 |
-| `tsec_agent/src/corelog.ts` | log.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ 旁观者分组视图 | 黑板日志格式 |
-| `tsec_agent/src/bystander.ts` | 旁观者：flag 主时钟一票 + 四信号任二 + 输入构建（**各分支分工名册**、按分支分组防交错难读）+ 插嘴指令（硬约束：**不给已分工分支改派范畴外任务**，界由 fork 划定） | 卡塞判定/提示词 |
+| `tsec_agent/src/branch.ts` | Attempt/Scope 执行面：状态/护栏/轮转/广播（尾部追加+限频+去重；**Attempt 对等，无特权主分支**）/report 结果卡/`spawnFromCheckpoint` 回溯 | 分支策略调整 |
+| `tsec_agent/src/branch_tools.ts` | fork/report/log/state_change 四工具 schema 与分发（fork 两阶段：reserve 护栏→轮末 materialize；report 收尾 + result card；log 同时送 planner） | 工具契约变化 |
+| `tsec_agent/src/planner.ts` | 唯一统筹者：消费 report/stall/log 事件，启发式决定提醒/回收/checkpoint spawn；不跑 shell/不改 messages | planner 策略调整 |
+| `tsec_agent/src/planner_state.ts` | `tasks/<code>/planner.json`：scopes/attempts/findings/mutations/recovery 结构化快照（tmp+rename） | planner 持久化字段 |
+| `tsec_agent/src/corelog.ts` | log.jsonl 读写 + flag 索引账本（matched_flag_index 为稳定 ID）+ Attempt 分组视图/planner 事件源 | 黑板日志格式 |
+| `tsec_agent/src/stall.ts` | 卡塞信号（flag 主时钟 + 四信号任二）+ planner 提醒模板；由 controller 事件化交给 planner，无独立 observer LLM | 卡塞判定/提醒文本 |
+| `tsec_agent/src/artifacts.ts` | shell 后新文件的有界扫描 + sha256；跨 Attempt/跨段产物去重提示；共享写命令启发式提醒 | 产物去重/扫描阈值 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
-| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/旁观者开关 `AGENT_FORK`/`AGENT_BYSTANDER`（默认 0）及护栏阈值 | 加配置项 |
+| `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/planner 开关 `AGENT_FORK`/`AGENT_PLANNER`、`AGENT_BRANCH_CONCURRENCY` 及护栏/提醒阈值 | 加配置项 |
 | `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
 | `arena/` | 内部本地跑分题场：官方 Challenges API 线格式兼容的计分服务 + **docker 真靶机驱动**（题包在 `arena/challenges/`，含 flag 字面量——`.dockerignore` 已排除 `arena/`，**红线别删**）；行为契约见 `arena/README.md`，接入只改 `BENCHMARK_BASE_URL`/`BENCHMARK_TOKEN` | 内部本地跑分、加题 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
@@ -231,7 +236,7 @@
 ## 常用操作
 
 ```bash
-# 离线自测（改完代码先跑这个，不需要 VPN/网关；50 个 vitest 用例）
+# 离线自测（改完代码先跑这个，不需要 VPN/网关；183 个 vitest 用例）
 cd tsec_agent && pnpm install && pnpm test
 
 # 一次性检查：类型检查 + biome lint + 全部测试（提交前自查）
