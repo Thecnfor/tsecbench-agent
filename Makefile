@@ -50,12 +50,17 @@ run: clean-tmp
 rerun:
 	-@scripts/kill_orphan_shells.sh
 	-@pkill -f '/solver/main\.py$$' 2>/dev/null
-	-@pkill -f 'python -m orchestrator$$' 2>/dev/null
+	-@pkill -f -- '-m orchestrator$$' 2>/dev/null
 	@for i in $$(seq 1 20); do pgrep -f '/solver/main\.py$$' >/dev/null || break; sleep 0.5; done
 	@sleep 1
 	@set -a; . ./solver/.env; set +a; \
-	 SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) nohup $(UV) run python -m orchestrator >> /tmp/tsec-run.log 2>&1 & \
+	 SLICE_MIN_S=$(SLICE_MIN_S) SLICE_MAX_S=$(SLICE_MAX_S) setsid -f $(UV) run python -m orchestrator >> /tmp/tsec-run.log 2>&1 < /dev/null
+	@sleep 2; pgrep -f -- '-m orchestrator$$' >/dev/null || { echo "orchestrator failed to start (see /tmp/tsec-run.log)" >&2; exit 1; }
 	 echo "orchestrator restarted -> tail -f /tmp/tsec-run.log  (journal: workspaces/journal.jsonl)"
+
+## docker-run: 本地托管仿真（容器内 VPN + 默认拒公网）
+docker-run:
+	scripts/docker_run.sh
 
 ## mock: 启动平台 mock server（runbook.md §4.1，只绑 loopback）
 mock:

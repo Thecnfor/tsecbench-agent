@@ -251,7 +251,8 @@ def test_placeholder_flags_are_rejected(common):
     assert common.find_flags(real) == [real]
 
 
-def test_persistent_shell_keeps_vars_and_cwd(common, tmp_path):
+def test_persistent_shell_keeps_vars_and_cwd(common, tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "_local_tmp_reference", lambda command: False)
     common.reset_shell_session()
     assert common.run_command("X=hello", 5)["exit_code"] == 0
     assert "hello" in common.run_command("echo $X", 5)["output"]
@@ -460,4 +461,24 @@ def test_advanced_tools_and_scope(common):
     assert {"gremlin", "gradio", "stage"} <= names
     assert common.run_gremlin({})["error"]
     assert common.run_gradio({})["error"]
-    assert common.run_command("nmap 172.18.0.1", 5)["exit_code"] == 126
+
+
+def test_shared_tmp_is_blocked_but_payload_tmp_allowed(common, monkeypatch, tmp_path):
+    monkeypatch.setattr(common, "TARGET_INFO", "10.0.187.248:80")
+    monkeypatch.setattr(common, "SOLVER_TASK_PATH", str(tmp_path / "task.json"))
+    assert common.run_command("echo hi > /tmp/x", 5)["exit_code"] == 126
+    assert common.run_command("echo hi > $TMPDIR/x", 5)["exit_code"] != 126
+    payload = "echo --data-urlencode 'c=php /tmp/rq.php' http://10.0.187.248/x"
+    assert common.run_command(payload, 5)["exit_code"] != 126
+
+
+def test_image_workspace_layout_blocks_siblings(common, monkeypatch, tmp_path):
+    """/workspaces/<task> 布局下（镜像内）不能读邻题目录。"""
+    own = tmp_path / "workspaces" / "mine"
+    own.mkdir(parents=True)
+    monkeypatch.setattr(common, "_local_tmp_reference", lambda command: False)
+    monkeypatch.setattr(common, "SOLVER_TASK_PATH", str(own / "task.json"))
+    assert common.run_command(f"cat {own}/out/flags/a.txt", 5)["exit_code"] != 126
+    blocked = common.run_command("cat /workspaces/other/out/flags/a.txt", 5)
+    assert blocked["exit_code"] == 126
+    assert "other task workspace" in blocked["output"]

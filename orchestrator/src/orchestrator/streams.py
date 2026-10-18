@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import os
 import time
@@ -26,6 +27,50 @@ STREAM_INTERVAL_S = 45.0  # 中途收割节拍（§2.2）
 # 停滞看门狗：solver 进程活着但 stdout 与 out/ 产物长时间不变 = LLM 流或工具挂死。
 # 单条命令上限 120s，240s 静默足以排除正常长命令；0 = 关闭。
 DEFAULT_STALL_S = 240.0
+
+
+class FairSlotPool:
+    """全局 solver 进程槽（普通片 + v2 子节点共用，总数 ≤ total）。
+
+    公平规则：先保证每个活跃 pipeline 至少有 1 个进程，才允许某题开第二个
+    子节点。避免一个多 flag 题的 2 个 subagent 把另一个 pipeline 饿死。
+    """
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, total)
+        self.used = 0
+        self._own: collections.Counter[str] = collections.Counter()
+        self._active: set[str] = set()
+        self._cond = asyncio.Condition()
+
+    def register(self, owner: str) -> None:
+        self._active.add(owner)
+
+    async def unregister(self, owner: str) -> None:
+        async with self._cond:
+            self._active.discard(owner)
+            self._cond.notify_all()
+
+    async def acquire(self, owner: str | None) -> None:
+        owner = owner or "?"
+        async with self._cond:
+            while True:
+                if self.used < self.total and (
+                    self._own[owner] == 0 or all(self._own[task] > 0 for task in self._active)
+                ):
+                    self.used += 1
+                    self._own[owner] += 1
+                    return
+                await self._cond.wait()
+
+    async def release(self, owner: str | None) -> None:
+        owner = owner or "?"
+        async with self._cond:
+            self.used = max(0, self.used - 1)
+            self._own[owner] -= 1
+            if self._own[owner] <= 0:
+                del self._own[owner]
+            self._cond.notify_all()
 
 
 def stall_seconds() -> float:
@@ -66,7 +111,7 @@ def activity_signature(ws: Path) -> tuple[int, float, float, int]:
     return (size, mtime, _newest_mtime(out), flags)
 
 
-async def run_solver_with_stream(
+async def _run_solver_with_stream(
     *,
     solver_cmd: list[str],
     ws,
@@ -187,3 +232,23 @@ async def run_solver_with_stream(
             await solver_task
         raise
     return outcome, early_new, early_completed
+
+
+async def run_solver_with_stream(*, slots=None, slot_owner=None, **kwargs):
+    """全局 solver 进程槽：subagent 节点和普通片共用同一个池。
+
+    平台/资源上限是 3；v2 节点也是真实 solver 子进程，必须一起计数。
+    """
+    if slots is None:
+        return await _run_solver_with_stream(**kwargs)
+    if isinstance(slots, FairSlotPool):
+        await slots.acquire(slot_owner)
+        try:
+            return await _run_solver_with_stream(**kwargs)
+        finally:
+            await slots.release(slot_owner)
+    await slots.acquire()
+    try:
+        return await _run_solver_with_stream(**kwargs)
+    finally:
+        slots.release()

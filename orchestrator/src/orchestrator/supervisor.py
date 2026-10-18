@@ -27,6 +27,8 @@ from .config import build_solver_env
 from .registry import ChallengeRecord
 
 GRACE_S = 10.0  # SIGTERM 后等待自行退出的宽限
+# 每次编排器进程启动 = 新会话：复用同名 attempt 目录时据此清掉上一进程的产物。
+_RUN_ID = f"{os.getpid()}-{int(time.time())}"
 
 
 @dataclass(slots=True)
@@ -57,8 +59,9 @@ def prepare_workspace(
     root = workspace_root(base)
     ws = root / f"{rec.unique_code}_attempt{attempt}"
     ws.mkdir(parents=True, exist_ok=True)
+    _reset_if_other_instance(ws, rec.container_addr)
     merged = dict(prior or {})
-    previous = _previous_attempt(root, rec.unique_code, ws)
+    previous = _previous_attempt(root, rec.unique_code, ws, rec.container_addr)
     if previous is not None:
         # 上一投被关闭/超时后，文件仍在磁盘：把 prior/history 合并，并把
         # 可复用文件路径写进提示，避免下一投重新侦察/重新写脚本。
@@ -76,6 +79,7 @@ def prepare_workspace(
         "targets": list(rec.container_addr),
         "flag_pattern": None,  # 平台不提供；从 description 推断或靠通用正则兜底
         "attempt": attempt,
+        "run_id": _RUN_ID,
         "prior": merged
         or {
             "assets": [],
@@ -109,6 +113,51 @@ def _dedupe(values: list) -> list:
     return out
 
 
+def _instance_sig(targets: list[str] | None) -> str:
+    return "|".join(sorted(str(t) for t in (targets or [])))
+
+
+def _reset_if_other_instance(ws: Path, targets: list[str] | None) -> None:
+    """同一 attempt 目录被新进程/新 target 复用时，清掉上一轮的 out/ 与日志。
+
+    平台每次 start 可能给同一 unique_code 分配不同的 target IP（实测 a-03:
+    .48 -> .50）。旧 out/flags、submitted.txt、prior.json 里的 IP 在新一局
+    全部失效；继续沿用会让 solver 去打别的题的目标，并把旧 flag 反复投递。
+    """
+    sig = _instance_sig(targets)
+    if not sig:
+        return
+    stamp = f"{_RUN_ID}|{sig}"
+    marker = ws / ".instance"
+    old = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+    same = old == stamp
+    if not old:
+        try:
+            stored = json.loads((ws / "task.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stored = None
+        same = (
+            bool(stored)
+            and stored.get("run_id") == _RUN_ID
+            and _instance_sig(stored.get("targets")) == sig
+        )
+    if same:
+        marker.write_text(stamp, encoding="utf-8")
+        return
+    out = ws / "out"
+    if out.is_dir() and any(out.iterdir()):
+        stale = ws / f"out.prev-{int(time.time())}"
+        with contextlib.suppress(OSError):
+            out.rename(stale)
+    for name in ("stdout.log", "stderr.log"):
+        with contextlib.suppress(OSError):
+            (ws / name).unlink()
+    for extra in ws.glob("stderr.log.*.log"):
+        with contextlib.suppress(OSError):
+            extra.unlink()
+    marker.write_text(stamp, encoding="utf-8")
+
+
 def _merge_prior(base: dict, extra: dict) -> dict:
     merged = dict(base or {})
     for key in ("assets", "explored", "open_leads", "credentials", "findings"):
@@ -134,7 +183,11 @@ def _merge_prior(base: dict, extra: dict) -> dict:
     return merged
 
 
-def _previous_attempt(root: Path, code: str, current: Path) -> Path | None:
+def _previous_attempt(
+    root: Path, code: str, current: Path, targets: list[str] | None = None
+) -> Path | None:
+    """上一 attempt 目录；只认**同一 target 实例**（IP 变了就是新一局）。"""
+    sig = _instance_sig(targets)
     best: Path | None = None
     best_mtime = -1.0
     for path in root.glob(f"{code}_attempt*"):
@@ -143,6 +196,16 @@ def _previous_attempt(root: Path, code: str, current: Path) -> Path | None:
         prior_file = path / "out" / "prior.json"
         if not prior_file.is_file():
             continue
+        if sig:
+            try:
+                task = json.loads((path / "task.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                task = None
+            if task is not None:
+                if task.get("run_id") != _RUN_ID:
+                    continue  # 上一进程/上一局：IP 与凭据都可能失效
+                if _instance_sig(task.get("targets")) != sig:
+                    continue
         with contextlib.suppress(OSError):
             mtime = prior_file.stat().st_mtime
             if mtime > best_mtime:

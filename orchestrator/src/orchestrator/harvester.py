@@ -169,15 +169,26 @@ async def submit_candidates(
         except TaskEnded:
             report.task_ended = True
             break
+        before = rec.correct_flag_count
         idx = result.get("matched_flag_index")
-        if idx is not None and int(idx) not in rec.matched_indices:
+        after = int(result.get("correct_flag_count") or before)
+        matched = idx is not None and int(idx) not in rec.matched_indices
+        if matched:
             rec.matched_indices.add(int(idx))
             report.matched_indices.append(int(idx))
+        if matched or after > before:
             report.new_matches += 1
+            rec.correct_flag_count = max(rec.correct_flag_count, after)
+        else:
+            # 平台对错误 flag 有时返回 200 + 未匹配（不是 422）：必须计入
+            # rejected 并消耗 reject 预算，否则会无限错投。
+            report.rejected += 1
+            rec.rejected_candidates += 1
+            rec.reject_budget = max(0, rec.reject_budget - 1)
         rec.submitted.add(flag)
         # 多 flag 题：correct_flag_count 是进度真值（platform-api.md §4.6）
-        total = result.get("total_flag_count")
-        if total and result["correct_flag_count"] >= total:
+        total = result.get("total_flag_count") or rec.flag_count
+        if total and after >= total:
             report.completed = True
             break
     return report

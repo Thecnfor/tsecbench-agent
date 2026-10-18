@@ -48,7 +48,7 @@ SKILLS: list[dict] = [
         "steps": [
             "指纹模板引擎（Twig/Jinja/Freemarker/Velocity）",
             "模板注入读文件/命令：{{7*7}}、${7*7}、<%= 7*7 %>",
-            "旧版元数据反序列化：找 unserialize/pickle/Java 序列化入口",
+            "PHP: phpggc <framework> <chain> <cmd>；Java: ysoserial <gadget> <cmd>",
         ],
         "stop": "先确定引擎再选 payload；模板名可控时直接包含 /flag。",
     },
@@ -109,9 +109,10 @@ SKILLS: list[dict] = [
             ("许可证", "授权码", "校验", "凭据"),
         ],
         "steps": [
-            "file/readelf/strings/objdump 先看架构与导入；rea 可用则 rea inspect",
-            "gdb/objdump 定位校验函数；找比较/分支/常量",
-            "本地运行/ emulate，构造正确输入；必要时 patch 校验",
+            "file/readelf/strings 先看架构；rea inspect <bin> 或 r2 -A <bin> 看函数/字符串",
+            "rea decompile <bin> <func> 或 analyzeHeadless 反编译；定位校验函数与成功分支",
+            "APK 用 jadx -d out app.apk；固件用 binwalk -e / unsquashfs 解包",
+            "构造输入或 patch；pwntools/ropper 辅助",
         ],
         "stop": "先定位校验函数和成功分支；不要全量反编译后才开始。",
     },
@@ -147,12 +148,27 @@ SKILLS: list[dict] = [
     },
     {
         "id": "multi-stage-web",
-        "require": [("官网", "门户网站", "全链路", "apt", "内网", "核心数据")],
+        "require": [
+            (
+                "官网",
+                "门户网站",
+                "全链路",
+                "apt",
+                "内网",
+                "核心数据",
+                "firewall",
+                "breach",
+                "lateral",
+                "pivot",
+                "multi-stage",
+            )
+        ],
         "steps": [
             "先打外网 Web：指纹/登录/上传/API，拿第一个立足点与凭据",
             "用凭据访问管理后台/内网服务；只扫描目标网段（10.x），不扫宿主 Docker",
             "每个 flag 后列剩余攻击面，横向到下一跳",
-            "复用已确认凭据到 SSH/数据库/对象存储",
+            "复用已确认凭据到 SSH/数据库/对象存储；ssh/sshpass 直连，proxychains4/chisel 做隧道",
+            "阶段成果立刻写入 stage 工具（foothold、credential、reachable host），供下一投接力",
         ],
         "stop": "一层打完立刻整理凭据和可达服务；没有新凭据就换入口，不要在同一页反复猜。",
     },
@@ -213,12 +229,38 @@ SKILLS: list[dict] = [
         "stop": "2 组凭据失败即换；拿到 shell 先读 flag，不要继续交互。",
     },
     {
+        "id": "jwt-auth",
+        "require": [
+            ("jwt", "bearer", "json web token"),
+            ("token", "cookie", "authorization", "alg"),
+        ],
+        "steps": [
+            "解码 header/payload，确认 alg 与 claim 结构",
+            "jwt_tool <token> -T 尝试 none/弱密钥；-C -d wordlist 跑字典",
+            "伪造 kid/jku、篡改 role/sub 后用真实接口验证",
+        ],
+        "stop": "先确认服务端真的校验签名；一次 401 就换 claim/算法，不要盲改。",
+    },
+    {
+        "id": "ad-smb",
+        "require": [
+            ("smb", "ldap", "kerberos", "active directory", "域控", "域内"),
+            ("credential", "password", "hash", "凭据", "用户"),
+        ],
+        "steps": [
+            "enum4linux-ng -A <host>；smbmap -H <host> -u guest 看共享",
+            "impacket（secretsdump/psexec/wmiexec）与 certipy 做 AD CS/凭据利用",
+            "拿到 hash/凭据后横向；优先读共享目录与配置",
+        ],
+        "stop": "先确认协议端口与认证方式；匿名失败就换已泄漏凭据，不要盲爆破。",
+    },
+    {
         "id": "generic-web",
         "require": [("web", "网站", "系统", "平台", "门户", "面板", "http")],
         "steps": [
-            "recon web：headers/title/tech，再对登录/上传/API 做 3 次探测",
+            "recon web：headers/title/tech；feroxbuster 或 nuclei（模板已内置）快速扫",
             "按指纹试 SQLi/LFI/SSRF/XXE/SSTI/未授权；先读源码/备份",
-            "每个入口做一次最小验证，失败就换入口",
+            "JWT 用 jwt_tool；SSTI 用 SSTImap；每个入口一次最小验证",
         ],
         "stop": "先指纹再选漏洞类；同一入口两次失败就换，不要盲扫大字典。",
     },
@@ -236,9 +278,9 @@ SKILLS: list[dict] = [
         "id": "generic-pwn",
         "require": [("二进制", "固件", "逆向", "可执行", "许可证", "pwn")],
         "steps": [
-            "file/checksec/strings/readelf 先看架构与保护",
-            "objdump/gdb 定位 main/校验函数/成功分支",
-            "本地构造输入；必要时 patch 或写 pwntools 脚本",
+            "file/checksec/readelf 先看架构与保护",
+            "r2 -A 或 rea decompile 定位 main/校验函数/成功分支",
+            "ropper/ROPgadget 找 gadget；本地构造输入或写 pwntools",
         ],
         "stop": "先成功分支再全量分析；不要先做完整反编译。",
     },
@@ -256,7 +298,20 @@ def generic_for(text: str, target: str = "") -> dict | None:
         word in low for word in ("云存储", "sas", "sts", "iam", "bucket", "对象存储", "serverless")
     ):
         return next((s for s in SKILLS if s["id"] == "generic-cloud"), None)
-    if any(word in low for word in ("内网", "全链路", "apt", "多阶段")):
+    if any(
+        word in low
+        for word in (
+            "内网",
+            "全链路",
+            "apt",
+            "多阶段",
+            "横向",
+            "firewall",
+            "breach",
+            "lateral",
+            "pivot",
+        )
+    ):
         return next((s for s in SKILLS if s["id"] == "multi-stage-web"), None)
     if any(
         port in t

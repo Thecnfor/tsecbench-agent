@@ -93,6 +93,27 @@ class RejectingClient:
         raise FlagRejected("422 rejected")
 
 
+class NoMatchClient:
+    """平台对错误 flag 返回 200 + matched_flag_index=null（不是 422）。"""
+
+    async def submit(self, unique_code: str, flag: str) -> dict:
+        return {
+            "correct_flag_count": 0,
+            "total_flag_count": 4,
+            "matched_flag_index": None,
+        }
+
+
+def test_200_without_match_counts_rejected_and_budget():
+    rec = ChallengeRecord(unique_code="n1", flag_count=4, total_score=1200)
+    report = asyncio.run(submit_candidates(NoMatchClient(), rec, ["flag{one}", "flag{two}"]))
+    assert report.rejected == 2
+    assert report.new_matches == 0
+    assert rec.rejected_candidates == 2
+    assert rec.reject_budget == 1
+    assert rec.correct_flag_count == 0
+
+
 def test_rejected_candidate_is_not_resubmitted():
     rec = ChallengeRecord(unique_code="r1")
     rejecting = RejectingClient()

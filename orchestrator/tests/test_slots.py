@@ -8,6 +8,45 @@ from types import SimpleNamespace
 from orchestrator.main import _active_slots
 
 
+def test_deep_task_detection():
+    from orchestrator.main import _is_deep_task
+
+    def rec(**kw):
+        base = dict(flag_count=1, difficulty="easy", description="", container_addr=["10.0.0.1:80"])
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    assert _is_deep_task(rec(description="内部门户穿透评估"))
+    assert _is_deep_task(rec(container_addr=["10.0.0.1:23"]))  # telnet 需要长跑道
+    assert not _is_deep_task(rec(description="文档协作平台"))
+
+
+def test_fair_slot_pool_prevents_pipeline_starvation():
+    import asyncio
+
+    from orchestrator.streams import FairSlotPool
+
+    async def scenario():
+        pool = FairSlotPool(3)
+        for code in ("a", "b", "c"):
+            pool.register(code)
+        await pool.acquire("a")
+        second = asyncio.create_task(pool.acquire("a"))
+        await asyncio.sleep(0.01)
+        assert not second.done()  # b/c 还没有槽，a 不能开第二个
+        await pool.acquire("b")
+        await pool.acquire("c")
+        await pool.release("c")
+        await pool.unregister("c")  # c 的 pipeline 结束后，a 才能开第二个
+        await asyncio.wait_for(second, 0.5)
+        assert pool.used == 3
+        await pool.release("a")
+        await pool.release("b")
+        await pool.release("a")
+
+    asyncio.run(scenario())
+
+
 def test_active_slots_counts_running_pipelines_only():
     ctx = SimpleNamespace(running={"a", "b"}, registry=SimpleNamespace(active_count=lambda: 99))
     assert _active_slots(ctx) == 2
@@ -38,6 +77,9 @@ def test_probe_decision_tiers():
     assert _probe_decision(2, True, True, 240) == "full"
     assert _probe_decision(3, True, False, 240) == "full"
     assert _probe_decision(1, True, True, 0) == "stop"
+    # deep 题：首轮无进展也必须走完两段探测 + 剩余片（多阶段横向需要跑道）
+    assert _probe_decision(1, False, False, 240, deep=True) == "second"
+    assert _probe_decision(2, False, False, 240, deep=True) == "full"
 
 
 def test_pass_progress_only_counts_flag_candidates(tmp_path):

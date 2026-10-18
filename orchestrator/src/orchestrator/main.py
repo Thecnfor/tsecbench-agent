@@ -90,6 +90,8 @@ class RunContext:
     priors: dict[str, dict] = field(default_factory=dict)  # code → 双图状态（跨轮合并）
     running: set[str] = field(default_factory=set)
     slot_freed: asyncio.Event = field(default_factory=asyncio.Event)
+    # 全局 solver 进程并发（含 v2 subagent 节点）；平台硬上限 3。
+    solver_slots: streams.FairSlotPool | None = None
     stopped: bool = False
     t0: float = 0.0
     env: dict[str, str] | None = None  # 传给 solver 的基础环境（测试注入用）
@@ -152,10 +154,45 @@ async def _wait_available(ctx: RunContext, rec: ChallengeRecord, timeout_s: floa
     return False
 
 
+_HTTP_PORTS = frozenset(
+    {80, 443, 3000, 5000, 7001, 7860, 8000, 8008, 8080, 8081, 8888, 9000, 9090, 10000}
+)
+
+
+async def _http_status(host: str, port: int) -> int | None:
+    """取 HTTP 状态码；连接失败返回 None。5xx = 应用还没就绪（DB/迁移未完成）。"""
+    ssl_ctx = None
+    if port == 443:
+        import ssl
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=3.0
+        )
+    except (TimeoutError, OSError):
+        return None
+    try:
+        writer.write(f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode())
+        await asyncio.wait_for(writer.drain(), timeout=2.0)
+        line = await asyncio.wait_for(reader.readline(), timeout=3.0)
+        parts = line.decode(errors="replace").split()
+        return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    except (TimeoutError, OSError):
+        return 0
+    finally:
+        writer.close()
+
+
 async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: float) -> bool:
-    """TCP 就绪预检：available ≠ 服务就绪（实测容器起后 Web 服务还有 ~1-3min 冷启），
-    过早放行 solver 会把它推进「网络诊断死循环」烧掉整个时间片（a-05 实测 14 轮全烧）。
-    best-effort：超时也放行（记 journal），solver 仍可尝试其它攻击面。"""
+    """就绪预检：available ≠ 服务就绪。
+
+    实测 a-03：容器 TCP 已开，但 Flask `/login` 连续 5xx 数分钟；agent 误判
+    “服务坏了”，转去扫同网段别的靶机（那是另一道题的目标），整片烧光。
+    所以 HTTP 端口必须看到 <500 才放行；超时仍 best-effort 放行并记 journal。
+    """
     addrs = []
     for a in rec.container_addr:
         host, _, port = a.partition(":")
@@ -164,6 +201,7 @@ async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: f
     if timeout_s <= 0 or all(h in ("127.0.0.1", "localhost", "::1") for h, _ in addrs):
         return True
     deadline = time.monotonic() + timeout_s
+    last_status: dict[str, int] = {}
     while time.monotonic() < deadline:
         for host, port in addrs:
             try:
@@ -171,12 +209,20 @@ async def _wait_target_ready(ctx: RunContext, rec: ChallengeRecord, timeout_s: f
                     asyncio.open_connection(host, port), timeout=3.0
                 )
                 writer.close()
-                return True
             except OSError:
                 continue
+            if port in _HTTP_PORTS:
+                status = await _http_status(host, port)
+                last_status[f"{host}:{port}"] = status or 0
+                if status is not None and 500 <= status < 600:
+                    continue  # 应用层未就绪，别放 solver 出去
+            return True
         await asyncio.sleep(3.0)
     ctx.journal.append(
-        "target_not_ready", unique_code=rec.unique_code, addrs=[f"{h}:{p}" for h, p in addrs]
+        "target_not_ready",
+        unique_code=rec.unique_code,
+        addrs=[f"{h}:{p}" for h, p in addrs],
+        http_status=last_status,
     )
     return False
 
@@ -337,6 +383,8 @@ def _slice_has_progress(ws: Path, since: float | None = None) -> bool:
 
 
 async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
+    if ctx.solver_slots is not None:
+        ctx.solver_slots.register(code)
     try:
         await _pipeline_inner(ctx, code, slice_s)
     except asyncio.CancelledError:
@@ -356,6 +404,9 @@ async def _pipeline(ctx: RunContext, code: str, slice_s: float) -> None:
                 rec.state = "QUEUED"
         except Exception:  # noqa: BLE001 - 兜底路径失败不掩盖原始异常
             pass
+    finally:
+        if ctx.solver_slots is not None:
+            await ctx.solver_slots.unregister(code)
 
 
 def _should_extend(remaining_s: float, completed: bool, has_progress: bool) -> bool:
@@ -363,15 +414,35 @@ def _should_extend(remaining_s: float, completed: bool, has_progress: bool) -> b
     return not completed and remaining_s > 5.0 and has_progress
 
 
-def _probe_decision(stage: int, has_progress: bool, high_value: bool, remaining_s: float) -> str:
-    """分层试探：60s 有资产 → 再 60s → 只有凭据/候选才继续吃剩余片。"""
+def _probe_decision(
+    stage: int, has_progress: bool, high_value: bool, remaining_s: float, *, deep: bool = False
+) -> str:
+    """分层试探：60s 有资产 → 再 60s → 只有凭据/候选才继续吃剩余片。
+
+    deep（多阶段/hard/多 flag）：即使首轮没 flag 也给满两段探测 + 剩余片，
+    避免 b-02 这类“22 秒就关”的横向题被饿死。
+    """
     if remaining_s <= 5.0:
         return "stop"
     if stage == 1:
-        return "second" if has_progress else "stop"
+        return "second" if (has_progress or deep) else "stop"
     if stage == 2:
-        return "full" if (high_value or has_progress) else "stop"
+        return "full" if (high_value or has_progress or deep) else "stop"
     return "full"
+
+
+_DEEP_DESC_RE = re.compile(
+    r"(?i)穿透|内网|横向|多阶段|全链路|防火墙|firewall|lateral|pivot|multi-stage|breach|chain"
+)
+
+
+def _is_deep_task(rec) -> bool:
+    return (
+        rec.flag_count > 1
+        or rec.difficulty == "hard"
+        or any(str(addr).endswith(":23") for addr in (rec.container_addr or []))
+        or bool(_DEEP_DESC_RE.search(rec.description or ""))
+    )
 
 
 def _v2_enabled_for(code: str, rec=None, real_solver: bool = False) -> bool:
@@ -519,10 +590,13 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
             else:
                 planner = StagePlanner(multi_flag=rec.flag_count > rec.correct_flag_count)
                 max_parallel = min(3, ctx.config.concurrency_limit)
+            # 单题内允许多节点并行；全局 3 个 solver 进程由 solver_slots 兜底，
+            # 普通片和 v2 节点共用同一个 Semaphore。
             controller = V2Controller(
                 runner=None,
                 max_parallel=max_parallel,
                 node_timeout_s=max(60.0, slice_s),
+                slots=ctx.solver_slots,
             )
             await controller.run_task(
                 task=rec.description or "",
@@ -539,7 +613,10 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
             )
             slice_count = 1
             outcome = SimpleNamespace(
-                exit_code=0, timed_out=False, duration_s=time.monotonic() - v2_started
+                exit_code=0,
+                timed_out=False,
+                stalled=False,
+                duration_s=time.monotonic() - v2_started,
             )
             early_new, early_completed = 0, False
         else:
@@ -569,6 +646,8 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                     unique_code=code,
                     rec=rec,
                     since=attempt_start,
+                    slots=ctx.solver_slots,
+                    slot_owner=code,
                 )
                 early_new += sub_new
                 early_completed = early_completed or sub_completed
@@ -581,7 +660,9 @@ async def _pipeline_inner(ctx: RunContext, code: str, slice_s: float) -> None:
                     prior.get("credentials")
                 )
                 high_value = bool(harvest(ws, since=attempt_start))
-                decision = _probe_decision(stage, has_progress, high_value, remaining_slice)
+                decision = _probe_decision(
+                    stage, has_progress, high_value, remaining_slice, deep=_is_deep_task(rec)
+                )
                 if decision == "stop":
                     ctx.journal.append(
                         "probe_stop",
@@ -787,6 +868,7 @@ async def run_agent(
         env=env,
         t0=time.time(),
         memory=memory,
+        solver_slots=streams.FairSlotPool(max(1, config.concurrency_limit)),
     )
     tasks: set[asyncio.Task] = set()
     reconciled = False

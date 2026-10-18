@@ -40,6 +40,76 @@ def test_workspace_writes_task_json(tmp_path):
     assert (ws / "out" / "flags").is_dir()
 
 
+def test_prior_not_carried_across_target_reassignment(tmp_path):
+    """平台每局重分配 IP：旧 attempt 的 assets/credentials 不能带进新实例。"""
+    old = rec(container_addr=["10.0.168.48:80"])
+    old_ws = prepare_workspace(tmp_path, old, attempt=1)
+    (old_ws / "out" / "prior.json").write_text(
+        json.dumps({"assets": ["10.0.168.49:8000"], "credentials": ["admin:x"]}),
+        encoding="utf-8",
+    )
+
+    new = rec(container_addr=["10.0.168.50:80"])
+    ws = prepare_workspace(tmp_path, new, attempt=2)
+    task = json.loads((ws / "task.json").read_text(encoding="utf-8"))
+    assert task["prior"]["assets"] == []
+    assert task["prior"]["credentials"] == []
+    assert "previous_workspace" not in task["prior"]
+
+
+def test_reused_attempt_dir_is_cleared_for_new_instance(tmp_path):
+    old = rec(container_addr=["10.0.168.48:80"])
+    ws = prepare_workspace(tmp_path, old, attempt=1)
+    (ws / "out" / "submitted.txt").write_text("flag{old}\n", encoding="utf-8")
+    (ws / "out" / "flags" / "f.txt").write_text("flag{old}\n", encoding="utf-8")
+    (ws / "stdout.log").write_text("old run", encoding="utf-8")
+
+    new = rec(container_addr=["10.0.168.50:80"])
+    again = prepare_workspace(tmp_path, new, attempt=1)
+    assert again == ws
+    assert not (ws / "out" / "submitted.txt").exists()
+    assert list((ws / "out" / "flags").iterdir()) == []
+    assert not (ws / "stdout.log").exists()
+    assert list(ws.glob("out.prev-*"))
+
+
+def test_same_instance_recovery_keeps_progress(tmp_path):
+    """崩溃恢复重跑同一 attempt（marker 还没写过）：保留 out/，不清进度。"""
+    r = rec(container_addr=["10.0.168.50:80"])
+    ws = prepare_workspace(tmp_path, r, attempt=1)
+    (ws / ".instance").unlink()
+    (ws / "out" / "submitted.txt").write_text("flag{kept}\n", encoding="utf-8")
+    again = prepare_workspace(tmp_path, rec(container_addr=["10.0.168.50:80"]), attempt=1)
+    assert again == ws
+    assert (ws / "out" / "submitted.txt").exists()
+
+
+def test_new_process_resets_reused_attempt_dir(monkeypatch, tmp_path):
+    """重启后同名 attempt 目录必须清空：进程级 run_id 变了。"""
+    import orchestrator.supervisor as supervisor_mod
+
+    r = rec(container_addr=["10.0.168.50:80"])
+    ws = prepare_workspace(tmp_path, r, attempt=1)
+    (ws / "out" / "submitted.txt").write_text("flag{prev-run}\n", encoding="utf-8")
+    monkeypatch.setattr(supervisor_mod, "_RUN_ID", "another-orchestrator-process")
+    again = prepare_workspace(tmp_path, rec(container_addr=["10.0.168.50:80"]), attempt=1)
+    assert again == ws
+    assert not (ws / "out" / "submitted.txt").exists()
+
+
+def test_same_instance_keeps_attempt_continuity(tmp_path):
+    r = rec(container_addr=["10.0.168.50:80"])
+    first = prepare_workspace(tmp_path, r, attempt=1)
+    (first / "out" / "prior.json").write_text(
+        json.dumps({"assets": ["10.0.168.50:80"], "open_leads": ["login sql injection"]}),
+        encoding="utf-8",
+    )
+    second = prepare_workspace(tmp_path, rec(container_addr=["10.0.168.50:80"]), attempt=2)
+    task = json.loads((second / "task.json").read_text(encoding="utf-8"))
+    assert "10.0.168.50:80" in task["prior"]["assets"]
+    assert task["prior"]["open_leads"] == ["login sql injection"]
+
+
 def test_collect_prior_tolerates_missing_and_garbage(tmp_path):
     ws = prepare_workspace(tmp_path, rec(), attempt=1)
     assert collect_prior(ws) == {

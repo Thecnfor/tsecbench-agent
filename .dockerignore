@@ -11,6 +11,7 @@ exp/
 *.ovpn
 .env
 **/.env
+runtime-import.env
 
 # 运行时与开发产物：镜像内一律重建，不从宿主机带入。
 # 注意 dockerignore 的普通路径只匹配根级 —— 必须 **/ 前缀才能拦住
@@ -34,3 +35,4 @@ bench_results.jsonl
 solver/.pi-vendor/
 .superpowers/
 workspaces/
+workspaces-docker/

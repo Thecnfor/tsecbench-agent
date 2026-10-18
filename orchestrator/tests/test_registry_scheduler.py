@@ -85,8 +85,8 @@ def test_progress_truth_overwritten_each_sync():
 
 
 # --------------------------------------------------------------- Scheduler ----
-def test_priority_easy_high_value_first():
-    """性价比优先：easy 高分 > hard 高分 > easy 低分。"""
+def test_easy_first_then_higher_difficulty():
+    """先易后难：easy 先拿分，再 hard。"""
     records = {
         "hard": rec("hard", difficulty="hard", total_score=200, flag_count=1),
         "easy100": rec("easy100", difficulty="easy", total_score=100, flag_count=1),
@@ -96,11 +96,8 @@ def test_priority_easy_high_value_first():
     assert order == ["easy100", "easy50", "hard"]
 
 
-def test_priority_easy_not_starved_by_medium():
-    """回归：easy 100 分必须排在 medium 300 分之前。
-
-    原 cost（easy 1.0）下 easy100 性价比 100 < medium300 的 150，实测导致 6 道
-    easy 送分题整轮从未被启动 —— 先易后难的纪律被成本模型反噬。"""
+def test_easy_before_medium_regardless_of_score():
+    """用户策略：先易后难，easy 100 先于 medium 300。"""
     records = {
         "easy100": rec("easy100", difficulty="easy", total_score=100, flag_count=1),
         "medium300": rec("medium300", difficulty="medium", total_score=300, flag_count=1),
@@ -109,11 +106,7 @@ def test_priority_easy_not_starved_by_medium():
     assert order == ["easy100", "medium300"]
 
 
-def test_multi_flag_downweighted_to_back():
-    """多阶段题（flag_count>1）实测零产出，按成本放大排到队尾。
-
-    b-01（medium 1200 分 4 flag）原本性价比 600 排第一，放大后应低于
-    普通 medium 300 分单 flag 题。"""
+def test_multi_flag_goes_after_single_flag():
     records = {
         "b-01": rec("b-01", difficulty="medium", total_score=1200, flag_count=4),
         "medium300": rec("medium300", difficulty="medium", total_score=300, flag_count=1),
@@ -128,8 +121,7 @@ def test_priority_level_and_difficulty_tiebreak():
         "m1": rec("m1", difficulty="medium", level=1, total_score=200, flag_count=1),
         "h1": rec("h1", difficulty="hard", level=1, total_score=400, flag_count=1),
     }
-    # 新契约：首键是零进展沉底标记，难度升序是第二键 —— medium 永远排在
-    # hard 之前（先拿分再说）。
+    # 先易后难：medium 排在 hard 之前；level 只做同难度 tiebreak。
     assert priority_key(records["m1"])[1] < priority_key(records["h1"])[1]
     assert priority_key(records["m1"])[0] == priority_key(records["h1"])[0] == 0
     assert eligible(records)[0].unique_code == "m1"

@@ -20,7 +20,6 @@ ARG GO_VERSION=1.26
 ARG PYTHON_VERSION=3.13
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
 ARG PI_VERSION=1.1.0
-ARG OPENHANDS_VERSION=1.11.0
 ARG MASTRA_VERSION=1.75.0
 ARG ZOD_VERSION=4.6.5
 ARG RIPGREP_VERSION=TODO-PIN-AT-IMAGE-BUILD
@@ -69,7 +68,6 @@ RUN npm run build
 # ---- runtime：运行时面 ------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 ARG PYTHON_VERSION
-ARG OPENHANDS_VERSION
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
@@ -79,27 +77,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # 基础 / 网络
       ca-certificates ripgrep curl wget git unzip xz-utils file xxd less procps \
-      socat netcat-openbsd tcpdump iproute2 dnsutils \
+      socat netcat-openbsd tcpdump iproute2 dnsutils iputils-ping \
       # 侦察与扫描
       nmap masscan \
       # Web
-      sqlmap whatweb \
+      sqlmap whatweb gobuster \
       # 爆破
       hydra john hashcat \
       # 多阶段 / 横向 / 云 / 取证
       openssh-client sshpass proxychains4 jq smbclient ldap-utils \
       libimage-exiftool-perl steghide \
       # 二进制 / Pwn
-      gdb binutils patchelf gcc g++ make gcc-multilib \
+      gdb binutils patchelf gcc g++ make gcc-multilib pkg-config libssl-dev \
       # 逆向（trixie 无 rizin/radare2，用 gdb+binutils+binwalk；nikto 也不在 trixie，
       #   image-spec.md §3 记为 apt/git，需要时单独 clone）
       binwalk \
       # L4 Lua 注入面（仅本地写/自检 .nse）+ Redis
-      lua5.4 redis-tools \
+      lua5.4 redis-tools default-mysql-client postgresql-client php-cli \
+      squashfs-tools foremost tshark \
       # Python 3.13 运行时（trixie 自带）
-      python3 python3-venv python3-pip \
-      # JDK（Ghidra 12.1.4 依赖）
-      openjdk-21-jdk-headless \
+      python3 python3-venv python3-pip openjdk-21-jdk-headless \
       # VPN 双模（runbook.md §2.2）
       openvpn \
     && rm -rf /var/lib/apt/lists/* \
@@ -112,10 +109,55 @@ RUN set -eux; \
     curl -fsSL https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz \
       | tar -xz -C /tmp ffuf && install -m 0755 /tmp/ffuf /usr/local/bin/ffuf; \
     curl -fsSL https://github.com/projectdiscovery/nuclei/releases/download/v3.3.5/nuclei_3.3.5_linux_amd64.zip \
-      -o /tmp/nuclei.zip && unzip -q /tmp/nuclei.zip -d /tmp && install -m 0755 /tmp/nuclei /usr/local/bin/nuclei; \
+      -o /tmp/nuclei.zip && unzip -q /tmp/nuclei.zip -d /tmp && install -m 0755 /tmp/nuclei /usr/local/bin/nuclei.real; \
     curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz \
       | gunzip > /usr/local/bin/chisel && chmod 0755 /usr/local/bin/chisel; \
+    mkdir -p /usr/local/share/nuclei-templates; \
+    curl -fsSL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.tar.gz \
+      | tar -xz --strip-components=1 -C /usr/local/share/nuclei-templates; \
+    printf '%s\n' '#!/bin/sh' 'for a in "$@"; do case "$a" in -t|--templates|-tl|--template-list) exec /usr/local/bin/nuclei.real "$@";; esac; done' 'exec /usr/local/bin/nuclei.real -t /usr/local/share/nuclei-templates "$@"' > /usr/local/bin/nuclei; \
+    chmod 0755 /usr/local/bin/nuclei; \
     rm -rf /tmp/ffuf /tmp/nuclei.zip /tmp/nuclei
+
+# 1d) 成熟工具面：feroxbuster / jadx / ysoserial / phpggc / SSTImap / jwt_tool / enum4linux-ng
+RUN set -eux; \
+    curl -fsSL https://github.com/epi052/feroxbuster/releases/download/v2.13.1/x86_64-linux-feroxbuster.tar.gz \
+      | tar -xz -C /tmp feroxbuster && install -m 0755 /tmp/feroxbuster /usr/local/bin/feroxbuster; \
+    curl -fsSL https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip \
+      -o /tmp/jadx.zip && mkdir -p /opt/jadx && unzip -q /tmp/jadx.zip -d /opt/jadx && chmod 0755 /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui; \
+    ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx; \
+    ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui; \
+    curl -fsSL https://github.com/frohoff/ysoserial/releases/download/v0.0.6/ysoserial-all.jar -o /opt/ysoserial.jar; \
+    git clone --depth 1 https://github.com/ambionics/phpggc /opt/phpggc; \
+    ln -sf /opt/phpggc/phpggc /usr/local/bin/phpggc; \
+    git clone --depth 1 https://github.com/vladko312/SSTImap /opt/sstimap; \
+    printf '#!/bin/sh\nexec /opt/tsecbench/venv/bin/python /opt/sstimap/sstimap.py "$@"\n' > /usr/local/bin/sstimap; \
+    git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool; \
+    printf '#!/bin/sh\nexec /opt/tsecbench/venv/bin/python /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool; \
+    git clone --depth 1 https://github.com/cddmp/enum4linux-ng /opt/enum4linux-ng; \
+    printf '#!/bin/sh\nexec /opt/tsecbench/venv/bin/python /opt/enum4linux-ng/enum4linux-ng.py "$@"\n' > /usr/local/bin/enum4linux-ng; \
+    chmod 0755 /usr/local/bin/sstimap /usr/local/bin/jwt_tool /usr/local/bin/enum4linux-ng; \
+    rm -rf /tmp/feroxbuster /tmp/jadx.zip
+
+# 1c) 逆向三件套：Ghidra 12.1.4 + radare2 6.2.4 + REA 6.3.0（全部离线打包）
+RUN set -eux; \
+    curl -fsSL https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip \
+      -o /tmp/ghidra.zip; \
+    mkdir -p /opt/tsecbench; \
+    unzip -q /tmp/ghidra.zip -d /opt; \
+    mv /opt/ghidra_12.1.4_PUBLIC /opt/tsecbench/ghidra; \
+    rm -f /tmp/ghidra.zip; \
+    ln -sf /opt/tsecbench/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless
+
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends patch && rm -rf /var/lib/apt/lists/*; \
+    git clone --depth 1 --branch 6.2.4 https://github.com/radareorg/radare2.git /tmp/radare2; \
+    cd /tmp/radare2; \
+    ./configure --prefix=/usr/local >/tmp/r2-configure.log 2>&1 || { tail -50 /tmp/r2-configure.log; exit 1; }; \
+    make -j4 >/tmp/r2-make.log 2>&1 || { tail -80 /tmp/r2-make.log; exit 1; }; \
+    make install >/tmp/r2-install.log 2>&1 || { tail -50 /tmp/r2-install.log; exit 1; }; \
+    rm -rf /tmp/radare2 /tmp/r2-*.log; \
+    r2 -v | head -1
 
 # 2) Node 运行时（pi / ts-workflow 需要）—— 从 pi-vendor 阶段带过来
 COPY --from=pi-vendor /usr/local/bin/node /usr/local/bin/node
@@ -124,10 +166,16 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && node --version
 
-# 3) Python 依赖：编排器（本项目）+ OpenHands 控制平面（独立 venv，版本取
-#    toolchain.env）。OpenHands 全系 requires_python <3.14 —— 这是本镜像钉 3.13
-#    的唯一原因（architecture.md §1.1）。
-# 只带 pyproject + src：tests/ 里的样例 flag 不应进任何镜像层
+RUN set -eux; \
+    mkdir -p /opt/tsecbench/rea; \
+    cd /opt/tsecbench/rea; \
+    printf '{"name":"rea-runtime","private":true}\n' > package.json; \
+    npm install --no-audit --no-fund rea-agents@6.3.0; \
+    ln -sf /opt/tsecbench/rea/node_modules/.bin/rea /usr/local/bin/rea; \
+    test -x /opt/tsecbench/rea/node_modules/.bin/rea
+
+# 3) Python 依赖：编排器 + 工具链（OpenHands 未在运行时使用，已移除以控制镜像体积）。
+#    只带 pyproject + src：tests/ 里的样例 flag 不应进任何镜像层
 COPY orchestrator/pyproject.toml /tmp/build/orchestrator/pyproject.toml
 COPY orchestrator/src/ /tmp/build/orchestrator/src/
 COPY mock/ /tmp/build/mock/
@@ -137,9 +185,10 @@ RUN python3 -m venv /opt/tsecbench/venv \
     # triviumdb 发的是 abi3 轮子、3.13 可用，但元数据保守写了 <3.13
     && /opt/tsecbench/venv/bin/pip install --ignore-requires-python "triviumdb>=0.8.8,<0.9" \
     && /opt/tsecbench/venv/bin/pip install /tmp/build/orchestrator /tmp/build/mock \
-    && /opt/tsecbench/venv/bin/pip install "openhands-ai==${OPENHANDS_VERSION}" \
-    && /opt/tsecbench/venv/bin/pip install pwntools capstone pyelftools ROPgadget impacket awscli \
-    && /opt/tsecbench/venv/bin/python -c "import orchestrator, mock_server, openhands, pwn, capstone, elftools; print('py deps ok')" \
+    && /opt/tsecbench/venv/bin/pip install openai pwntools capstone pyelftools ROPgadget impacket awscli boto3 httpx \
+      flask-unsign ropper pycryptodome gmpy2 keystone-engine unicorn \
+      certipy-ad ldapdomaindump smbmap ldap3 pyyaml termcolor \
+    && /opt/tsecbench/venv/bin/python -c "import orchestrator, mock_server, pwn, capstone, elftools; print('py deps ok')" \
     && rm -rf /tmp/build
 
 # 4) 交付物落位
@@ -162,7 +211,13 @@ EXPOSE 7878
 #   SOLVER_CMD=<python> /opt/tsecbench/solver/dual_main.py     ← pi 直跑入口
 ENV PI_BIN=/opt/tsecbench/pi/node_modules/.bin/pi \
     GATEWAY_MODE=on \
-    TSECBENCH_SOLVER_DIR=/opt/tsecbench/solver
+    TSECBENCH_SOLVER_DIR=/opt/tsecbench/solver \
+    JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+    GHIDRA_INSTALL_DIR=/opt/tsecbench/ghidra
+
+# 4b) 本地托管仿真需要 iptables（放在末尾，避免破坏重工具缓存层）
+RUN apt-get update && apt-get install -y --no-install-recommends iptables \
+    && rm -rf /var/lib/apt/lists/*
 
 # 5) 泄漏扫描（image-spec.md §6）—— 必须是最后一道 RUN，命中即断构建。
 #    红线：镜像不得含 flag 字面量、题目答案、针对性题解、ing/ 凭据、refs/ 素材。

@@ -123,7 +123,7 @@ def priority_key(rec: ChallengeRecord) -> tuple[int, int, float, int, str]:
     # “伪 easy”题不再长期霸占槽，未跑过的 medium/hard 可以排到它们前面。
     rank = DIFFICULTY_RANK.get(rec.difficulty, 1) + min(rec.attempts, 2)
     zero = 0 if rec.zero_progress_passes == 0 else 1
-    # 不记 per-code 历史：fresh 广度优先，平台难度/分数只做同层排序。
+    # 先易后难（用户策略）：easy 先拿分，再 medium/hard；同难度内按性价比排序。
     return (zero, rank, -value, rec.level, rec.unique_code)
 
 

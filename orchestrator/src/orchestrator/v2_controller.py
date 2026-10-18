@@ -192,6 +192,7 @@ def make_stream_runner(
     rec,
     deadline_epoch: float,
     stage_count: int = 1,
+    slots=None,
 ):
     """把 streams.run_solver_with_stream 包成节点级 runner（生产装配）。
 
@@ -244,6 +245,8 @@ def make_stream_runner(
             journal=journal,
             unique_code=key,
             rec=rec,
+            slots=slots,
+            slot_owner=rec.unique_code,
         )
         # 节点 flags 回传父 workspace，供片尾 harvest 统一收割/去重。
         dest = ws / "out" / "flags"
@@ -261,13 +264,20 @@ def make_stream_runner(
 
 class V2Controller:
     def __init__(
-        self, *, runner, max_parallel: int = 3, node_timeout_s: float = 900.0, memory=None
+        self,
+        *,
+        runner,
+        max_parallel: int = 3,
+        node_timeout_s: float = 900.0,
+        memory=None,
+        slots=None,
     ) -> None:
         from .v2_state import GraphController
 
         self.controller = GraphController(max_parallel=max_parallel, node_timeout_s=node_timeout_s)
         self.bridge = PlannerBridge(memory=memory, controller=self.controller)
         self.runner = runner
+        self.slots = slots  # 全局 solver 进程 Semaphore（含普通片）
         self.skipped_delegates = 0  # planner 重复/越权委派被跳过的计数（观测位）
 
     async def _drive(self, planner, *, poll_interval: float = 0.01) -> None:
@@ -365,6 +375,7 @@ class V2Controller:
             rec=rec,
             deadline_epoch=deadline_epoch,
             stage_count=stage_count,
+            slots=self.slots,
         )
         self.runner = runner
         await self._drive(planner)
