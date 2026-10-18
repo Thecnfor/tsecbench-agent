@@ -27,6 +27,7 @@ const CFG: BranchCfg = {
   pruneSec: 600,
   plannerNudgeMax: 2,
   plannerNudgeCooldownSec: 400,
+  weightCooldownSec: 120,
 };
 
 function trunkMsgs(): ChatMessage[] {
@@ -283,6 +284,34 @@ describe("fork 优先调度", () => {
     // boost 只消费一次，之后回到 RR
     expect(bm.get(0)!.priority).toBe(0);
     expect(bm.get(1)!.priority).toBe(1); // 新 fork 两票，剩一票
+  });
+});
+
+describe("planner 权重调度", () => {
+  it("权重设置幂等，并在冷却内不重复调整", () => {
+    const bm = mkBm();
+    expect(bm.setWeight(0, 2, 1000)).toBe(true);
+    expect(bm.setWeight(0, 2, 1001)).toBe(false); // 目标未变
+    expect(bm.setWeight(0, 3, 1001)).toBe(false); // 冷却中
+    expect(bm.setWeight(0, 3, 1121)).toBe(true);
+  });
+
+  it("加权调度让高权重 branch 获得更多 turn，但低权重仍有保底机会", () => {
+    const bm = mkBm();
+    bm.materializeFork(1, 0, "A", 3, 1001, (id) => `/w/br/${id}`);
+    bm.materializeFork(2, 0, "B", 4, 1002, (id) => `/w/br/${id}`);
+    for (const id of [0, 1, 2]) bm.get(id)!.priority = 0;
+    bm.setWeight(0, 3, 1100);
+    const seen = new Map<number, number>();
+    for (let i = 0; i < 10; i++) {
+      const b = bm.pickWeighted();
+      expect(b).not.toBeNull();
+      seen.set(b!.id, (seen.get(b!.id) ?? 0) + 1);
+    }
+    expect(seen.get(0)!).toBeGreaterThan(seen.get(1) ?? 0);
+    expect(seen.get(0)!).toBeGreaterThan(seen.get(2) ?? 0);
+    expect(seen.get(1) ?? 0).toBeGreaterThan(0);
+    expect(seen.get(2) ?? 0).toBeGreaterThan(0);
   });
 });
 

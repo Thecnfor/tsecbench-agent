@@ -182,6 +182,7 @@ export interface Config {
   // planner 卡塞提醒（不调用额外 LLM；程序检测信号后提醒/回收）
   planner_nudge_max: number;
   planner_nudge_cooldown_sec: number;
+  planner_weight_cooldown_sec: number;
   stall_short_sec: number;
   stall_long_sec: number;
   flag_stall_short_sec: number;
@@ -271,6 +272,7 @@ export const CFG: Config = {
   // --- planner 卡塞提醒（程序检测 + 模板提醒，不调用额外 LLM） ---
   planner_nudge_max: num("AGENT_PLANNER_NUDGE_MAX", "2"), // 每段每 Attempt 提醒上限
   planner_nudge_cooldown_sec: num("AGENT_PLANNER_NUDGE_COOLDOWN_SEC", "400"),
+  planner_weight_cooldown_sec: num("AGENT_PLANNER_WEIGHT_COOLDOWN_SEC", "120"),
   // 组合信号（任二成立触发）的分档阈值：停滞时长按题目分类取值
   stall_short_sec: num("AGENT_STALL_SHORT_SEC", "300"),
   stall_long_sec: num("AGENT_STALL_LONG_SEC", "600"),

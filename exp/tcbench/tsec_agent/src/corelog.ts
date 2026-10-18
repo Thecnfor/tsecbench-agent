@@ -176,6 +176,10 @@ export class FlagLedger {
   count(): number {
     return this.got.size;
   }
+  /** 该 branch 新增的 flag 数（duplicate index 不重复计）。 */
+  newFlagsFor(branch: number): number {
+    return this.byBranch.get(branch)?.length ?? 0;
+  }
   /** 平台申报的 flag 总数（未知识 0）。响应缺字段时用它兜底进度口径。 */
   totalCount(): number {
     return this.total;

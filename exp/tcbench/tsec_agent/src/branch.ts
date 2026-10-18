@@ -19,6 +19,7 @@ export interface BranchCfg {
   pruneSec: number; // corelog/flag 双停滞剪枝阈值
   plannerNudgeMax: number; // 每段每 Attempt 的 planner 提醒上限
   plannerNudgeCooldownSec: number;
+  weightCooldownSec?: number; // planner 调整同一 Attempt 权重的冷却
 }
 
 /** attempt 生命周期。active=可调度；done/deadend/blocked=已主动收束。 */
@@ -58,6 +59,12 @@ export interface BranchState {
   busy: boolean;
   /** fork 后的一次性调度优先级（运行时，不持久化）。 */
   priority: number;
+  /** planner 可调的调度权重；1=基础，越大分到更多 turn。 */
+  weight: number;
+  /** smooth weighted round-robin 的当前信用。 */
+  credit: number;
+  /** 最近一次 planner 调整权重的时间（0=未调整）。 */
+  lastWeightAt: number;
   /** fork/分裂时刻的上下文前缀：spawn 相似尝试时复制它，而不是复制失败后的尾部。 */
   checkpointMessages: ChatMessage[];
   active: boolean; // parked=false 后跳过轮转
@@ -89,6 +96,7 @@ export interface BranchLite {
   inbox?: ChatMessage[];
   status?: BranchStatus;
   active?: boolean;
+  weight?: number;
   result?: BranchResult;
 }
 
@@ -134,6 +142,9 @@ export class BranchManager {
       inbox: [],
       busy: false,
       priority: 0,
+      weight: 1,
+      credit: 0,
+      lastWeightAt: 0,
       checkpointMessages: trunkMessages.slice(),
       active: true,
       pruned: false,
@@ -174,6 +185,9 @@ export class BranchManager {
         inbox: st.inbox ?? [],
         busy: false,
         priority: 0,
+        weight: st.weight ?? 1,
+        credit: 0,
+        lastWeightAt: 0,
         checkpointMessages: st.checkpointMessages ?? st.messages.slice(),
         active: status === "active", // 续段恢复：未结束的 Attempt 重新获得调度机会（旧语义）
         pruned: false,
@@ -282,6 +296,52 @@ export class BranchManager {
   noteScheduled(id: number): void {
     const idx = this.active().findIndex((b) => b.id === id);
     if (idx >= 0) this.rr = idx;
+  }
+
+  /** 是否已有 planner 自定义权重；没有时继续走原有 RR，保持行为不变。 */
+  hasCustomWeight(): boolean {
+    return this.active().some((b) => b.weight !== 1);
+  }
+
+  /** planner 调整 Attempt 权重：目标未变/冷却中不重复设置。 */
+  setWeight(id: number, weight: number, now: number): boolean {
+    const b = this.branches.get(id);
+    if (!b || b.pruned || b.status !== "active") return false;
+    const w = Math.max(1, Math.min(4, Math.round(weight)));
+    if (b.weight === w) return false;
+    const cooldown = this.cfg.weightCooldownSec ?? 0;
+    if (b.lastWeightAt > 0 && now - b.lastWeightAt < cooldown) return false;
+    b.weight = w;
+    b.lastWeightAt = now;
+    b.credit = 0;
+    return true;
+  }
+
+  /** planner 权重版调度：smooth weighted round-robin；每个正权重分支都有机会。
+   *  一次性 fork priority 仍优先消费；没有自定义权重时调用方应走旧 RR。 */
+  pickWeighted(
+    exclude: Set<number> = new Set(),
+    canRun: (b: BranchState) => boolean = () => true,
+  ): BranchState | null {
+    const list = this.active().filter((b) => !exclude.has(b.id) && canRun(b));
+    if (!list.length) return null;
+    const boosted = list.filter((b) => b.priority > 0);
+    if (boosted.length) {
+      const chosen = boosted.sort((a, b) => b.priority - a.priority || a.id - b.id)[0];
+      chosen.priority--;
+      this.noteScheduled(chosen.id);
+      return chosen;
+    }
+    let total = 0;
+    for (const b of list) {
+      b.credit += b.weight;
+      total += b.weight;
+    }
+    let chosen = list[0];
+    for (const b of list) if (b.credit > chosen.credit) chosen = b;
+    chosen.credit -= total;
+    this.noteScheduled(chosen.id);
+    return chosen;
   }
 
   /** 单飞轮转（兼容旧调用）。 */
@@ -431,6 +491,9 @@ export class BranchManager {
       inbox: [],
       busy: false,
       priority: 0,
+      weight: 1,
+      credit: 0,
+      lastWeightAt: 0,
       checkpointMessages: parent.messages.slice(),
       active: true,
       pruned: false,
@@ -517,6 +580,9 @@ export class BranchManager {
       inbox: [],
       busy: false,
       priority: 0,
+      weight: 1,
+      credit: 0,
+      lastWeightAt: 0,
       checkpointMessages: base.slice(),
       active: true,
       pruned: false,

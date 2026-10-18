@@ -16,8 +16,18 @@ export interface PlannerAttemptSnapshot {
   status: string;
   active: boolean;
   pruned: boolean;
+  weight?: number;
   lastCoreTs: number;
   result?: unknown;
+}
+
+export interface PendingDirection {
+  id: string;
+  source: number;
+  direction: string;
+  scopeId: number;
+  reason: string;
+  at: number;
 }
 
 export interface PlannerSnapshot {
@@ -28,6 +38,8 @@ export interface PlannerSnapshot {
   attempts: PlannerAttemptSnapshot[];
   findings: CorelogEntry[];
   mutations: MutationRecord[];
+  /** report 的 next 方向待定队列；有槽时由 controller spawn，跨段保留。 */
+  pendingDirections?: PendingDirection[];
   recovery: {
     owner: number | null;
     pending: string[];

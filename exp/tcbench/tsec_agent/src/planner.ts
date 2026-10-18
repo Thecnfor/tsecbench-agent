@@ -20,6 +20,10 @@ export interface ReportEvent {
   next: string[];
   scopeId: number;
   scopeStatus: ScopeStatus;
+  /** 本 Attempt 新增的 flag 数（duplicate 不算）。 */
+  newFlags?: number;
+  /** 收尾时题目剩余未拿 flag 数。 */
+  remainingFlags?: number;
 }
 
 /** 程序检测到某个 Attempt 卡塞后投给 planner 的事件（不经过 LLM observer）。 */
@@ -58,19 +62,42 @@ export type PlannerAction =
   | { type: "retire"; attempt: number; reason: string }
   | { type: "spawn"; source: number; direction: string; scopeId: number; reason: string }
   | { type: "close_scope"; scopeId: number; reason: string }
-  | { type: "remind"; attempt: number; text: string; reason: string };
+  | { type: "remind"; attempt: number; text: string; reason: string }
+  | { type: "set_weight"; attempt: number; weight: number; reason: string }
+  | {
+      type: "enqueue_next";
+      source: number;
+      direction: string;
+      scopeId: number;
+      reason: string;
+    };
 
 export interface PlannerContext {
   enabled: boolean;
   canSpawn: (source: number) => boolean;
   nudgeAvailable: (attempt: number) => boolean; // 额度 + 冷却都允许
   nudgeExhausted: (attempt: number) => boolean; // 额度已用尽（不看冷却）
+  /** 题目剩余未提交 flag 数；done+next 只有还有 flag 时才 spawn。 */
+  remainingFlags?: () => number;
 }
 
 /** 启发式：report 事件做 checkpoint 回溯；stall 事件先提醒，额度用完则回收（Attempt 0 除外）。 */
 export function heuristicPlan(ev: PlannerEvent, ctx: PlannerContext): PlannerAction[] {
   if (!ctx.enabled) return [];
-  if (ev.type === "log") return []; // 当前 heuristic 只吸收；LLM planner 可在未来据此路由/提醒
+  if (ev.type === "log") {
+    // flag 是进展信号：给该 Attempt 加权，让它更快继续；controller 负责幂等/冷却。
+    if (ev.kind === "flag") {
+      return [
+        {
+          type: "set_weight",
+          attempt: ev.attempt,
+          weight: 2,
+          reason: "flag progress; give this attempt more scheduling share",
+        },
+      ];
+    }
+    return [];
+  }
   if (ev.type === "coverage") {
     if (ev.active >= ev.desired && ev.scopes >= 2) return [];
     if (!ctx.canSpawn(ev.attempt) || !ctx.nudgeAvailable(ev.attempt)) return [];
@@ -112,29 +139,34 @@ export function heuristicPlan(ev: PlannerEvent, ctx: PlannerContext): PlannerAct
     return [];
   }
 
-  if (ev.status !== "deadend") return [];
-  if (ev.scopeStatus === "satisfied") return [];
-  const direction = ev.next.map((s) => s.trim()).find((s) => s.length > 0);
-  if (!direction) return [];
-  if (!ctx.canSpawn(ev.attempt)) return [];
+  const directions = ev.next.map((s) => s.trim()).filter((s) => s.length > 0);
+  if (!directions.length) return [];
+  const remaining = ev.remainingFlags ?? ctx.remainingFlags?.() ?? 0;
+  if (remaining <= 0) return [];
 
-  const actions: PlannerAction[] = [];
-  // Attempt 0 是初始 Attempt，不回收；其他 deadend Attempt 让位给回溯兄弟。
-  if (ev.attempt !== 0) {
-    actions.push({
-      type: "retire",
-      attempt: ev.attempt,
-      reason: "deadend; free slot for checkpoint backtrack",
-    });
-  }
-  actions.push({
-    type: "spawn",
+  // done/deadend 只代表当前方向结束；next 是独立攻击面，统一进 planner 的待定队列，
+  // 有槽时由 controller 取出 spawn。这样槽满/当前不能 spawn 时 next 不会丢。
+  const queued: PlannerAction[] = directions.map((direction) => ({
+    type: "enqueue_next",
     source: ev.attempt,
     direction: direction.slice(0, 200),
     scopeId: ev.scopeId,
-    reason: "planner backtrack from checkpoint (no failed tail copied)",
-  });
-  return actions;
+    reason:
+      ev.status === "done"
+        ? "done direction has next surface; queue for a free slot"
+        : "deadend direction has next surface; queue for a free slot",
+  }));
+  if (ev.status === "done") return queued;
+  if (ev.status !== "deadend") return [];
+  // deadend 的 source 已经 park；保留 retire 以释放其存活名额（Attempt 0 除外）。
+  if (ev.attempt !== 0) {
+    queued.unshift({
+      type: "retire",
+      attempt: ev.attempt,
+      reason: "deadend; free slot for queued next direction",
+    });
+  }
+  return queued;
 }
 
 /** planner 覆盖检查提醒：要求对照 fork 分类补全独立方向，而不是只开一条线。 */

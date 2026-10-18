@@ -573,3 +573,55 @@ describe("solveTask fork 集成", () => {
     expect(sysRec.content).toBe(SYSTEM_PROMPT);
   });
 });
+
+describe("done + next 待定队列", () => {
+  it("done 的 next 在 source 已 satisfied 时仍能 spawn 新 Attempt", async () => {
+    CFG.fork_enabled = true;
+    CFG.planner_enabled = true;
+    CFG.branch_concurrency = 1;
+    CFG.max_branches = 4;
+    CFG.task_max_turns = 8;
+    const recdir = fs.mkdtempSync(path.join(os.tmpdir(), "next_queue_"));
+    setRecordsDir(recdir);
+    const R = initRecords("local", "deepseek-flash");
+    const conv = R.conversation("t-nextq");
+    setTaskCwd(fs.mkdtempSync(path.join(os.tmpdir(), "next_queue_work_")));
+    const { client, calls } = makeScriptedClient([
+      {
+        when: (m) => !m.some((x) => String(x.content ?? "").startsWith("【分支")),
+        respond: () => ({
+          content: null,
+          tool_calls: [tc("f1", "fork", { direction: "初始分支" })],
+        }),
+      },
+      {
+        when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 1")),
+        respond: () => ({
+          content: null,
+          tool_calls: [
+            tc("r1", "report", {
+              status: "done",
+              summary: "后台方向完成，但还有 OA/SSH 未覆盖",
+              next: ["打 OA 管理面"],
+            }),
+          ],
+        }),
+      },
+      {
+        when: (m) => m.some((x) => String(x.content ?? "").startsWith("【分支 2")),
+        respond: () => ({ content: "接手 OA 方向。" }),
+      },
+      {
+        when: () => true,
+        respond: () => ({ content: "主线收束。" }),
+      },
+    ]);
+    const r = await solveTask(client, "t-nextq", "卡", 600, conv, {
+      taskClass: "long",
+      flagTotal: 2,
+    });
+    expect(["done", "paused"]).toContain(r.status);
+    expect(calls.some((c) => c.branchHint === "b2")).toBe(true);
+    expect(r.branches.some((b) => b.id === 2)).toBe(true);
+  }, 30_000);
+});

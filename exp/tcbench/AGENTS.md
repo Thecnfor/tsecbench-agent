@@ -59,7 +59,9 @@
    fork 多 Attempt 与 planner 统筹是**默认开启的控制器层能力**（`AGENT_FORK` 默认 1；
    `AGENT_PLANNER` 默认 1；`AGENT_BRANCH_CONCURRENCY` 默认 4），
    打开后工具集扩展为 `shell + fork + report + log + state_change`——这是与评测方对齐后的演进
-   （单线调试可设 `AGENT_FORK=0`，行为回到旧单分支）。planner 是唯一统筹者，没有特权主分支；`AGENT_BRANCH_CONCURRENCY>1` 时多 Attempt turn 真并发（注入走 inbox）；
+   （单线调试可设 `AGENT_FORK=0`，行为回到旧单分支）。planner 是唯一统筹者，没有特权主分支；
+   `AGENT_BRANCH_CONCURRENCY>1` 时多 Attempt turn 真并发（注入走 inbox）；planner 只设
+   Attempt 权重/状态，不直接选下一轮；权重同值/冷却内不重复调整（`AGENT_PLANNER_WEIGHT_COOLDOWN_SEC=120`）。
    read/write/web 等文件类工具仍禁止
    （shell 已覆盖且有审计价值）。设计契约见 `../docs/fork-planner-design.md`，
    缓存实测依据见 `../cache_exp/README.md`。
@@ -142,6 +144,9 @@
      注入 `prompt.GIVEUP_NOTE` 原地续一段（事件 `giveup_continue`）。无题等槽时默认
      `AGENT_NO_WAITER_GIVEUP_MAX=0`（不限次数，最后几题不主动放弃）；有题等槽时才用
      `AGENT_GIVEUP_MAX=3` 收束。上下文和 target 都不变，省掉容器重启代价。
+   - **next 待定队列**：`report(done|deadend)` 的 `next` 先进入 planner 的
+     `pendingDirections`（持久化 planner.json）；有空槽/分支让位时 controller 再 spawn。
+     槽满时方向不会丢，`done` 也不等于整题完成。
      有人等名额才照旧关题让位（长题另有配额规则，见上）。快照拿不到时保守按原行为关题。
      实测单段最长 158min 平台未超时砍题。
    - **上下文压缩（通用交接文档，2026-10-17 取代逐 flag 总结）**：
@@ -246,7 +251,7 @@
 ## 常用操作
 
 ```bash
-# 离线自测（改完代码先跑这个，不需要 VPN/网关；193 个 vitest 用例）
+# 离线自测（改完代码先跑这个，不需要 VPN/网关；198 个 vitest 用例）
 cd tsec_agent && pnpm install && pnpm test
 
 # 一次性检查：类型检查 + biome lint + 全部测试（提交前自查）

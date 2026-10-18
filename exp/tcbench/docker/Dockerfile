@@ -252,6 +252,10 @@ RUN mkdir -p /work
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# ── 附加口令/子域字典（SuperWordlist；构建上下文 docker/assets）──────────────
+#   来源见 /usr/share/wordlists/SuperWordlist/SOURCE.txt；按场景选用，不参与 apt 字典裁剪。
+COPY docker/assets/SuperWordlist /usr/share/wordlists/SuperWordlist
+
 # ── 离线安全知识库（CVE POC 文章 + nuclei 模板 + hacktricks 等 16 源 + KEV/NVD 数据）──
 #   放最后：更新知识库只重建这一层（venv/工具层缓存不受影响）。
 COPY security-knowledge-base /opt/security-knowledge-base

@@ -1,7 +1,7 @@
 # Fork 多 Attempt + Planner 设计（tsec_agent）
 
 状态：**已实现**（2026-10-16，`AGENT_FORK` 默认 on；`AGENT_BRANCH_CONCURRENCY` 默认 4；`AGENT_PLANNER` 在 fork 开启时默认 on；
-193 个 vitest 全绿，
+198 个 vitest 全绿，
 `pnpm check` 通过）。实现映射：§1→branch_tools.ts/agent.ts 工具分发、§2→agent.ts `branchCwd`
 +prompt.ts FORK_PROMPT_EXTRA、§3→branch.ts `prune`、§4→branch.ts `reserveFork` 护栏、
 §5→stall.ts + planner.ts + agent.ts `maybePlannerStall`、§6→records.ts `rebuildBranches`/corelog.ts。
@@ -96,6 +96,7 @@
 | `AGENT_FORK_MAX` | 8 | 每题 fork 总数硬上限（含分支再分叉；树大小有界） |
 | `AGENT_FORK_COOLDOWN_SEC` | 180 | fork 冷却（对所有分支生效） |
 | 预算共享 | 固定 | **fork 不增预算**：全分支共享段墙钟与轮数，分支越多每线越薄 |
+| `AGENT_PLANNER_WEIGHT_COOLDOWN_SEC` | 120 | 同一 Attempt 的 planner 权重调整冷却 |
 | `AGENT_BRANCH_PRUNE_SEC` | 1200 | Attempt 黑板/flag 双停滞 → 回收 + 摘要写黑板（**B 方案 2026-10-16**：曾为 600=与长题停滞阈值同值，剪枝先执行令planner窗口为0；1200 使 900s 触发后仍有 300s 救治窗） |
 
 > 分支可再分叉：深度不单独设限——活跃上限 3 + 总数上限 5 + 冷却 + 预算共享
@@ -112,10 +113,17 @@
   - 有提醒额度 → `remind`：尾部追加 `[planner 提醒] …`，要求先 log 证据，再换方法或
     `report(deadend)`；
   - 额度用完仍卡 → `retire` 该 Attempt（含初始 Attempt 0；timer prune 仍以 0 为兜底锚点）；
+  - `flag` 进展事件 → `set_weight(attempt, 2)`：让出 flag 的 Attempt 获得更多调度份额；
+    controller 做同值 no-op + `AGENT_PLANNER_WEIGHT_COOLDOWN_SEC`(120) 防反复调整；
+  - `done + next` 且题目仍有未拿 flag → `next` 进入 planner 待定队列（持久化到
+    `planner.json`），有空槽/分支让位时由 controller spawn；`done` 只表示方向完成，
+    不表示整题完成；duplicate flag 也不等于方向完成；
   - 提醒有每 Attempt 上限 `AGENT_PLANNER_NUDGE_MAX`(2) + 冷却
     `AGENT_PLANNER_NUDGE_COOLDOWN_SEC`(400)；冷却中不重复提醒也不因此关闭。
+- **事件优先级**：`report > stall > flag/log > coverage`；report 是结构性变化，不能
+  被周期性的 stall/coverage 事件压在 FIFO 后面。
 - **覆盖检查**：多 flag / 长题每轮检查 active Attempt 与 scope 数；不足目标（按 flag 数，
-  最多 3 条）时 planner 发 `coverage` 事件并 `remind`：按 fork 分类（时间/空间/假设/
+  最多 4 条）时 planner 发 `coverage` 事件并 `remind`：按 fork 分类（时间/空间/假设/
   探索/产出与权限）检查覆盖是否完全，有独立方向就补 fork；同样受提醒额度/冷却限制。
 - **时钟跨段持久**：flag/停滞时钟锚在题起点 + 黑板最后事件，solveTask 启动时恢复。
 - **不再有独立 observer LLM**：提醒文本由程序模板生成；planner 只做决策，
@@ -226,10 +234,12 @@ planner未触发 = 停滞阈值 600s 而 run 494s 即停，三信号均未成立
 
 - `AGENT_BRANCH_CONCURRENCY`（默认 4，最大 4）控制同时 inflight 的 Attempt turn 数；
   1 = 旧单飞轮转，>1 = 真正并发 LLM/tool turn。
-- scheduler 用 `pickExcept(inflight)` 选 runnable Attempt，`Promise.race` 收割完成的 turn；
-  `pruneStalled`/`planner 卡塞` 跳过 inflight，避免把正在跑的分支回收。
-- 并发 fill 的同优先级 Attempt 按 `rr` 轮转（不是 id 顺序）：高 id 新 fork 不会被低 id
-  永久饿死；`ranked` 与 `noteScheduled` 共用轮转游标。
+- scheduler 用 `pickExcept(inflight)` / `ranked` 选 runnable Attempt，`Promise.race` 收割
+  完成的 turn；`pruneStalled`/`planner 卡塞` 跳过 inflight，避免把正在跑的分支回收。
+- **有 planner 自定义权重时**改用 `pickWeighted`：smooth weighted round-robin，每个正权重
+  Attempt 都有保底机会；`weight` 默认 1，planner 可设 1–4，同值/冷却中不重复调整。
+- 没有自定义权重时沿用 `ranked` 的优先级 + `rr` 轮转（不是 id 顺序）：高 id 新 fork
+  不会被低 id 永久饿死。
 - 每个 turn 在独立 `AsyncLocalStorage` 分支上下文里执行（shell job 归属不串味）。
 - **并发注入邮箱**：branch 正忙于 LLM/tool 时，广播/结果卡/重建任务先入 `inbox`，
   下一轮开始再并入 messages；conv 注入也排队到本回合 tool 结果落盘后写，

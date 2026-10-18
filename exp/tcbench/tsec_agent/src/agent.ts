@@ -47,7 +47,12 @@ import {
   type StallEvent,
   selectRecoveryOwner,
 } from "./planner.js";
-import { type PlannerSnapshot, writePlannerState } from "./planner_state.js";
+import {
+  type PendingDirection,
+  type PlannerSnapshot,
+  readPlannerState,
+  writePlannerState,
+} from "./planner_state.js";
 import {
   CLOSING_SUMMARY_PROMPT,
   COMPACT_NOTE,
@@ -481,6 +486,7 @@ function branchCfgFromConfig(): BranchCfg {
     pruneSec: CFG.branch_prune_sec,
     plannerNudgeMax: CFG.planner_nudge_max,
     plannerNudgeCooldownSec: CFG.planner_nudge_cooldown_sec,
+    weightCooldownSec: CFG.planner_weight_cooldown_sec,
   };
 }
 
@@ -551,6 +557,21 @@ export async function solveTask(
     at: number;
   };
   const sharedCompacts = new Map<string, SharedCompact>();
+  // report 的 next 待定队列：槽满时不丢方向，后续 apply/收段有槽再由 controller 取出 spawn。
+  const pendingDirections: PendingDirection[] = [];
+  const queuedDirectionKeys = new Set<string>();
+  try {
+    const prev = readPlannerState(plannerFile);
+    for (const p of prev?.pendingDirections ?? []) {
+      if (!p?.direction || !Number.isFinite(p.source)) continue;
+      const key = `${p.source}\0${p.direction}`;
+      if (queuedDirectionKeys.has(key)) continue;
+      pendingDirections.push(p);
+      queuedDirectionKeys.add(key);
+    }
+  } catch {
+    /* 旧 planner.json 无 next 队列 */
+  }
   const branchCwd = (id: number): string => {
     const d = `${workdir}/branches/${id}`;
     try {
@@ -618,6 +639,15 @@ export async function solveTask(
   if (multiOn) tools.push(CORE_LOG_TOOL_SCHEMA);
   const plannerOn = CFG.planner_enabled && forkOn;
   const plannerEvents: PlannerEvent[] = [];
+  /** report 是结构性事件，优先于 stall/flag/coverage；同类保持 FIFO。 */
+  const plannerPriority = (ev: PlannerEvent): number =>
+    ev.type === "report" ? 3 : ev.type === "stall" ? 2 : ev.type === "log" ? 1 : 0;
+  const enqueuePlanner = (ev: PlannerEvent): void => {
+    const p = plannerPriority(ev);
+    let i = 0;
+    while (i < plannerEvents.length && plannerPriority(plannerEvents[i]) >= p) i++;
+    plannerEvents.splice(i, 0, ev);
+  };
   const recoveryNotices: Array<{ scopeId: number; content: string }> = [];
   // busy branch 的注入消息要等本回合 tool 结果落盘后再写 conv，保证重建配对顺序。
   const convQueue = new Map<number, Array<Record<string, unknown>>>();
@@ -668,7 +698,7 @@ export async function solveTask(
       });
       const b = bm.get(fromId);
       if (plannerOn && b?.result) {
-        plannerEvents.push({
+        enqueuePlanner({
           type: "report",
           attempt: fromId,
           status: b.result.status,
@@ -676,6 +706,8 @@ export async function solveTask(
           next: b.result.next,
           scopeId: b.scopeId,
           scopeStatus,
+          newFlags: ledger.newFlagsFor(fromId),
+          remainingFlags: flagTotal > 0 ? Math.max(0, flagTotal - ledger.count()) : 1,
         });
       }
     },
@@ -708,6 +740,7 @@ export async function solveTask(
         checkpointMessages: b.checkpointMessages,
         status: b.status,
         active: b.active,
+        weight: b.weight,
         result: b.result,
       }));
   /** 结构化持久化 planner 树/知识/恢复队列；log.jsonl 仍保留原始事件流。 */
@@ -741,10 +774,12 @@ export async function solveTask(
           active: b.active,
           pruned: b.pruned,
           lastCoreTs: b.lastCoreTs,
+          weight: b.weight,
           result: b.result,
         })),
         findings: entries.slice(-200),
         mutations: pending,
+        pendingDirections: pendingDirections.slice(-64),
         recovery: {
           owner,
           pending: pending.map((m) => m.id),
@@ -779,6 +814,102 @@ export async function solveTask(
     };
   };
 
+  let directionSeq = 0;
+  /** 把 report.next 放入待定队列；同 source+direction 只入队一次。 */
+  const enqueueNextDirection = (
+    source: number,
+    direction: string,
+    scopeId: number,
+    reason: string,
+  ): void => {
+    const d = direction.trim().slice(0, 200);
+    if (!d) return;
+    const key = `${source}\0${d}`;
+    if (queuedDirectionKeys.has(key)) return;
+    queuedDirectionKeys.add(key);
+    pendingDirections.push({
+      id: `next-${source}-${directionSeq++}`,
+      source,
+      direction: d,
+      scopeId,
+      reason: reason.slice(0, 300),
+      at: nowSec(),
+    });
+    if (pendingDirections.length > 64) {
+      const dropped = pendingDirections.shift();
+      if (dropped)
+        log(`[${code}] pending next queue overflow; dropped ${dropped.direction.slice(0, 60)}`);
+    }
+    rec().event("direction_queued", {
+      code,
+      source,
+      scopeId,
+      direction: d,
+      reason: reason.slice(0, 300),
+    });
+    log(`[${code}] queued next direction from Attempt ${source}: ${d.slice(0, 80)}`);
+  };
+
+  /** 真正从 source checkpoint spawn；next 队列和 planner spawn 共用。 */
+  const commitPlannerSpawn = (
+    source: number,
+    direction: string,
+    scopeId: number,
+    reason: string,
+  ): boolean => {
+    const d = direction.trim().slice(0, 200);
+    if (!d) return false;
+    const made = bm.spawnFromCheckpoint(source, d, nowSec(), branchCwd, scopeId);
+    if (!made) {
+      log(`[${code}] planner spawn refused (source ${source}): ${reason.slice(0, 100)}`);
+      return false;
+    }
+    conv.write("user", {
+      branch: made.branch.id,
+      kind_note: "fork_directive",
+      parent_branch: made.branch.parent ?? 0,
+      fork_seq: made.branch.forkSeq,
+      scope_id: made.branch.scopeId,
+      fork_label: d,
+      spawned_by: "planner",
+      source_branch: source,
+      content: made.directive,
+      turn: `${code}:${turn}`,
+    });
+    afterForkMaterialized(corelog, source, made.branch.id, d);
+    log(`[${code}] planner spawn attempt ${made.branch.id} from ${source}: ${d.slice(0, 80)}`);
+    return true;
+  };
+
+  /** 有空槽时消费待定 next；槽满时保留，等下一次 apply/retire 再试。 */
+  const drainPendingDirections = (): void => {
+    if (!plannerOn) return;
+    let i = 0;
+    while (i < pendingDirections.length) {
+      const p = pendingDirections[i];
+      if (!bm.branches.has(p.source)) {
+        log(`[${code}] drop pending next: source Attempt ${p.source} no longer exists`);
+        pendingDirections.splice(i, 1);
+        continue;
+      }
+      if (!bm.canSpawnFrom(p.source)) {
+        i++;
+        continue;
+      }
+      if (!commitPlannerSpawn(p.source, p.direction, p.scopeId, p.reason)) {
+        i++;
+        continue;
+      }
+      pendingDirections.splice(i, 1);
+      rec().event("direction_spawned", {
+        code,
+        source: p.source,
+        direction: p.direction,
+        scopeId: p.scopeId,
+      });
+    }
+  };
+
   /** Planner 是唯一统筹者：消费 report/stall 事件，执行提醒/retire/spawn 等结构化动作。
    *  P1 用启发式；LLM planner 只需替换 heuristicPlan，动作校验/落盘保持一致。 */
   const applyPlanner = (): void => {
@@ -790,6 +921,7 @@ export async function solveTask(
         canSpawn: (source) => bm.canSpawnFrom(source),
         nudgeAvailable: (attempt) => bm.plannerNudgeAvailable(attempt, nowSec()),
         nudgeExhausted: (attempt) => bm.plannerNudgeExhausted(attempt),
+        remainingFlags: () => (flagTotal > 0 ? Math.max(0, flagTotal - ledger.count()) : 1),
       });
       for (const action of actions) {
         if (action.type === "retire") {
@@ -798,34 +930,9 @@ export async function solveTask(
             log(`[${code}] planner retire attempt ${action.attempt}: ${action.reason}`);
           }
         } else if (action.type === "spawn") {
-          const made = bm.spawnFromCheckpoint(
-            action.source,
-            action.direction,
-            nowSec(),
-            branchCwd,
-            action.scopeId,
-          );
-          if (!made) {
-            log(`[${code}] planner spawn refused (source ${action.source})`);
-            continue;
-          }
-          conv.write("user", {
-            branch: made.branch.id,
-            kind_note: "fork_directive",
-            parent_branch: made.branch.parent ?? 0,
-            fork_seq: made.branch.forkSeq,
-            scope_id: made.branch.scopeId,
-            fork_label: action.direction.slice(0, 200),
-            spawned_by: "planner",
-            source_branch: action.source,
-            content: made.directive,
-            turn: `${code}:${turn}`,
-          });
-          afterForkMaterialized(corelog, action.source, made.branch.id, action.direction);
-          log(
-            `[${code}] planner spawn attempt ${made.branch.id} from checkpoint of ` +
-              `${action.source}: ${action.direction.slice(0, 80)}`,
-          );
+          commitPlannerSpawn(action.source, action.direction, action.scopeId, action.reason);
+        } else if (action.type === "enqueue_next") {
+          enqueueNextDirection(action.source, action.direction, action.scopeId, action.reason);
         } else if (action.type === "remind") {
           const target = bm.get(action.attempt);
           if (!target || target.status !== "active") continue;
@@ -846,11 +953,19 @@ export async function solveTask(
             `[${code}] planner nudge attempt ${action.attempt}: ${action.reason} ` +
               `(${action.text.slice(0, 80)})`,
           );
+        } else if (action.type === "set_weight") {
+          if (bm.setWeight(action.attempt, action.weight, nowSec())) {
+            log(
+              `[${code}] planner weight attempt ${action.attempt} -> ${action.weight} ` +
+                `(${action.reason})`,
+            );
+          }
         } else if (action.type === "close_scope") {
           log(`[${code}] planner close scope ${action.scopeId}: ${action.reason}`);
         }
       }
     }
+    drainPendingDirections();
   };
 
   /** 回合末统一追加重建消息：先广播完成结果，再给 planner 选出的 owner 下发下一项。
@@ -968,7 +1083,7 @@ export async function solveTask(
       scopeId: chosen.b.scopeId,
       scopeStatus: bm.scopeStatus(chosen.b.scopeId),
     };
-    plannerEvents.push(ev);
+    enqueuePlanner(ev);
     applyPlanner();
   };
 
@@ -994,7 +1109,7 @@ export async function solveTask(
     const target = eligible.reduce((a, b) => (a.lastCoreTs <= b.lastCoreTs ? a : b));
     if (!bm.canSpawnFrom(target.id)) return;
     lastCoverageNudgeAt = now;
-    plannerEvents.push({
+    enqueuePlanner({
       type: "coverage",
       attempt: target.id,
       scopeId: target.scopeId,
@@ -1460,6 +1575,15 @@ export async function solveTask(
                 if (allConfirmed) allFlagsSubmitted = true;
                 else if (resp?.correct === true) compactAfterFlag.add(br.id); // 找到 flag（未全齐）→ 回合末压缩交接
               }
+              if (plannerOn && resp?.correct === true && !allConfirmed) {
+                enqueuePlanner({
+                  type: "log",
+                  attempt: br.id,
+                  scopeId: br.scopeId,
+                  note: `flag idx=${out.flagIndex ?? "?"} (${out.correctCount}/${out.totalCount || "?"})`,
+                  kind: "flag",
+                });
+              }
               if (resp?.correct === true) {
                 bm.recordFlag(nowSec()); // correct 即进展，刷题级 flag 主时钟
                 corelog?.write({
@@ -1659,16 +1783,21 @@ export async function solveTask(
     pruneStalled(busy);
     maybePlannerStall(busy);
     maybePlannerCoverage();
+    drainPendingDirections();
 
     while (inflight.size < branchConcurrency) {
       const exclude = new Set(inflight.keys());
       const coldBusy = [...exclude].some((id) => !warmed.has(id));
-      const br =
-        branchConcurrency === 1
+      const weighted = bm.hasCustomWeight();
+      const canRun = (b: BranchState): boolean =>
+        branchConcurrency === 1 || warmed.has(b.id) || !coldBusy;
+      const br = weighted
+        ? bm.pickWeighted(exclude, canRun)
+        : branchConcurrency === 1
           ? bm.pickExcept(exclude)
           : bm.ranked(exclude).find((b) => warmed.has(b.id) || !coldBusy);
       if (!br) break;
-      if (branchConcurrency > 1) {
+      if (!weighted && branchConcurrency > 1) {
         bm.consumePriority(br.id);
         bm.noteScheduled(br.id);
       }

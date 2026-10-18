@@ -23,6 +23,7 @@ const ctx = {
   canSpawn: () => true,
   nudgeAvailable: () => true,
   nudgeExhausted: () => false,
+  remainingFlags: () => 2,
 };
 
 describe("heuristic planner", () => {
@@ -67,25 +68,54 @@ describe("heuristic planner", () => {
     expect(selectRecoveryOwner(mutations, [{ id: 2, scopeId: 2, status: "deadend" }], 0)).toBe(0);
   });
 
-  it("deadend + next：retire source + spawn from checkpoint", () => {
+  it("deadend + next：retire source + 把 next 放入待定队列", () => {
     expect(heuristicPlan(base, ctx)).toEqual([
-      { type: "retire", attempt: 1, reason: "deadend; free slot for checkpoint backtrack" },
+      { type: "retire", attempt: 1, reason: "deadend; free slot for queued next direction" },
       {
-        type: "spawn",
+        type: "enqueue_next",
         source: 1,
         direction: "动态 trace",
         scopeId: 1,
-        reason: "planner backtrack from checkpoint (no failed tail copied)",
+        reason: "deadend direction has next surface; queue for a free slot",
       },
     ]);
   });
 
-  it("done / blocked / 无 next / scope satisfied / 禁用 → 不动作", () => {
-    expect(heuristicPlan({ ...base, status: "done" }, ctx)).toEqual([]);
-    expect(heuristicPlan({ ...base, status: "blocked" }, ctx)).toEqual([]);
+  it("done + next：还有 flag 时进入待定队列，不能因方向完成丢掉下一条面", () => {
+    const done = { ...base, status: "done" as const, next: ["file-server FTP/SSH"] };
+    const actions = heuristicPlan(done, { ...ctx, remainingFlags: () => 3 });
+    expect(actions).toEqual([
+      {
+        type: "enqueue_next",
+        source: 1,
+        direction: "file-server FTP/SSH",
+        scopeId: 1,
+        reason: "done direction has next surface; queue for a free slot",
+      },
+    ]);
+    expect(heuristicPlan(done, { ...ctx, remainingFlags: () => 0 })).toEqual([]);
+    expect(heuristicPlan({ ...done, next: [] }, { ...ctx, remainingFlags: () => 2 })).toEqual([]);
+  });
+
+  it("无 next / 无剩余 flag / blocked / 禁用 → 不动作", () => {
     expect(heuristicPlan({ ...base, next: [] }, ctx)).toEqual([]);
-    expect(heuristicPlan({ ...base, scopeStatus: "satisfied" }, ctx)).toEqual([]);
+    expect(heuristicPlan({ ...base, next: [] }, { ...ctx, remainingFlags: () => 0 })).toEqual([]);
+    expect(heuristicPlan({ ...base, status: "blocked" }, ctx)).toEqual([]);
+    expect(heuristicPlan(base, { ...ctx, remainingFlags: () => 0 })).toEqual([]);
     expect(heuristicPlan(base, { ...ctx, enabled: false })).toEqual([]);
+  });
+
+  it("flag 日志事件 → 给该 Attempt 加权", () => {
+    const actions = heuristicPlan(
+      { type: "log", attempt: 2, scopeId: 2, note: "flag idx=1", kind: "flag" },
+      ctx,
+    );
+    expect(actions).toContainEqual({
+      type: "set_weight",
+      attempt: 2,
+      weight: 2,
+      reason: "flag progress; give this attempt more scheduling share",
+    });
   });
 
   it("coverage：active/scope 不足 → 提醒按 fork 分类补全；覆盖到位不动作", () => {
@@ -159,15 +189,24 @@ describe("heuristic planner", () => {
     ).toEqual([]);
   });
 
-  it("预算/护栏拒绝 spawn → 不动作；Attempt 0 不 retire", () => {
-    expect(heuristicPlan(base, { ...ctx, canSpawn: () => false })).toEqual([]);
+  it("槽满时 next 仍然入队；Attempt 0 不 retire", () => {
+    expect(heuristicPlan(base, { ...ctx, canSpawn: () => false })).toEqual([
+      { type: "retire", attempt: 1, reason: "deadend; free slot for queued next direction" },
+      {
+        type: "enqueue_next",
+        source: 1,
+        direction: "动态 trace",
+        scopeId: 1,
+        reason: "deadend direction has next surface; queue for a free slot",
+      },
+    ]);
     expect(heuristicPlan({ ...base, attempt: 0 }, ctx)).toEqual([
       {
-        type: "spawn",
+        type: "enqueue_next",
         source: 0,
         direction: "动态 trace",
         scopeId: 1,
-        reason: "planner backtrack from checkpoint (no failed tail copied)",
+        reason: "deadend direction has next surface; queue for a free slot",
       },
     ]);
   });

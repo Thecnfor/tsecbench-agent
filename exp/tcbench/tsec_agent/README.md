@@ -32,7 +32,7 @@ docker/work/                  # 遗留目录，当前 run.sh 已不用
 ```bash
 pnpm install          # 首次
 pnpm build            # 构建 agent（dist/agent.js、dist/panel-server.js）+ 面板（dist/panel/）
-pnpm test             # 离线自测（193 个用例，不依赖 VPN/网关/平台）
+pnpm test             # 离线自测（198 个用例，不依赖 VPN/网关/平台）
 pnpm check            # 提交前自查：tsc --noEmit + biome check + pnpm test
 pnpm typecheck        # 仅类型检查
 pnpm lint             # biome 检查（配置 biome.jsonc）
@@ -121,6 +121,7 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `AGENT_SHELL_MAX_JOBS_PER_BRANCH` | 每个 Attempt 的后台 job 上限（每题 `AGENT_SHELL_MAX_JOBS` 仍为 8） | 4 |
 | `AGENT_PLANNER_NUDGE_MAX` | 每段每 Attempt 的 planner 提醒上限 | 2 |
 | `AGENT_PLANNER_NUDGE_COOLDOWN_SEC` | planner 提醒冷却（秒） | 400 |
+| `AGENT_PLANNER_WEIGHT_COOLDOWN_SEC` | 同一 Attempt 的 planner 权重调整冷却（秒） | 120 |
 | `AGENT_DEADLINE_SEC` | 总时限秒（0=不限） | 0 |
 | `AGENT_REQUEST_TIMEOUT` | 单次 LLM 请求超时秒数；超时后按固定间隔重试 | 90 |
 | `AGENT_LLM_RETRY_INTERVAL_SEC` | 网络/超时/429/5xx 的固定重试间隔（秒；forever 模式） | 2 |
