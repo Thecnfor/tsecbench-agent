@@ -53,3 +53,6 @@ data/
 # ── AI 工具本地产物（计划文档等），不入库 ──────────────────
 .trae/
 runtime-import.env
+
+# KB 索引是构建产物，不进 git（镜像构建从工作区复制）
+solver/kb/unified.db*
