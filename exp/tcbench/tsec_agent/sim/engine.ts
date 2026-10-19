@@ -1,7 +1,8 @@
 /** 离散事件引擎：1 分钟粒度推进，策略可插拔（消融对比用）。
  *
  * 世界规则（贴真实实现）：
- * - 平台容器槽 = 3（max active），agent 并发 = 5；总结阶段占 agent 不占容器（A）。
+ * - 平台容器槽 = 3（max active），agent 并发 = 5；总结阶段脱槽，不阻塞容器补位（A）。
+ * - 容器 start 可以配置为随机耗时（startupMinMin/Max），用于压测 start 空档。
  * - 段闸 C：turnProxy=60轮的墙钟代理（每题抽样 ~17min 中位）；fixed=600s/1800s。
  * - 通关判定 A：每 tick 查缓存快照（watcher 20s 代理延迟）→ 立即关容器；
  *   非 A：模型自然收尾（realizeDelay×伯努利）或段末检查。
@@ -34,6 +35,18 @@ export interface Policy {
   reclassify: boolean;
   /** 配额内长题段到点不轮转（有等者也原地续；false=轮转） */
   rotateQuotaLong: boolean;
+  /** 只有 fresh（从未启动）题算 waiter；暂停题不触发 giveup 的 close→start。 */
+  noWaiterFreshOnly?: boolean;
+  /** 有 flag 进展的暂停题优先于 fresh 题。 */
+  pausedProgressPriority?: boolean;
+  /** 无得分题收尾时给有进展的暂停题让位，但这次让位不累计 giveup。 */
+  yieldProgress?: boolean;
+  /** 长题续段自适应：上一段有新 flag → progressSec，零新 flag → stalledSec；0=关闭。 */
+  longProgressSec?: number;
+  longStalledSec?: number;
+  /** 无用重启熔断：连续 N 段零新 flag → 暂停并冷却 cooldownMin；0=关闭。 */
+  noProgressPauseLimit?: number;
+  noProgressCooldownMin?: number;
 }
 
 export interface SimConfig {
@@ -42,7 +55,10 @@ export interface SimConfig {
   agentCap: number;
   giveupMax: number;
   resumePenaltyMin: number; // 续跑重定向代价（agent 分钟，探新容器/重建状态）
-  restartSlotMin: number; // 平台 start 占槽时长
+  restartSlotMin: number; // 平台 start 占槽时长（固定模式的兼容值）
+  /** 随机容器启动耗时（分钟）；设置后每次 start 独立抽样，覆盖 restartSlotMin。 */
+  startupMinMin?: number;
+  startupMinMax?: number;
   summaryMaxMin: number; // 总结超时上限（用户定：5min）
   watcherDelayMin: number; // A 的快照缓存延迟（20s watcher 代理）
   rng: () => number;
@@ -82,6 +98,26 @@ export interface SimResult {
   /** 槽位压力：容器占用分钟 */
   containerOpenMin: number;
   makeSpanMin: number;
+  /** 未完成题存在、但没有任何容器打开的分钟数（真正的调度空档）。 */
+  idleGapMin: number;
+  /** 上述空档的连续 episode 数。 */
+  idleEpisodes: number;
+  /** 未完成题存在、但没有一个 worker 在真正解题（start 等待也算空档）的分钟数。 */
+  noRunningGapMin: number;
+  /** 被关闭/暂停的未完成题 episode 数（可重复计同一题）。 */
+  pausedEpisodes: number;
+  /** 至少暂停过一次的题数。 */
+  pausedTasks: number;
+  /** 暂停后至少重新启动过一次的题数。 */
+  pausedResumed: number;
+  /** 暂停后直到时限结束都没有再启动的题数。 */
+  pausedNeverResumed: number;
+  /** 无进展熔断触发次数（连续 N 段零新 flag → 冷却）。 */
+  noProgressBreaks: number;
+  /** 单题连续零新 flag 段数的最大值（诊断：熔断是否根本没用上）。 */
+  maxZeroFlagSegs: number;
+  /** 关闭→重新启动的最大等待（分钟）。 */
+  maxResumeGapMin: number;
   // ---- 泄漏探针（诊断用）----
   agentBusyAtEnd: number;
   containerOpenAtEnd: number;
@@ -143,6 +179,16 @@ export function simulate(
   let containerOpenMin = 0;
   let makeSpan = 0;
   let shortLagMax = 0;
+  let idleGapMin = 0;
+  let idleEpisodes = 0;
+  let idleEP = false;
+  let noRunningGapMin = 0;
+  let pausedEpisodes = 0;
+  let noProgressBreaks = 0;
+  let maxResumeGapMin = 0;
+  const pausedEver = new Set<string>();
+  const resumedAfterPause = new Set<string>();
+  const lastPauseAt = new Map<string, number>();
 
   const isOpen = (t: Sched) => t.containerOpen;
   const openCount = () => S.filter(isOpen).length;
@@ -156,11 +202,28 @@ export function simulate(
     );
   const waiters = (self: Sched) =>
     S.some((o) => o !== self && (o.status === "pending" || o.status === "paused"));
+  /** fresh（从未启动）waiter：giveup 决策只看它，暂停题不再互相触发 close→start。 */
+  const freshWaiters = (self: Sched) =>
+    S.some((o) => o !== self && o.status === "pending");
+  /** 已拿到部分 flag 的暂停题；无得分题应把槽位让给它。 */
+  const pausedProgress = (self: Sched) =>
+    S.filter((o) => o !== self && o.status === "paused" && o.flagsGot > 0);
+  /** 无进展熔断：连续零新 flag 段数（有 flag 清零；跨暂停保持）。 */
+  const zeroSegs = new Map<string, number>();
+  // 首段前的侦察期不算“无进展段”：从第二轮段开始后才计数（避免把 0.3~0.9 分钟的小段算成熔断）。
+  const maxZeroSegs = new Map<string, number>();
+  const cooldownUntil = new Map<string, number>();
 
-  const budgetMin = (t: Sched): number =>
-    policy.segmentMode === "fixed"
-      ? (t.classifiedLong ? policy.fixedLongSec : policy.fixedShortSec) / 60
-      : t.paceSec / 60;
+  /** 段预算：长题续段按上一段是否产出新 flag 自适应（首段仍用 fixedLongSec）。 */
+  const budgetMin = (t: Sched): number => {
+    if (policy.segmentMode !== "fixed") return t.paceSec / 60;
+    if (!t.classifiedLong) return policy.fixedShortSec / 60;
+    if (t.segments > 0 && policy.longProgressSec && policy.longStalledSec) {
+      const lastSegNew = t.flagsGot - t.segStartFlags;
+      return (lastSegNew > 0 ? policy.longProgressSec : policy.longStalledSec) / 60;
+    }
+    return policy.fixedLongSec / 60;
+  };
 
   const closeContainer = (t: Sched) => {
     t.containerOpen = false;
@@ -187,6 +250,9 @@ export function simulate(
     t.status = "paused";
     t.pausedAt = now;
     t.waitingSince = now;
+    pausedEver.add(t.code);
+    pausedEpisodes++;
+    lastPauseAt.set(t.code, now);
     t.segStartWork = t.workDone;
     t.inPlaceCount = 0;
     t.readyAt = null;
@@ -197,11 +263,35 @@ export function simulate(
     agentBusy = Math.max(0, agentBusy - 1);
   };
 
+  /** 段结束后更新无进展计数；返回是否进入冷却（熔断）。 */
+  const noteSegProgress = (t: Sched, segNew: number, now: number): boolean => {
+    // 首段零 flag 是正常的侦察段；只统计“已经跑过至少一段”后的连续零进展。
+    const prevSegs = t.segments;
+    const z = segNew > 0 || prevSegs < 2 ? 0 : (zeroSegs.get(t.code) ?? 0) + 1;
+    if (z === 0) zeroSegs.delete(t.code);
+    zeroSegs.set(t.code, z);
+    maxZeroSegs.set(t.code, Math.max(maxZeroSegs.get(t.code) ?? 0, z));
+    const limit = policy.noProgressPauseLimit ?? 0;
+    if (limit > 0 && z >= limit) {
+      if ((cooldownUntil.get(t.code) ?? -1) <= now) noProgressBreaks++;
+      cooldownUntil.set(t.code, now + (policy.noProgressCooldownMin ?? 10));
+      return true;
+    }
+    return false;
+  };
+  const isCooled = (t: Sched, now: number) => (cooldownUntil.get(t.code) ?? -1) > now;
+
   /** D：选下一个启动的题（只读 public 字段与可观测状态）。 */
   const pickNext = (): Sched | null => {
-    const pending = S.filter((t) => t.status === "pending" && !t.pendingStart);
-    const paused = S.filter((t) => t.status === "paused" && !t.pendingStart);
-    if (!pending.length && !paused.length) return null;
+    const allPending = S.filter((t) => t.status === "pending" && !t.pendingStart);
+    const allPaused = S.filter((t) => t.status === "paused" && !t.pendingStart);
+    const warm = (t: Sched) => !isCooled(t, nowRef.v);
+    const pending = allPending.filter(warm);
+    const paused = allPaused.filter(warm);
+    if (!pending.length && !paused.length) {
+      // 全部都在冷却：仍然运行（题目不能死），但只剩最后一个兜底名额。
+      return allPending[0] ?? allPaused[0] ?? null;
+    }
     const byEst = (a: Sched, b: Sched) => est(a) - est(b) || (a.code < b.code ? -1 : 1);
 
     if (!policy.slotPartition) {
@@ -216,10 +306,15 @@ export function simulate(
     const waitShort = [...pending, ...paused].filter((t) => !t.classifiedLong);
     const waitLong = [...pending, ...paused].filter((t) => t.classifiedLong);
     const longQuota = waitShort.length ? cfg.containerCap - 1 : cfg.containerCap;
+    const hasProgress = (t: Sched) =>
+      !!policy.pausedProgressPriority && t.status === "paused" && t.flagsGot > 0;
     if (longRunning() < Math.min(longQuota, waitLong.length)) {
       // 首启长题：估算大者先（长任务不能最后才启动）；续排按等待时长
       const isFreshL = (t: Sched) => t.lastStartAt === null;
       const c = [...waitLong].sort((a, b) => {
+        const pa = hasProgress(a);
+        const pb = hasProgress(b);
+        if (pa !== pb) return pa ? -1 : 1;
         const fa = isFreshL(a);
         const fb = isFreshL(b);
         if (fa !== fb) return fa ? -1 : 1;
@@ -232,7 +327,10 @@ export function simulate(
     if (!pool.length) return pending[0] ?? paused[0] ?? null;
     const isFresh = (t: Sched) => t.lastStartAt === null;
     pool.sort((a, b) => {
-      // fresh 优先（从未启动的先跑，短者先）；暂停题按等待时长降序（最老先，防 LIFO 饿死）
+      // 有 flag 进展的暂停题优先于 fresh；fresh 内短题先；暂停题最老优先。
+      const pa = hasProgress(a);
+      const pb = hasProgress(b);
+      if (pa !== pb) return pa ? -1 : 1;
       const fa = isFresh(a);
       const fb = isFresh(b);
       if (fa !== fb) return fa ? -1 : 1;
@@ -322,6 +420,20 @@ export function simulate(
 
       // 模型放弃（没通关就收尾总结）
       if (rng() < t.truth.giveupP) {
+        const noFresh = !!policy.noWaiterFreshOnly && !freshWaiters(t);
+        const progress = !!policy.yieldProgress && pausedProgress(t).length > 0;
+        const stalledTooLong = noteSegProgress(t, 0, now);
+        // 无 fresh 新题：giveup 原地续，不关题、不累计 giveup（生产 no-waiter 语义）。
+        if (noFresh && !progress && !stalledTooLong) {
+          t.inPlaceCount++;
+          t.segStartWork = t.workDone;
+          continue;
+        }
+        // 有部分 flag 的暂停题在等：让位但不把这次收尾计入 giveup。
+        if (progress) {
+          requeue(t, now, false);
+          continue;
+        }
         t.giveups++;
         if (t.giveups >= cfg.giveupMax) {
           t.status = "failed";
@@ -351,7 +463,8 @@ export function simulate(
       const overCap = t.inPlaceCount + 1 > policy.inPlaceMax;
       const rotateZero =
         policy.forceRotateOnZeroProgress && segFlagsNew <= 0 && t.inPlaceCount >= 1;
-      if ((noWaiter || noRotateQuota) && !overCap && !rotateZero) {
+      const stalledTooLong = noteSegProgress(t, segFlagsNew, now);
+      if ((noWaiter || noRotateQuota) && !overCap && !rotateZero && !stalledTooLong) {
         // segment_continue 原语义：原地续，不关不启，直到 bench 时限
         t.inPlaceCount++;
         t.segStartWork = t.workDone;
@@ -361,14 +474,29 @@ export function simulate(
     }
 
     // ---------- 3. 调度 ----------
-    if (agentBusy < cfg.agentCap) {
+    // 容器槽只受平台 containerCap 限制；通关总结走脱槽调用，不占新的解题槽
+    // （真实 runParallel 在通关总结前已把 worker 从 running 摘除）。旧模拟把 summary
+    // 计入 agentCap，会出现“容器槽空着但调度器不补题”的假空档。
+    const solvingCount = S.filter((t) => t.status === "running" && !t.pendingStart).length;
+    if (solvingCount < cfg.agentCap && openCount() < cfg.containerCap) {
       for (let slot = openCount(); slot < cfg.containerCap; slot++) {
         const nxt = pickNext();
         if (!nxt) break;
+        if (nxt.status === "paused") {
+          resumedAfterPause.add(nxt.code);
+          const pausedAt = lastPauseAt.get(nxt.code);
+          if (pausedAt !== undefined) {
+            maxResumeGapMin = Math.max(maxResumeGapMin, now - pausedAt);
+          }
+        }
         nxt.status = "running";
         nxt.containerOpen = true;
         nxt.pendingStart = true;
-        nxt.startDoneAt = now + cfg.restartSlotMin;
+        const startup =
+          cfg.startupMinMin !== undefined && cfg.startupMinMax !== undefined
+            ? cfg.startupMinMin + rng() * Math.max(0, cfg.startupMinMax - cfg.startupMinMin)
+            : cfg.restartSlotMin;
+        nxt.startDoneAt = now + startup;
         nxt.lastStartAt = nxt.lastStartAt ?? now;
         nxt.waitingSince = null;
         nxt.containerStarts++;
@@ -381,6 +509,23 @@ export function simulate(
         nxt.segStartFlags = nxt.flagsGot;
       }
     }
+
+    // 空档探针：还有未完成题（pending/paused/running）却没有任何容器打开，
+    // 或没有任何 worker 真正进入解题（容器启动等待阶段也算 noRunning）。
+    const unresolved = S.some(
+      (t) => t.status === "pending" || t.status === "paused" || t.status === "running",
+    );
+    const solving = S.some((t) => t.status === "running" && !t.pendingStart);
+    if (unresolved && openCount() === 0) {
+      idleGapMin++;
+      if (!idleEP) {
+        idleEpisodes++;
+        idleEP = true;
+      }
+    } else {
+      idleEP = false;
+    }
+    if (unresolved && !solving) noRunningGapMin++;
   }
 
   // ---------- 4. 时限收尾 ----------
@@ -413,5 +558,15 @@ export function simulate(
     agentBusyMin,
     containerOpenMin,
     makeSpanMin: Math.round(makeSpan),
+    idleGapMin,
+    idleEpisodes,
+    noRunningGapMin,
+    pausedEpisodes,
+    pausedTasks: pausedEver.size,
+    pausedResumed: resumedAfterPause.size,
+    pausedNeverResumed: Math.max(0, pausedEver.size - resumedAfterPause.size),
+    maxResumeGapMin,
+    noProgressBreaks,
+    maxZeroFlagSegs: Math.max(0, ...maxZeroSegs.values()),
   };
 }

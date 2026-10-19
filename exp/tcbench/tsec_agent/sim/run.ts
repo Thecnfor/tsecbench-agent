@@ -61,6 +61,14 @@ export const METRICS = [
   "restarts",
   "agentBusyMin",
   "containerOpenMin",
+  "idleGapMin",
+  "idleEpisodes",
+  "noRunningGapMin",
+  "pausedTasks",
+  "pausedResumed",
+  "pausedNeverResumed",
+  "maxResumeGapMin",
+  "noProgressBreaks",
 ] as const;
 
 export type MetricName = (typeof METRICS)[number];

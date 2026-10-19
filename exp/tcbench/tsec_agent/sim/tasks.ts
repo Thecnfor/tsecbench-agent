@@ -41,7 +41,7 @@ export interface SimTask extends TaskPublic {
 }
 
 /** 生成进度曲线：前 X% 工作量不产 flag（侦察期），之后线性到满。 */
-function curve(totalWork: number, flagCount: number, reconFrac: number) {
+export function flagCurve(totalWork: number, flagCount: number, reconFrac = 0.35) {
   const recon = totalWork * reconFrac;
   return (workMin: number): number => {
     if (workMin <= recon) return 0;
@@ -102,7 +102,7 @@ export function genRealistic(opts: GenOptions): { pub: TaskPublic; truth: TaskTr
       },
       truth: {
         totalWorkMin: trueWork,
-        flagCurve: curve(trueWork, flagCount, 0.35),
+        flagCurve: flagCurve(trueWork, flagCount, 0.35),
         giveupP: 0.12 + (isLong ? 0.18 : 0), // 长题更易中途放弃
         realizeDelayMin: 1 + rnd() * 3,
       },
@@ -121,7 +121,7 @@ export function genEasySlow(opts: GenOptions): { pub: TaskPublic; truth: TaskTru
     t.pub.difficulty = "easy";
     t.pub.level = 1;
     t.truth.totalWorkMin = w;
-    t.truth.flagCurve = curve(w, 1, 0.45);
+    t.truth.flagCurve = flagCurve(w, 1, 0.45);
     t.truth.giveupP = 0.3;
   }
   return out;
@@ -143,7 +143,7 @@ export function genAllShort(opts: GenOptions): { pub: TaskPublic; truth: TaskTru
       },
       truth: {
         totalWorkMin: w,
-        flagCurve: curve(w, 1, 0.3),
+        flagCurve: flagCurve(w, 1, 0.3),
         giveupP: 0.08,
         realizeDelayMin: 1,
       },
@@ -168,7 +168,7 @@ export function genAllLong(opts: GenOptions): { pub: TaskPublic; truth: TaskTrut
       },
       truth: {
         totalWorkMin: w,
-        flagCurve: curve(w, flags, 0.3),
+        flagCurve: flagCurve(w, flags, 0.3),
         giveupP: 0.25,
         realizeDelayMin: 2,
       },
@@ -196,7 +196,7 @@ export function genRandom(opts: GenOptions): { pub: TaskPublic; truth: TaskTruth
       },
       truth: {
         totalWorkMin: w,
-        flagCurve: curve(w, flags, 0.35),
+        flagCurve: flagCurve(w, flags, 0.35),
         giveupP: rnd() * 0.4,
         realizeDelayMin: 1 + rnd() * 5,
       },

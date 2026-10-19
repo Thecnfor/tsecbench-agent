@@ -1,7 +1,7 @@
 /** A/C/D 调度改造专项测试（对应 sim/ 模拟器 bench 的胜出策略）。
  *
  * A：通关每轮检测（watcher 缓存）+ 通关即关容器 + 总结脱槽限时
- * C：段墙钟预算（短 600s/长 1800s），轮数降为安全网
+ * C：段墙钟预算（短 420s/长 1800s，长题续段按进展 1500s/900s 自适应），轮数降为安全网
  * D：字段分类 + 槽分区 + 长题早启动 + 暂停 aging + 段末改判 + 配额内不轮转
  */
 import { describe, expect, it } from "vitest";
@@ -74,10 +74,12 @@ describe("D：槽分区与配额语义（与 sim/engine.ts 规则一致）", () 
 });
 
 describe("C：段墙钟预算换算", () => {
-  it("配置默认：短 600s / 长 1800s", async () => {
+  it("配置默认：短 420s / 长 1800s，长题续段自适应 1500s/900s", async () => {
     const { CFG } = await import("../src/config.js");
-    expect(CFG.segment_short_sec).toBe(600);
+    expect(CFG.segment_short_sec).toBe(420);
     expect(CFG.segment_long_sec).toBe(1800);
+    expect(CFG.segment_long_progress_sec).toBe(1500);
+    expect(CFG.segment_long_stalled_sec).toBe(900);
   });
   it("轮数闸降为安全网（默认 120，0=关闭）", async () => {
     const { CFG } = await import("../src/config.js");
@@ -187,6 +189,28 @@ describe("D 调度排序（orderCandidates 纯函数）", () => {
       .slice(0, 3)
       .map((c) => c.unique_code);
     expect(top).toEqual(["b-02", "b-01", "b-03"]);
+  });
+
+  it("暂停题有 flag 进展时优先于 fresh；无进展 aged 题保留一个前排名额", () => {
+    const pausedProgress = mk("b-02", "hard", 6);
+    pausedProgress.correct_flag_count = 2;
+    const pausedNoProgress = mk("a-05", "easy", 1);
+    const freshShort = mk("a-03", "medium", 1);
+    const ordered = orderCandidates({
+      freshLong: [],
+      freshShort: [freshShort],
+      paused: [pausedProgress, pausedNoProgress], // 已按等待时长降序
+      cap: 3,
+      agingSec: 600,
+      nowSec: 10_000,
+      // b-02 的进展优先级不依赖 aging；a-05 仍按 aged 前排名额。
+      waitAgeOf: (c) => (c.unique_code === "b-02" ? 10_000 : 0),
+      runningLong: 0,
+    }).map((c) => c.unique_code);
+    // 有进展的暂停题不能排到 fresh 后面；无进展暂停题至少有一个前排名额。
+    expect(ordered[0]).toBe("b-02");
+    expect(ordered.slice(0, 3)).toContain("a-05");
+    expect(ordered.indexOf("b-02")).toBeLessThan(ordered.indexOf("a-03"));
   });
 
   it("回归（1e84c934 实跑）：2 长已在跑时，释放的槽必须给短题而不是第三长", () => {

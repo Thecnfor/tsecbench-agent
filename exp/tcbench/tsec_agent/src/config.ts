@@ -132,10 +132,19 @@ export interface Config {
   // 为什么不用轮数当主闸：实测段墙钟 p50=4.7min、p90=28.9min、max=158min——同样 60 轮
   // 墙钟差 30 倍，因为耗时由工具等待（nmap/爆破的 wait_sec）主导，与轮数无关。
   task_max_turns: number;
-  // 段墙钟预算（主闸）：短题 600s / 长题 1800s（归档实测短段 p50=3.2min、长段 p50=19min p90=45min，
-  // 档位落在 p75~p90，检查点不至于太碎增加重启成本，也不至于太粗失控）。
+  // 段墙钟预算（主闸）：短题 420s / 长题 1800s，长题续段按上一段是否产出新 flag 自适应。
+  // 归档 272 段实测：短题段 p50=246s p75=762s p90=1567s（33% 超 600s）；
+  // 长题段 p50=1495s p90=3580s（40% 超 1800s）——短题收窄到 p75 附近，长题保持 p90 档不硬截。
   segment_short_sec: number;
   segment_long_sec: number;
+  /** 长题续段（上一段有 flag 进展）的预算；缺省=segment_long_sec。 */
+  segment_long_progress_sec: number;
+  /** 长题续段（上一段零新 flag）的预算，减少无进展长题占槽；缺省=segment_long_sec。 */
+  segment_long_stalled_sec: number;
+  /** 同一题连续零新 flag 段数达到该值 → 暂停题冷却，让出槽位给 fresh/有进展题；0=关闭。 */
+  no_progress_pause_limit: number;
+  /** 无进展冷却：到点后该题等待秒数，期间排在有进展暂停题/fresh 之后。 */
+  no_progress_cooldown_sec: number;
   // 通关后 AI 复盘的时间上限（秒）：容器此时已关闭、槽位已释放，总结脱槽跑不占并发名额；
   // 超时丢弃总结照常记 pass——总结失败绝不能拖累通关，也不能让 agent 无限烧 token。
   summary_timeout_sec: number;
@@ -216,8 +225,15 @@ export const CFG: Config = {
   max_turns: num("AGENT_MAX_TURNS", "400"),
   // 分段解题：段主闸是墙钟时间（见下），轮数只是安全网（0=关闭）。
   task_max_turns: num("AGENT_TASK_MAX_TURNS", "120"),
-  segment_short_sec: num("AGENT_TASK_SEGMENT_SHORT_SEC", "600"),
+  segment_short_sec: num("AGENT_TASK_SEGMENT_SHORT_SEC", "420"),
   segment_long_sec: num("AGENT_TASK_SEGMENT_LONG_SEC", "1800"),
+  // 长题续段自适应：首段仍用 segment_long_sec；之后按上一段是否产出新 flag 取档。
+  segment_long_progress_sec: num("AGENT_TASK_SEGMENT_LONG_PROGRESS_SEC", "1500"),
+  segment_long_stalled_sec: num("AGENT_TASK_SEGMENT_LONG_STALLED_SEC", "900"),
+  // 无用重启熔断（a-05/c-03 实测：0 分题段到点后立刻 close→start 同一地址，连跑 30min）。
+  // 同一题连续 2 段 0 新 flag → 续跑优先级降到 fresh 之后，并冷却 10 分钟；仍可被调度，不会判死。
+  no_progress_pause_limit: num("AGENT_NO_PROGRESS_PAUSE_LIMIT", "2"),
+  no_progress_cooldown_sec: num("AGENT_NO_PROGRESS_COOLDOWN_SEC", "600"),
   summary_timeout_sec: num("AGENT_SUMMARY_TIMEOUT_SEC", "300"),
   flag_verify_delay_sec: num("AGENT_FLAG_VERIFY_DELAY_SEC", "5"),
   flag_verify_timeout_sec: num("AGENT_FLAG_VERIFY_TIMEOUT_SEC", "20"),

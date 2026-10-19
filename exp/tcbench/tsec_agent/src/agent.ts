@@ -474,6 +474,7 @@ export interface SolveResult {
   branches: BranchLite[]; // fork 模式的跨段分支状态（disabled 时为空）
   flagSummaryDone: boolean; // 单 flag 的收尾总结已由 flag_summary 轮产出（worker 跳过 closingSummary）
   flagsComplete: boolean; // submit 响应/账本已确认全部 flag（平台 is_completed 仍需延迟复核）
+  submitRejected: boolean; // 本段最后一次提交被平台拒绝（correct:false；错提交不是题目终点）
 }
 
 /** fork/planner 配置（从 CFG 组装；测试可整体覆盖 CFG）。 */
@@ -543,6 +544,7 @@ export async function solveTask(
   let flagSummaryDone = false; // 单 flag：flag_summary 总结轮已产出收尾（跳过 closingSummary）
   let allFlagsSubmitted = false; // 多 flag 全齐（submit 响应权威）→ 回合末立即收束释放槽位
   let flagsComplete = false; // 全部 flag 已确认（含单 flag）→ 段结束后延迟复核平台 is_completed
+  let submitRejected = false; // 最后一次 submit 返回 correct:false；用于阻止“错提交→收尾→关题”
   let segStartTs = Date.now() / 1000; // VPN 挂起等待会补偿（等待不烧段预算）
   const nowSec = () => Date.now() / 1000;
 
@@ -811,6 +813,7 @@ export async function solveTask(
       branches: branchLite(),
       flagSummaryDone,
       flagsComplete,
+      submitRejected,
     };
   };
 
@@ -1566,6 +1569,7 @@ export async function solveTask(
               // 账本仍是可靠下界，避免"实际全齐却继续解题"。
               // 单 flag 不走此路（保留 flag 总结轮即收尾的设计）
               const confirmed = resp?.correct === true || out.duplicateConfirmed;
+              submitRejected = resp?.correct === false && !out.duplicateConfirmed && !flagsComplete;
               const allConfirmed =
                 confirmed &&
                 out.totalCount > 0 &&
@@ -1605,6 +1609,14 @@ export async function solveTask(
                 }
               }
               result = out.result + extra;
+              // 错提交不是终点：平台拒绝一个值只说明这个值不对，题目仍应继续探索。
+              // 明确告诉模型不要因此收尾，避免它把 correct:false 当成“本题失败”而
+              // 输出无工具总结；controller 侧也不会因 correct:false 关闭题目。
+              if (resp?.correct === false && !out.duplicateConfirmed) {
+                result +=
+                  "\n[系统] 该 flag 未被平台接受；错提交不会结束本题，不要输出总结或放弃。" +
+                  "请继续从 target 获取正确 flag（不要重复提交同一个错误值）。";
+              }
             }
           } else if (BRANCH_TOOL_NAMES.includes(tc.function.name)) {
             const out = dispatchBranchTool(tc.function.name, args, toolDeps, br.id, tc.id);
@@ -2019,9 +2031,11 @@ export function estLong(c: Challenge): number {
  *     quota - runningLong（实测 bug：只按排序快照给 2 个前排长题，已在跑的 2 长不计入
  *     → 短题通关释放的槽被第三长抢走，三长占满 3 槽、几十道短题全部饿死）
  *     （保底 1 槽给短题，防饿死）；
- *  2) 短题最短优先（est 升序）；
- *  3) 暂停题 aging——排队超过 agingSec 的提权插到新题前（防 fresh 无限插队，
- *     实测曾有题暂停后等 118 分钟才续跑），组内按等待时长降序。
+ *  2) 有 flag 进展的暂停题优先于 fresh——已有上下文且离得分更近，不能让它们在
+ *     几十道新题后面排队（实测 b-01/b-02/a-05 暂停后等 70~90 分钟）；
+ *  3) 短题最短优先（est 升序）；
+ *  4) 无进展暂停题 aging——排队超过 agingSec 的保留一个前排名额，其余排到 freshShort 后，
+ *     既避免完全饿死，也不让暂停题占满全部槽位；组内按等待时长降序。
  *  历史基线不进策略（正式比赛题目必变，只能当参考）。 */
 export function orderCandidates(opts: {
   freshLong: Challenge[];
@@ -2032,6 +2046,8 @@ export function orderCandidates(opts: {
   nowSec: number;
   waitAgeOf: (c: Challenge) => number; // 暂停题已等秒数
   runningLong: number; // 当前在跑的长题数（配额扣减项）
+  /** 无进展冷却中的暂停题 code：排到所有候选之后，但仍可被调度（不判死）。 */
+  cooled?: Set<string>;
 }): Challenge[] {
   const { freshLong, freshShort, paused, cap, agingSec, nowSec, waitAgeOf } = opts;
   const waitingShort = freshShort.length + paused.filter((c) => classifyTask(c) === "short").length;
@@ -2039,14 +2055,28 @@ export function orderCandidates(opts: {
   const longFront = Math.max(0, longQuota - opts.runningLong); // 已在跑的长题不给前排名额
   const longOrdered = [...freshLong].sort((a, b) => estLong(b) - estLong(a));
   const shortOrdered = [...freshShort].sort((a, b) => estLong(a) - estLong(b));
-  const agedPaused = paused.filter((c) => nowSec - waitAgeOf(c) >= agingSec);
-  const freshPaused = paused.filter((c) => nowSec - waitAgeOf(c) < agingSec);
+  const isCooled = (c: Challenge) => opts.cooled?.has(c.unique_code) === true;
+  const cooled = paused.filter(isCooled);
+  const active = paused.filter((c) => !isCooled(c));
+  const pausedWithProgress = active.filter((c) => (c.correct_flag_count ?? 0) > 0);
+  const pausedNoProgress = active.filter((c) => (c.correct_flag_count ?? 0) === 0);
+  const agedNoProgress = pausedNoProgress.filter((c) => nowSec - waitAgeOf(c) >= agingSec);
+  const freshNoProgress = pausedNoProgress.filter((c) => nowSec - waitAgeOf(c) < agingSec);
+  // 暂停题已经有上下文/已完成部分侦察；有 flag 进展的暂停题比“从未开始的新题”更接近得分。
+  // 旧排序把 agedPaused 放在所有 freshShort 之后，63 题长队列里 b-01/b-02/a-05 暂停一次后
+  // 会等到全部新题跑完才续跑（实测等待 70~90 分钟，最终没有时间）。这里让有进展的暂停题
+  // 排在 fresh 前；无进展的 aged 暂停题仍保留一个前排名额，避免完全饿死，但不占满全部槽位。
+  const pausedNoProgressFront = agedNoProgress.slice(0, 1);
+  const pausedNoProgressRest = agedNoProgress.slice(1);
   return [
+    ...pausedWithProgress,
     ...longOrdered.slice(0, longFront),
+    ...pausedNoProgressFront,
     ...shortOrdered,
-    ...agedPaused, // aging 提权：暂停够久的插队到新题前
+    ...pausedNoProgressRest,
     ...longOrdered.slice(longFront),
-    ...freshPaused,
+    ...freshNoProgress,
+    ...cooled,
   ];
 }
 
@@ -2170,6 +2200,11 @@ async function runParallel(
   //   resumeMeta: 暂停题的续跑状态 {pauses, gives, target, turns}
   const failures: Record<string, number> = {};
   const resumeMeta: Record<string, Record<string, unknown>> = {};
+  // 终局兜底：所有未完成题都被判 fail 时，至少给最有进展的一题一次复活机会，
+  // 避免“全部关闭后 scheduler 直接 break、再也没有题目活着”。
+  // 明确因 giveup 上限收束的题不复活：那是主动释放槽位的终止决策，不是调度断流。
+  const revived = new Set<string>();
+  const abandonedByGiveup = new Set<string>();
   // D 策略：题目分类（long/short），启动时按 API 字段定类，段末可动态改判（治字段失真）。
   const taskClass = new Map<string, "long" | "short">();
   const cls = (c: Challenge): "long" | "short" => {
@@ -2181,8 +2216,23 @@ async function runParallel(
     return v;
   };
 
-  /** 是否还有别的题在等这个并发名额（新题或待续跑的题）。 */
-  const slotWaiters = (items: Challenge[] | null, selfCode: string): boolean => {
+  /** 是否还有别的题在等这个并发名额。
+   *
+   * 这里有两种 waiter，不能混用：
+   * - freshWaiter：从未开始/没有续跑上下文的题。它确实需要当前 worker 让出槽位；
+   * - pausedWaiter：已经暂停、等续跑的题。它需要槽位，但**不应触发 giveup 的
+   *   close→start**：多个暂停题在 cap 内互相把对方当 waiter 时，每个模型收尾都会
+   *   close 一次，下一轮再 start，实测退化成 10s 级抖动，最终还会按 giveup 上限
+   *   把无得分题误判为 fail。
+   *
+   * 段预算到点需要轮转 paused 题时仍可用 includePaused=true；模型主动收尾
+   * （done）只用 freshWaiter 判断是否真的有人在等这个槽位。
+   */
+  const slotWaiters = (
+    items: Challenge[] | null,
+    selfCode: string,
+    includePaused = true,
+  ): boolean => {
     if (!items?.length) return true;
     for (const c of items) {
       const cc = c.unique_code;
@@ -2190,9 +2240,27 @@ async function runParallel(
       if (!taskSelected(cc, taskFilter)) continue;
       if (running.has(cc) || results[cc] === "pass") continue;
       if ((failures[cc] ?? 0) >= Math.max(CFG.max_failures, 1)) continue;
+      if (!includePaused && cc in resumeMeta) continue;
       return true;
     }
     return false;
+  };
+  /** 有没有真正需要“新开一段”的题；暂停题不算。 */
+  const freshSlotWaiters = (items: Challenge[] | null, selfCode: string): boolean =>
+    slotWaiters(items, selfCode, false);
+  /** 是否有已拿到部分 flag 的暂停题在等槽位。无得分题收尾时应让位给这类高价值题；
+   *  否则无得分题原地 giveup_continue 会一直占住槽位，b-01/b-02 这类题永远排不上。 */
+  const pausedProgressWaiters = (items: Challenge[] | null, selfCode: string): boolean => {
+    if (!items?.length) return false;
+    const maxFail = Math.max(CFG.max_failures, 1);
+    return items.some((c) => {
+      const cc = c.unique_code;
+      if (cc === selfCode || c.is_completed) return false;
+      if (!taskSelected(cc, taskFilter)) return false;
+      if (running.has(cc) || results[cc] === "pass") return false;
+      if ((failures[cc] ?? 0) >= maxFail) return false;
+      return cc in resumeMeta && (c.correct_flag_count ?? 0) > 0;
+    });
   };
 
   /** 有短题在等（决定长题配额 cap-1 还是 cap）——与 slotWaiters 同口径但只看短题。 */
@@ -2241,6 +2309,8 @@ async function runParallel(
     const meta = resumeMeta[code] ?? {};
     let pauses = Number(meta.pauses ?? 0);
     let gives = Number(meta.gives ?? 0);
+    // 无进展熔断：连续零新 flag 段数（有 flag 即清零；跨暂停持久，写入 resumeMeta）。
+    let noProgress = Number(meta.noProgress ?? 0);
     const oldTarget = (meta.target as string) ?? "";
     let startTurn = 0;
     let used = 0;
@@ -2256,13 +2326,27 @@ async function runParallel(
         target: addr,
         workdir: getTaskCwd() || taskWorkdir(code),
       });
-      // C 策略：段预算按分类取墙钟（短 600s/长 1800s）；时限临近时压缩到剩余的 1/6。
+      // C 策略：段预算按分类取墙钟（短 420s/长 1800s）；长题续段按上一段是否产出新 flag
+      // 自适应（有进展 1500s / 零进展 900s，降低无进展长题占槽）；时限临近时压缩到剩余的 1/6。
+      let longTier: "progress" | "stalled" | null = null;
+      // 本段是否拿到新 flag（无进展熔断用；段结束时按平台计数重算，避免快照滞后误判）。
+      let segmentGotFlag = (task.correct_flag_count ?? 0) > 0;
       const segBudgetSec = (): number => {
-        const base = cls(task) === "long" ? CFG.segment_long_sec : CFG.segment_short_sec;
+        let base = cls(task) === "long" ? CFG.segment_long_sec : CFG.segment_short_sec;
+        if (cls(task) === "long" && longTier === "progress") {
+          base = CFG.segment_long_progress_sec || base;
+        } else if (cls(task) === "long" && longTier === "stalled") {
+          base = CFG.segment_long_stalled_sec || base;
+        }
         const rem = remainingSec();
         return rem !== null ? Math.max(60, Math.min(base, Math.trunc(rem / 6))) : base;
       };
       let budgetSec = segBudgetSec();
+      /** 段结束后按本段 flag 增量决定下一段档位；首段仍用 1800s 观察。 */
+      const noteSegmentProgress = (segNewFlags: number): void => {
+        if (cls(task) !== "long") return;
+        longTier = segNewFlags > 0 ? "progress" : "stalled";
+      };
 
       if (isResume) {
         // 续跑：从 conversation.jsonl 重建全量上下文（记录即事实），再追加续跑通知
@@ -2389,6 +2473,10 @@ async function runParallel(
 
       // 本段起始 flag 数（D 改判判据）：首段用调度快照里的值，续段用上轮校验后的 state
       let segStartFlags = task.correct_flag_count ?? 0;
+      // 段循环内的收尾信息需要带到循环后的 dispose 分支（r/progressWaiter 是循环局部）。
+      let lastSubmitRejected = false;
+      let lastProgressWaiter = false;
+      let lastFlagsComplete = false;
       for (;;) {
         const r = await solveTask(client, code, card, budgetSec, conv, {
           messages: messages ?? undefined,
@@ -2408,6 +2496,7 @@ async function runParallel(
         messages = r.messages;
         branches = r.branches;
         flagSummaryDone = r.flagSummaryDone;
+        lastFlagsComplete = r.flagsComplete;
 
         // 校验平台状态：本地已确认全部 flag → 先等一档再轮询 is_completed（平台计数
         // 可能异步落账，不能拿本地账本当通关）；其余情况沿用快照失败重试，避免误判。
@@ -2447,11 +2536,20 @@ async function runParallel(
         }
         completed = !!state?.is_completed;
         if (status !== "done") gives = 0; // 只有连续 done 才累计 give-up
+        const progressWaiter = pausedProgressWaiters(itemsNow, code);
+        lastSubmitRejected = r.submitRejected;
+        lastProgressWaiter = progressWaiter;
 
         // giveup 且无人等这个并发名额：不关题、不 start，原地重新打开初始 Attempt 继续。
         // 页面/上下文都还在（尤其 target 不变），giveup 后的 close→start 纯属浪费。
         if (status === "done" && !completed && !r.flagsComplete && !completionUnconfirmed) {
-          const noWaiters = !slotWaiters(itemsNow, code);
+          // 模型收尾（尤其错提交后误以为结束）不等于本题结束。只有 fresh 新题在等槽位时
+          // 才让出；若其他题也都暂停着，则不 close，原地注入继续提示，避免 start/close 抖动。
+          // 最后一次提交明确被平台拒绝时再给一次原地继续：错提交本身绝不能成为关题理由。
+          // 若还有“已拿到部分 flag 的暂停题”在等槽位，当前无得分题收尾时让位；
+          // 否则 no-waiter 原地续段会独占槽位，把 b-01/b-02 这类高价值题饿到结束。
+          const noWaiters =
+            r.submitRejected || (!freshSlotWaiters(itemsNow, code) && !progressWaiter);
           const cap = noWaiters ? CFG.no_waiter_giveup_max : CFG.giveup_max;
           const nextGives = gives + 1;
           const tooMany = cap > 0 && nextGives >= cap;
@@ -2473,6 +2571,7 @@ async function runParallel(
               kind_note: "giveup_continue",
               content: note,
             });
+            noteSegmentProgress((state?.correct_flag_count ?? segStartFlags) - segStartFlags);
             startTurn += used;
             segStartFlags = state?.correct_flag_count ?? segStartFlags;
             budgetSec = segBudgetSec();
@@ -2512,7 +2611,14 @@ async function runParallel(
           // 超配额长题（怪兽题改判后鸠占鹊巢）必须让位；短题有等待者时照旧轮转。
           const quotaNow = anyWaitingShort(itemsNow, code) ? Math.max(1, cap - 1) : cap;
           const overQuota = isLong && countRunningLong() > quotaNow;
-          if (!overQuota && (isLong || !slotWaiters(itemsNow, code))) {
+          // 无进展熔断：连续 N 段零新 flag 时不要原地无限续段——让出槽位，冷却后再排。
+          // 首段零 flag 是正常侦察段；只有“已跑过至少一段后连续零进展”才计数。
+          noProgress = segNewFlags > 0 || pauses < 2 ? 0 : noProgress + 1;
+          segmentGotFlag = segNewFlags > 0;
+          const stalledTooLong =
+            CFG.no_progress_pause_limit > 0 && noProgress >= CFG.no_progress_pause_limit;
+          if (!overQuota && !stalledTooLong && (isLong || !slotWaiters(itemsNow, code))) {
+            noteSegmentProgress(segNewFlags);
             startTurn += used;
             segStartFlags = state?.correct_flag_count ?? segStartFlags;
             budgetSec = segBudgetSec();
@@ -2521,12 +2627,24 @@ async function runParallel(
               turns: startTurn,
               target: addr,
               class: isLong ? "long" : "short",
+              next_budget_sec: budgetSec,
             });
             log(
               `[${code}] segment budget hit; continue in place ` +
-                `(${startTurn} turns so far, no close/restart)`,
+                `(${startTurn} turns so far, next segment ${budgetSec}s, no close/restart)`,
             );
             continue;
+          }
+          if (stalledTooLong) {
+            rec().event("no_progress_cooldown", {
+              code,
+              consecutive_zero_flag_segments: noProgress,
+              cooldown_sec: CFG.no_progress_cooldown_sec,
+            });
+            log(
+              `[${code}] ${noProgress} consecutive zero-flag segments; ` +
+                `releasing slot and cooling down ${CFG.no_progress_cooldown_sec}s (not abandoned)`,
+            );
           }
         }
         finalWaiters = slotWaiters(itemsNow, code);
@@ -2578,15 +2696,31 @@ async function runParallel(
         // paused（本段轮次到点）或 done 但未通关（模型提前收尾）→
         // 关闭题目释放名额，保留上下文排到队尾，等没有新题时再续跑。
         const giveup = status === "done";
-        gives = giveup ? gives + 1 : 0;
+        // 无得分题给“有部分 flag 的暂停题”让位时，不把这次收尾计入 giveup：
+        // 否则高价值题还没轮到，它就因为让位三次被判 fail。让位仍写 task_paused，
+        // 后续可被正常续跑。
+        const yieldForProgress =
+          giveup &&
+          !lastSubmitRejected &&
+          lastProgressWaiter &&
+          !lastFlagsComplete &&
+          !completionUnconfirmed;
+        const countedGiveup = giveup && !yieldForProgress;
+        gives = countedGiveup ? gives + 1 : 0;
         pauses += 1;
+        // 模型收尾但本段零 flag 也计入无进展；本段有 flag 则清零（跨暂停持久）。
+        if (giveup && !lastFlagsComplete && !completionUnconfirmed) {
+          noProgress = segmentGotFlag || pauses < 2 ? 0 : noProgress + 1;
+        }
         const giveupCap = finalWaiters ? CFG.giveup_max : CFG.no_waiter_giveup_max;
         const tooMany =
-          (giveupCap > 0 && gives >= giveupCap) ||
-          (finalWaiters && CFG.pause_max > 0 && pauses > CFG.pause_max);
+          !yieldForProgress &&
+          ((giveupCap > 0 && gives >= giveupCap) ||
+            (finalWaiters && CFG.pause_max > 0 && pauses > CFG.pause_max));
         if (tooMany) {
           // 终止式放弃：直接置满失败上限，不再被重新派发
           failures[code] = Math.max(CFG.max_failures, 1);
+          if (giveup) abandonedByGiveup.add(code);
           delete resumeMeta[code];
           outcome = "fail";
           rec().event("task_abandoned", {
@@ -2601,14 +2735,29 @@ async function runParallel(
           );
         } else {
           outcome = "paused";
-          const desync = giveup && completionUnconfirmed;
+          const desync = countedGiveup && completionUnconfirmed;
           const plat = state ? `${state.correct_flag_count}/${state.flag_count}` : "?";
+          const reason = yieldForProgress
+            ? "yield_progress"
+            : desync
+              ? "completion_desync"
+              : giveup
+                ? "giveup"
+                : "paused";
+          // 无进展熔断：连续零 flag 段数达到阈值 → 冷却一段时间再排（不判死，也不原地续）。
+          // 冷却只降低续跑优先级，好的 fresh 题/有进展的暂停题先跑；冷却结束仍会再被调度。
+          const stalledCool =
+            CFG.no_progress_pause_limit > 0 && noProgress >= CFG.no_progress_pause_limit;
           resumeMeta[code] = {
             pauses,
             gives,
             target: addr,
             turns: startTurn + used,
-            reason: desync ? "completion_desync" : giveup ? "giveup" : "paused",
+            reason: stalledCool ? "no_progress" : reason,
+            noProgress,
+            ...(stalledCool
+              ? { cooldownUntil: Date.now() / 1000 + CFG.no_progress_cooldown_sec }
+              : {}),
             ...(desync ? { platform: plat } : {}),
             pausedAt: Date.now() / 1000, // D-aging：记录暂停时刻，续跑排序按等待时长提权
           };
@@ -2616,13 +2765,25 @@ async function runParallel(
             code,
             pauses,
             gives,
-            reason: desync ? "completion_desync" : giveup ? "giveup" : "segment_budget",
+            no_progress_segments: noProgress,
+            cooldown_sec: stalledCool ? CFG.no_progress_cooldown_sec : 0,
+            reason: stalledCool
+              ? "no_progress"
+              : yieldForProgress
+                ? "yield_progress"
+                : desync
+                  ? "completion_desync"
+                  : giveup
+                    ? "giveup"
+                    : "segment_budget",
             turns: startTurn + used,
             target: addr,
           });
           log(
-            `[${code}] segment done (${status}); pausing & releasing slot ` +
-              `(segment ${pauses}, ${startTurn + used} total turns)`,
+            `[${code}] segment done (${status})` +
+              `${yieldForProgress ? " [yield to paused flag progress]" : ""}` +
+              `${stalledCool ? ` [no progress ${noProgress} segments → cooldown]` : ""}; ` +
+              `pausing & releasing slot (segment ${pauses}, ${startTurn + used} total turns)`,
           );
         }
       }
@@ -2773,9 +2934,18 @@ async function runParallel(
       (c) => !(c.unique_code in resumeMeta) && cls(c) === "short",
     );
     // 暂停题按等待时长降序（aging 组内最老先续）
+    // 冷却中的无进展暂停题排到队尾：不是丢弃，只是让 fresh/有进展题先跑。
+    const nowS = Date.now() / 1000;
+    const cooling = (code: string): boolean => {
+      const until = resumeMeta[code]?.cooldownUntil;
+      return typeof until === "number" && nowS < until;
+    };
     const pausedTasks = eligibleTasks
       .filter((c) => c.unique_code in resumeMeta)
       .sort((a, b) => {
+        const ca = cooling(a.unique_code) ? 1 : 0;
+        const cb = cooling(b.unique_code) ? 1 : 0;
+        if (ca !== cb) return ca - cb;
         const at = resumeMeta[b.unique_code]?.pausedAt;
         const bt = resumeMeta[a.unique_code]?.pausedAt;
         return (typeof at === "number" ? at : 0) - (typeof bt === "number" ? bt : 0);
@@ -2792,9 +2962,50 @@ async function runParallel(
         return typeof at === "number" ? Date.now() / 1000 - at : 0;
       },
       runningLong: countRunningLong(), // 配额扣减：在跑长题不再给前排名额
+      cooled: new Set(
+        Object.entries(resumeMeta)
+          .filter(([, m]) => typeof m.cooldownUntil === "number" && nowS < m.cooldownUntil)
+          .map(([c]) => c),
+      ),
     });
 
-    if (!candidates.length && !running.size) break; // 全部完成或全部结束
+    if (!candidates.length && !running.size) {
+      // 不能简单 break：平台里仍有未通关题时，至少保留一次复活机会。
+      // 典型场景：所有无得分题因快速 giveup 被误判 fail，B-01/B-02 这类有部分 flag
+      // 的题却被留在 paused 队列；直接退出会让整个 benchmark 提前结束。
+      const unfinished = items.filter(
+        (c) =>
+          !c.is_completed &&
+          taskSelected(c.unique_code, taskFilter) &&
+          results[c.unique_code] !== "pass",
+      );
+      if (!unfinished.length) break;
+      const revive = [...unfinished]
+        .filter((c) => !revived.has(c.unique_code))
+        .filter((c) => !abandonedByGiveup.has(c.unique_code))
+        .sort(
+          (a, b) =>
+            (b.correct_flag_count ?? 0) - (a.correct_flag_count ?? 0) ||
+            (attempts[a.unique_code] ?? 0) - (attempts[b.unique_code] ?? 0) ||
+            a.unique_code.localeCompare(b.unique_code),
+        )[0];
+      if (!revive) break;
+      revived.add(revive.unique_code);
+      delete failures[revive.unique_code];
+      delete results[revive.unique_code];
+      rec().event("task_revived", {
+        code: revive.unique_code,
+        correct_flag_count: revive.correct_flag_count,
+        flag_count: revive.flag_count,
+        reason: "liveness_guard",
+      });
+      log(
+        `[${revive.unique_code}] liveness guard: re-arming (${revive.correct_flag_count}/${revive.flag_count}) ` +
+          `because no schedulable task remains`,
+      );
+      await sleep(1000);
+      continue;
+    }
 
     if (VPN_DOWN) {
       // 暂停派发（平台 API 走公网不依赖 VPN；只有靶场渗透需要 VPN）：不 start、不消耗 attempts

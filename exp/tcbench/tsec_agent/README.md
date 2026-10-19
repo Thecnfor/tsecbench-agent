@@ -32,7 +32,7 @@ docker/work/                  # 遗留目录，当前 run.sh 已不用
 ```bash
 pnpm install          # 首次
 pnpm build            # 构建 agent（dist/agent.js、dist/panel-server.js）+ 面板（dist/panel/）
-pnpm test             # 离线自测（198 个用例，不依赖 VPN/网关/平台）
+pnpm test             # 离线自测（208 个用例，不依赖 VPN/网关/平台）
 pnpm check            # 提交前自查：tsc --noEmit + biome check + pnpm test
 pnpm typecheck        # 仅类型检查
 pnpm lint             # biome 检查（配置 biome.jsonc）
@@ -88,12 +88,14 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `prompt.ts` | 单题 system prompt、任务卡模板、续跑/拉回/复盘通知 |
 | `panel/` | `data.ts` 记录读取与统计（含历史归档基线预测）；`server.ts` Node 面板服务；`web/` React 面板 |
 | `types.ts` | 共享类型契约 |
-| `sim/` | 调度策略离散事件模拟器（纯内存）：`tasks.ts` 场景生成（真实配比/easy慢题/全短/全长/fuzz）、`engine.ts` 世界推进、`policies.ts` 策略消融、`run.ts` bench——**A/C/D 策略选择的依据**，回归时可再跑 |
+| `sim/` | 调度策略离散事件模拟器（纯内存）：`tasks.ts` 场景生成（真实配比/easy慢题/全短/全长/fuzz）、`realdata.ts`+`fixtures/realrun.json`（归档/CSV 的 63 题 metadata+耗时）、`engine.ts` 世界推进（含随机容器启动、空档/续排指标）、`policies.ts` 策略消融、`run.ts` bench——**A/C/D 策略选择的依据**，回归时可再跑 |
 
 测试在 `test/`（vitest，`test/setup.ts` 隔离宿主 `.env` 泄漏）；`e2e.test.ts` 是
 `selftest.py` 的等价移植（假模型 + 内存平台，全离线跑通「分段解题 + 记录断言」）；
 `scheduling.test.ts` 是 A/C/D 调度改造的契约测试；`sim.test.ts` 是模拟器 bench
-（含"100 种子短题零饿死"性质断言，`pnpm bench` 单独跑）。
+（含"100 种子短题零饿死"性质断言，`pnpm bench` 单独跑）；`real_sim.test.ts` 用归档
+63 题 metadata + 当前 run/3853 归档耗时，压测零容器空档、暂停未完成题必须续排，
+并叠加随机容器启动与字段失真对抗集。
 
 ## 环境变量（均有内置默认值）
 
@@ -104,14 +106,18 @@ node dist/agent.js --mode local --task b-0*   # 只解指定题（调试）
 | `DEEPSEEK_BASE_URL` | 本地模型网关（官方） | `https://api.deepseek.com/v1` |
 | `DEEPSEEK_API_KEY` | 网关鉴权 | — |
 | `AGENT_MODE` | `auto`（默认）/`local`/`hosted` | `auto` |
-| `AGENT_TASK_SEGMENT_SHORT_SEC` | 短题段墙钟预算（主闸；到点暂停保留上下文） | 600 |
-| `AGENT_TASK_SEGMENT_LONG_SEC` | 长题段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
+| `AGENT_TASK_SEGMENT_SHORT_SEC` | 短题段墙钟预算（主闸；到点暂停保留上下文；归档短题段 p75=762s、33% 超旧值 600s） | 420 |
+| `AGENT_TASK_SEGMENT_LONG_SEC` | 长题首段墙钟预算（多 flag ∨ hard ∨ level≥3） | 1800 |
+| `AGENT_TASK_SEGMENT_LONG_PROGRESS_SEC` | 长题续段预算：上一段有新 flag | 1500 |
+| `AGENT_TASK_SEGMENT_LONG_STALLED_SEC` | 长题续段预算：上一段零新 flag（减少无进展长题占槽） | 900 |
 | `AGENT_TASK_MAX_TURNS` | 段轮数【安全网】（0=关；墙钟才是主闸，轮数防极端空转） | 120 |
-| `AGENT_GIVEUP_MAX` | 有其他题等槽时，连续「未通关就收束」上限 | 3 |
-| `AGENT_NO_WAITER_GIVEUP_MAX` | 无题等槽时 giveup 上限；0=不限，最后几题持续跑 | 0 |
+| `AGENT_GIVEUP_MAX` | 有 fresh 新题等槽时，连续「未通关就收束」上限 | 3 |
+| `AGENT_NO_WAITER_GIVEUP_MAX` | 无 fresh 新题等槽时 giveup 上限；0=不限，最后几题持续跑（暂停题不算 fresh） | 0 |
 | `AGENT_SUMMARY_TIMEOUT_SEC` | 通关复盘限时（容器已关、脱槽跑；超时丢弃照常 pass） | 300 |
 | `AGENT_COMPACT_TOKENS` | 单 Attempt 压缩阈值（**token 实测**：上一次 LLM 调用 usage.prompt_tokens）；优先压共享 fork 前缀并保留 tail，其他 Attempt 到阈值复用；找到 flag 仍可强制压缩 | 400000 |
-| `AGENT_RESUME_AGING_SEC` | 暂停题排队提权阈值（秒，防 fresh 无限插队） | 600 |
+| `AGENT_NO_PROGRESS_PAUSE_LIMIT` | 同一题连续零新 flag 段数达到该值 → 暂停并冷却（让槽给其他题；0=关闭） | 2 |
+| `AGENT_NO_PROGRESS_COOLDOWN_SEC` | 无进展冷却秒数；冷却中的题排在候选末尾但仍可被调度 | 600 |
+| `AGENT_RESUME_AGING_SEC` | 无进展暂停题排队提权阈值（秒）；有 flag 进展的暂停题直接优先于 fresh | 600 |
 | `AGENT_MAX_PARALLEL` | 并行解题数（平台 max-active 会自动收缩） | 5 |
 | `AGENT_FORK` | fork 多 Attempt 与协作工具（fork/report/log/state_change） | 1 |
 | `AGENT_PLANNER` | planner 统筹（fork 开启时生效；0=关闭自动提醒/spawn） | 1 |

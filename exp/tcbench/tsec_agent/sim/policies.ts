@@ -65,4 +65,23 @@ export const POLICIES: Policy[] = [
     rotateQuotaLong: false,
     forceRotateOnZeroProgress: true,
   },
+  // 生产调度语义：ACD + fresh-only no-waiter + 有进展暂停题优先/让位。
+  {
+    ...base,
+    name: "PROD",
+    earlyCloseOnComplete: true,
+    segmentMode: "fixed",
+    slotPartition: true,
+    resumeAgingMin: 10,
+    reclassify: true,
+    rotateQuotaLong: false,
+    noWaiterFreshOnly: true,
+    pausedProgressPriority: true,
+    yieldProgress: true,
+    fixedShortSec: 420,
+    longProgressSec: 1500,
+    longStalledSec: 900,
+    noProgressPauseLimit: 2,
+    noProgressCooldownMin: 10,
+  },
 ];

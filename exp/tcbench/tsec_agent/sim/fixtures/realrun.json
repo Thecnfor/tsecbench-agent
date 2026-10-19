@@ -1,0 +1,581 @@
+{
+  "source": {
+    "metadata": "a10cc76e-.../tasks/*/conversation.jsonl (63 task cards)",
+    "current": "Downloads/run-36470-events.csv",
+    "archive_durations": "3853c731-.../tasks.jsonl",
+    "note": "current_sec = sum of all close-start segments in the run; archive_sec = sum of task_close duration_sec in one archive run"
+  },
+  "gaps": {
+    "max_sec": 94.0,
+    "count": 73
+  },
+  "records": [
+    {
+      "code": "a-01",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 45.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 39.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-03",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 341.0,
+      "archive_sec": 1090.0
+    },
+    {
+      "code": "a-04",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 47.0,
+      "archive_sec": 39.7
+    },
+    {
+      "code": "a-05",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 736.0,
+      "archive_sec": 845.2
+    },
+    {
+      "code": "a-06",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 75.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-07",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 101.0,
+      "archive_sec": 274.2
+    },
+    {
+      "code": "a-08",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 29.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-09",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 230.0,
+      "archive_sec": 127.2
+    },
+    {
+      "code": "a-10",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 60.0,
+      "archive_sec": 51.6
+    },
+    {
+      "code": "a-11",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 108.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-12",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 43.0,
+      "archive_sec": 36.4
+    },
+    {
+      "code": "a-13",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 115.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-14",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 736.0,
+      "archive_sec": 532.8
+    },
+    {
+      "code": "a-15",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 86.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-16",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 1421.0,
+      "archive_sec": null
+    },
+    {
+      "code": "a-17",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 186.0,
+      "archive_sec": 151.0
+    },
+    {
+      "code": "a-18",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 1966.0,
+      "archive_sec": null
+    },
+    {
+      "code": "b-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 4,
+      "total_score": 1200,
+      "current_sec": 1939.0,
+      "archive_sec": 3040.5
+    },
+    {
+      "code": "b-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 6,
+      "total_score": 1800,
+      "current_sec": 1823.0,
+      "archive_sec": 7205.7
+    },
+    {
+      "code": "b-03",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 4,
+      "total_score": 1200,
+      "current_sec": 703.0,
+      "archive_sec": 4451.0
+    },
+    {
+      "code": "c-01",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 231.0,
+      "archive_sec": null
+    },
+    {
+      "code": "c-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 516.0,
+      "archive_sec": null
+    },
+    {
+      "code": "c-03",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 600.0,
+      "archive_sec": 615.1
+    },
+    {
+      "code": "c-04",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 191.0,
+      "archive_sec": 262.8
+    },
+    {
+      "code": "c-05",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 87.0,
+      "archive_sec": 87.9
+    },
+    {
+      "code": "c-06",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 110.0,
+      "archive_sec": 97.6
+    },
+    {
+      "code": "c-07",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 109.0,
+      "archive_sec": 128.1
+    },
+    {
+      "code": "c-08",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 250.0,
+      "archive_sec": 236.6
+    },
+    {
+      "code": "c-09",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 100,
+      "current_sec": 350.0,
+      "archive_sec": 311.7
+    },
+    {
+      "code": "d-01",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 200,
+      "current_sec": 17.0,
+      "archive_sec": 23.9
+    },
+    {
+      "code": "d-02",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 200,
+      "current_sec": 17.0,
+      "archive_sec": 24.9
+    },
+    {
+      "code": "d-03",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 400,
+      "current_sec": 57.0,
+      "archive_sec": null
+    },
+    {
+      "code": "d-04",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 141.0,
+      "archive_sec": 384.3
+    },
+    {
+      "code": "d-05",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 400,
+      "current_sec": 33.0,
+      "archive_sec": null
+    },
+    {
+      "code": "d-06",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 77.0,
+      "archive_sec": 57.9
+    },
+    {
+      "code": "e1-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 28.0,
+      "archive_sec": 271.2
+    },
+    {
+      "code": "e1-02",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 12.0,
+      "archive_sec": 5.8
+    },
+    {
+      "code": "e1-03",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 76.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e1-04",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 25.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e1-05",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 28.0,
+      "archive_sec": 12.5
+    },
+    {
+      "code": "e1-06",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 36.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e2-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 44.0,
+      "archive_sec": 28.1
+    },
+    {
+      "code": "e2-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 75.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e2-03",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 32.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e2-04",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 43.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e3-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 28.0,
+      "archive_sec": 31.1
+    },
+    {
+      "code": "e3-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 44.0,
+      "archive_sec": null
+    },
+    {
+      "code": "e3-03",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 25.0,
+      "archive_sec": 47.0
+    },
+    {
+      "code": "e3-04",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 250,
+      "current_sec": 449.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f1-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 248.0,
+      "archive_sec": 29.4
+    },
+    {
+      "code": "f1-02",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 74.0,
+      "archive_sec": 59.9
+    },
+    {
+      "code": "f1-03",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 129.0,
+      "archive_sec": 538.6
+    },
+    {
+      "code": "f1-04",
+      "difficulty": "easy",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 200,
+      "current_sec": 41.0,
+      "archive_sec": 63.2
+    },
+    {
+      "code": "f1-05",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 105.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-01",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 200,
+      "current_sec": 664.0,
+      "archive_sec": 241.3
+    },
+    {
+      "code": "f2-02",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 400,
+      "current_sec": 85.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-03",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 56.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-04",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 104.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-05",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 500,
+      "current_sec": 880.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-06",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 300,
+      "current_sec": 104.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-07",
+      "difficulty": "hard",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 400,
+      "current_sec": 125.0,
+      "archive_sec": null
+    },
+    {
+      "code": "f2-08",
+      "difficulty": "medium",
+      "level": 1,
+      "flag_count": 1,
+      "total_score": 200,
+      "current_sec": 90.0,
+      "archive_sec": 66.4
+    }
+  ]
+}

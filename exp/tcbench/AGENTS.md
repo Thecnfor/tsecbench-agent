@@ -98,8 +98,9 @@
 7. **上下文按题隔离（方案 A）+ 分段解题**：平台编排（选题/start/close/名额）由 `src/agent.ts` 控制器 +
    `src/bench.ts` 硬编码执行；模型只在**每题独立的 messages** 里解题（`solveTask`）。
    **不要改回单一大上下文**。
-   - **每段预算以墙钟为主（`AGENT_TASK_SEGMENT_SHORT_SEC`=600s / `LONG_SEC`=1800s，按
-     `classifyTask` 的字段分类取值）：段到点不判死**——`task_close{outcome:"paused"}`
+   - **每段预算以墙钟为主（`AGENT_TASK_SEGMENT_SHORT_SEC`=420s / `LONG_SEC`=1800s，按
+     `classifyTask` 的字段分类取值；长题续段自适应：上一段有新 flag → 1500s，零新 flag →
+     900s，首段仍 1800s）：段到点不判死**——`task_close{outcome:"paused"}`
      关题释放名额 → 上下文保留（`resumeMeta`；需要时由 `records.rebuildMessages` 从
      conversation.jsonl 重建）→ 之后 `start` 续跑（重启靶机），
      续跑在上下文末尾追加 `prompt.RESUME_NOTE`（新 target / 靶机内状态已重置 / workdir 保留 /
@@ -132,18 +133,33 @@
      补回同槽，等待的短题一无所获，纯重启浪费；打断 88→31.6 完成持平）；
      ④ 超配额长题（怪兽题改判后鸠占鹊巢）段到点必须让位；短题有等待者时照旧关题轮转。
    - **调度排序（D）**：长题早启动（开局就顶上去跑，不能最后才启动，估算降序），
-     短题最短优先，暂停题 aging（`AGENT_RESUME_AGING_SEC` 默认 600s，等最久的先续——
-     防 fresh 无限插队，实测曾有题暂停后等 118 分钟）。分类只用 API 字段
+     **有 flag 进展的暂停题优先于 fresh**（已有上下文且离得分更近；旧排序把它们放
+     在所有 freshShort 后面，实测 b-01/b-02/a-05 暂停后等 70~90 分钟才续跑），
+     短题最短优先，无进展暂停题 aging（`AGENT_RESUME_AGING_SEC` 默认 600s，保留一个
+     前排名额，防完全饿死又不占满槽位）。分类只用 API 字段
      （flag_count/difficulty/level），**不依赖历史基线**（正式比赛题目必变）。
      策略选择由 `sim/` 离散事件模拟器 bench 验证（74 测试含 `test/sim.test.ts`）。
-   - **无人等名额就不关题（段到点 / giveup 都适用）**：若快照里**没有别的题在等
-     这个并发名额**（无新题、也无待续跑的题——典型即"收尾只剩几题且都在跑"）：
-     ① 段到点：不 `close`、不 `start`，**同一容器、同一上下文直接续一段**
-     （事件 `segment_continue`）；
-     ② giveup（所有 Attempt 已 park）：同样不 `close`、不 `start`，重新打开初始 Attempt、
-     注入 `prompt.GIVEUP_NOTE` 原地续一段（事件 `giveup_continue`）。无题等槽时默认
-     `AGENT_NO_WAITER_GIVEUP_MAX=0`（不限次数，最后几题不主动放弃）；有题等槽时才用
-     `AGENT_GIVEUP_MAX=3` 收束。上下文和 target 都不变，省掉容器重启代价。
+   - **无人等名额就不关题（fresh waiter 语义）**：只有**从未开始/没有续跑上下文的
+     fresh 题**才算“有题在等槽位”。暂停题不算 fresh waiter——如果多个暂停题互相把
+     对方当 waiter，每个模型收尾都会触发一次 close→start，实测退化成 10s 级抖动，
+     并会按 giveup 上限把无得分题误判 fail。对模型收尾（giveup）：
+     ① 没有 fresh waiter：不 `close`、不 `start`，重新打开初始 Attempt、注入
+     `prompt.GIVEUP_NOTE` 原地续一段（事件 `giveup_continue`）；默认
+     `AGENT_NO_WAITER_GIVEUP_MAX=0`（最后几题不主动放弃）；
+     ② 有 fresh waiter 时才按 `AGENT_GIVEUP_MAX=3` 收束释放槽位；
+     ③ 无 fresh waiter 但存在**已拿到部分 flag 的暂停题**时，无得分题收尾也让位一次，
+     把槽位交给 b-01/b-02 这类高价值续跑题，避免它们被无得分题的 giveup_continue 永久占槽。
+     段预算到点仍可在暂停题之间轮转（`segment_continue` 仅在无其他 waiter 时原地续段；
+     暂停题已有上下文，轮转不改变 fresh 队列的插队顺序）。上下文和 target 都不变。
+     实测 a-05/c-03 会在 0 分题上反复 `close→start`（同一地址连跑 30min），因此默认加
+     **无进展熔断**：同一题连续 `AGENT_NO_PROGRESS_PAUSE_LIMIT`(2) 段零新 flag 后不再原地续段，
+     `close` 并冷却 `AGENT_NO_PROGRESS_COOLDOWN_SEC`(600s)；冷却题排在所有候选之后但**不判死**，
+     仍会再被调度。首段零 flag 是正常侦察，不计入。
+     最后若所有未完成题都已判 fail，调度器保留一次 `task_revived` 兜底，避免全关后直接退出。
+   - **错提交不是终点**：`submit_flag` 返回 `correct:false` 只把错误反馈给模型（附加“不要收尾”的
+     系统提示），不写 `results=fail`、不主动 `close`；若模型紧接着输出无工具总结，
+     `SolveResult.submitRejected` 会让 controller 给一次原地 `giveup_continue`，即使有 fresh
+     新题在等槽也不因这次错误提交关题。
    - **next 待定队列**：`report(done|deadend)` 的 `next` 先进入 planner 的
      `pendingDirections`（持久化 planner.json）；有空槽/分支让位时 controller 再 spawn。
      槽满时方向不会丢，`done` 也不等于整题完成。
@@ -239,7 +255,7 @@
 | `tsec_agent/src/artifacts.ts` | shell 后新文件的有界扫描 + sha256；跨 Attempt/跨段产物去重提示；共享写命令启发式提醒 | 产物去重/扫描阈值 |
 | `tsec_agent/src/panel/` | 本地观察面板（React 前端 `web/` + Node 服务 `server.ts` + 数据层 `data.ts`；只读记录+平台 API；RUNNING/PASS/FAIL、进行中 shell、模型输出、flag 数——有选题时按选题范围统计，取 `meta.runs[-1].task_filter`，空=全局；**按 `docker/archives/` 归档做实时耗时预测对比**：提前完成即扣、超时逐帧累加） | 面板展示项 |
 | `tsec_agent/src/config.ts` | 全部配置与默认值（环境变量可覆盖）；含 fork/planner 开关 `AGENT_FORK`/`AGENT_PLANNER`、`AGENT_BRANCH_CONCURRENCY`/`AGENT_MAX_BRANCHES`/`AGENT_FORK_MAX` 及护栏/提醒阈值 | 加配置项 |
-| `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言） | 改动主循环后必须跑 |
+| `tsec_agent/test/` | vitest 自测（`e2e.test.ts` 离线端到端：fake 模型驱动工具循环 + 记录断言；`real_sim.test.ts` 用归档/CSV 的 63 题数据压测调度空档与暂停续排） | 改动主循环后必须跑 |
 | `arena/` | 内部本地跑分题场：官方 Challenges API 线格式兼容的计分服务 + **docker 真靶机驱动**（题包在 `arena/challenges/`，含 flag 字面量——`.dockerignore` 已排除 `arena/`，**红线别删**）；行为契约见 `arena/README.md`，接入只改 `BENCHMARK_BASE_URL`/`BENCHMARK_TOKEN` | 内部本地跑分、加题 |
 | `docker/Dockerfile` | Kali + 渗透工具 + openvpn + 纯 JS agent 产物（`tsec_agent/dist/`，构建前先 `pnpm build`）+ 离线知识库（构建上下文 = 项目根，根 `.dockerignore` 排除凭证/记录/node_modules） | 加工具/依赖（**镜像 ≤3GB 是压缩后口径**） |
 | `docker/entrypoint.sh` | 容器入口：VPN → 预检 → DNS → 冒烟 → 跑分 | 接入流程变化 |
@@ -251,7 +267,7 @@
 ## 常用操作
 
 ```bash
-# 离线自测（改完代码先跑这个，不需要 VPN/网关；198 个 vitest 用例）
+# 离线自测（改完代码先跑这个，不需要 VPN/网关；208 个 vitest 用例）
 cd tsec_agent && pnpm install && pnpm test
 
 # 一次性检查：类型检查 + biome lint + 全部测试（提交前自查）
